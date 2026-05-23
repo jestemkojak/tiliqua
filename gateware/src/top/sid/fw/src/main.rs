@@ -156,41 +156,51 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
     ];
 
     for n_voice in 0usize..3usize {
-        let base = (7*n_voice) as u8;
+        let base = (7 * n_voice) as u8;
 
-        // MODULATION
-        let mut freq: u16 = voices[n_voice].freq.value;
-        let mut gate = voices[n_voice].gate.value;
+        let (mut freq, gate) = if opts.misc.control_source.value == ControlSource::Midi {
+            let mut base_freq = midi_voices[n_voice].base_freq;
+            let gate = midi_voices[n_voice].gate as u8;
 
-        for (ch, m) in mods.iter().enumerate() {
-            if let Some(VoiceModulationType::Frequency) = m.modulates_voice(n_voice) {
-                let volts: f32 = (x[ch] as f32) / 4096.0f32;
-                let freq_hz = volts_to_freq(volts);
-                freq = 16u16 * (0.05960464f32 * freq_hz) as u16; // assumes 1Mhz SID clk
-                                                                 // http://www.sidmusic.org/sid/sidtech2.html
-            }
-            if let Some(VoiceModulationType::Gate) = m.modulates_voice(n_voice) {
-                if x[ch] > 2000 {
-                    gate = 1;
-                }
-                if x[ch] < 1000 {
-                    gate = 0;
+            for (ch, m) in mods.iter().enumerate() {
+                if let Some(VoiceModulationType::Frequency) = m.modulates_voice(n_voice) {
+                    let cv_volts: f32 = (x[ch] as f32) / 4096.0f32;
+                    let delta_hz = volts_to_freq(cv_volts) - volts_to_freq(0.0f32);
+                    let delta_sid = (delta_hz * 0.05960464f32 * 16.0f32) as i32;
+                    base_freq = (base_freq as i32 + delta_sid).clamp(0, 65535) as u16;
                 }
             }
-        }
 
-        // Propagate modulation back to menu system
+            (base_freq, gate)
+        } else {
+            let mut freq: u16 = voices[n_voice].freq.value;
+            let mut gate = voices[n_voice].gate.value;
 
-        voices[n_voice].freq.value = freq;
-        voices[n_voice].gate.value = gate;
+            for (ch, m) in mods.iter().enumerate() {
+                if let Some(VoiceModulationType::Frequency) = m.modulates_voice(n_voice) {
+                    let volts: f32 = (x[ch] as f32) / 4096.0f32;
+                    let freq_hz = volts_to_freq(volts);
+                    freq = 16u16 * (0.05960464f32 * freq_hz) as u16;
+                }
+                if let Some(VoiceModulationType::Gate) = m.modulates_voice(n_voice) {
+                    if x[ch] > 2000 { gate = 1; }
+                    if x[ch] < 1000 { gate = 0; }
+                }
+            }
+
+            voices[n_voice].freq.value = freq;
+            voices[n_voice].gate.value = gate;
+
+            (freq, gate)
+        };
 
         freq = (freq as f32 * (voices[n_voice].freq_os.value as f32 / 1000.0f32)) as u16;
 
-        sid_poke(&sid, base+0, freq as u8);
-        sid_poke(&sid, base+1, (freq>>8) as u8);
+        sid_poke(&sid, base + 0, freq as u8);
+        sid_poke(&sid, base + 1, (freq >> 8) as u8);
 
-        sid_poke(&sid, base+2, voices[n_voice].pw.value as u8);
-        sid_poke(&sid, base+3, (voices[n_voice].pw.value>>8) as u8);
+        sid_poke(&sid, base + 2, voices[n_voice].pw.value as u8);
+        sid_poke(&sid, base + 3, (voices[n_voice].pw.value >> 8) as u8);
 
         let mut reg04 = 0u8;
         use crate::options::Wave;
@@ -205,13 +215,13 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         reg04 |= voices[n_voice].sync.value << 1;
         reg04 |= voices[n_voice].ring.value << 2;
 
-        sid_poke(&sid, base+4, reg04);
+        sid_poke(&sid, base + 4, reg04);
 
-        sid_poke(&sid, base+5,
+        sid_poke(&sid, base + 5,
             voices[n_voice].decay.value |
             (voices[n_voice].attack.value << 4));
 
-        sid_poke(&sid, base+6,
+        sid_poke(&sid, base + 6,
             voices[n_voice].release.value |
             (voices[n_voice].sustain.value << 4));
     }
@@ -232,15 +242,22 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
          (opts.filter.volume.value << 0)) as u8
         );
 
-    critical_section::with(|cs| {
-        let mut app = app.borrow_ref_mut(cs);
-        app.ui.opts.voice1.freq.value = voices[0].freq.value;
-        app.ui.opts.voice1.gate.value = voices[0].gate.value;
-        app.ui.opts.voice2.freq.value = voices[1].freq.value;
-        app.ui.opts.voice2.gate.value = voices[1].gate.value;
-        app.ui.opts.voice3.freq.value = voices[2].freq.value;
-        app.ui.opts.voice3.gate.value = voices[2].gate.value;
-    });
+    let usb_en = opts.misc.usb_host.value == UsbHost::On;
+    sid.usb_midi_host().write(|w| unsafe { w.host().bit(usb_en) });
+    sid.usb_midi_cfg().write(|w| unsafe { w.value().bits(1) });
+    sid.usb_midi_endp().write(|w| unsafe { w.value().bits(1) });
+
+    if opts.misc.control_source.value == ControlSource::Cv {
+        critical_section::with(|cs| {
+            let mut app = app.borrow_ref_mut(cs);
+            app.ui.opts.voice1.freq.value = voices[0].freq.value;
+            app.ui.opts.voice1.gate.value = voices[0].gate.value;
+            app.ui.opts.voice2.freq.value = voices[1].freq.value;
+            app.ui.opts.voice2.gate.value = voices[1].gate.value;
+            app.ui.opts.voice3.freq.value = voices[2].freq.value;
+            app.ui.opts.voice3.gate.value = voices[2].gate.value;
+        });
+    }
 }
 
 #[entry]
