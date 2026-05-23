@@ -28,10 +28,23 @@ use hal::pca9635::Pca9635Driver;
 
 use micromath::F32Ext;
 
+use midi_types::MidiMessage;
+use midi_convert::parse::MidiTryParseSlice;
+use options::{ControlSource, UsbHost};
+
 pub const TIMER0_ISR_PERIOD_MS: u32 = 5;
+
+#[derive(Default, Clone, Copy)]
+struct MidiVoiceState {
+    note:      u8,
+    gate:      bool,
+    base_freq: u16,
+}
 
 struct App {
     ui: ui::UI<Encoder0, EurorackPmod0, I2c0, Opts>,
+    midi_voices: [MidiVoiceState; 3],
+    midi_write_ix: usize,
 }
 
 impl App {
@@ -44,13 +57,38 @@ impl App {
         Self {
             ui: ui::UI::new(opts, TIMER0_ISR_PERIOD_MS,
                             encoder, pca9635, pmod),
+            midi_voices: [MidiVoiceState::default(); 3],
+            midi_write_ix: 0,
         }
+    }
+}
+
+impl App {
+    fn find_midi_slot(&mut self, note: u8) -> usize {
+        // 1. Retrigger: slot already playing this note
+        for (i, v) in self.midi_voices.iter().enumerate() {
+            if v.note == note && v.gate { return i; }
+        }
+        // 2. Free slot (gate released)
+        for (i, v) in self.midi_voices.iter().enumerate() {
+            if !v.gate { return i; }
+        }
+        // 3. Steal oldest via round-robin write index
+        let slot = self.midi_write_ix;
+        self.midi_write_ix = (self.midi_write_ix + 1) % 3;
+        slot
     }
 }
 
 fn volts_to_freq(volts: f32) -> f32 {
     let a3_freq_hz: f32 = 440.0f32;
     (a3_freq_hz / 2.0f32) * (2.0f32).powf(volts + 2.0f32 - 3.0f32/4.0f32)
+}
+
+fn midi_note_to_sid_freq(note: u8) -> u16 {
+    // assumes 1 MHz SID clock; http://www.sidmusic.org/sid/sidtech2.html
+    let freq_hz = 440.0f32 * 2.0f32.powf((note as f32 - 69.0f32) / 12.0f32);
+    (freq_hz * 0.05960464f32 * 16.0f32) as u16
 }
 
 fn timer0_handler(app: &Mutex<RefCell<App>>) {
