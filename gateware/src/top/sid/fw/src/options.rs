@@ -35,6 +35,22 @@ pub enum Wave {
     Noise,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum ControlSource {
+    #[default]
+    Cv,
+    Midi,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum UsbHost {
+    #[default]
+    Off,
+    On,
+}
+
 #[derive(Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Default, Serialize, Deserialize)]
 #[strum(serialize_all = "kebab-case")]
 pub enum ModulationTarget {
@@ -97,6 +113,10 @@ pub struct HelpOpts {
 
 #[derive(OptionPage, Clone)]
 pub struct MiscOpts {
+    #[option]
+    pub control_source: EnumOption<ControlSource>,
+    #[option]
+    pub usb_host: EnumOption<UsbHost>,
     #[option(false)]
     pub save_opts: ButtonOption<OneShotButtonParams>,
     #[option(false)]
