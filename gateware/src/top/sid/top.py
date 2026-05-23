@@ -52,6 +52,8 @@ from amaranth.lib.wiring import In, Out, connect, flipped
 from amaranth_soc import csr
 
 from tiliqua import midi
+from guh.engines.midi import USBMIDIHost
+from tiliqua.build import sim
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
 from tiliqua.raster import scope
@@ -297,9 +299,9 @@ class SIDSoc(TiliquaSoc):
 
     # Stored in manifest and used by bootloader for brief summary of each bitstream.
     bitstream_help = BitstreamHelp(
-        brief="MOS 6581 (SID) emulation.",
+        brief="MOS 6581 (SID) emulation with MIDI input.",
         io_left=['modulate0', 'modulate1', 'modulate2', 'modulate3', 'voice0', 'voice1', 'voice2', 'voice mix'],
-        io_right=['navigate menu', '', 'video out', '', '', '']
+        io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 
     def __init__(self, **kwargs):
@@ -369,6 +371,37 @@ class SIDSoc(TiliquaSoc):
             self.scope_periph.i.payload[2].eq(pmod0.i_cal.payload[1]),
             self.scope_periph.i.payload[3].eq(pmod0.i_cal.payload[2]),
         ]
+
+        if sim.is_hw(platform):
+            # TRS MIDI (serial)
+            midi_pins = platform.request("midi")
+            m.submodules.serialrx = serialrx = midi.SerialRx(
+                system_clk_hz=60e6, pins=midi_pins)
+            m.submodules.midi_decode_trs = midi_decode_trs = midi.MidiDecodeSerial(
+                forward_rt=True)
+            wiring.connect(m, serialrx.o, midi_decode_trs.i)
+
+            # USB MIDI host
+            ulpi = platform.request(platform.default_usb_connection)
+            m.submodules.usb = usb = USBMIDIHost(bus=ulpi)
+            m.submodules.midi_decode_usb = midi_decode_usb = midi.MidiDecodeUSB(
+                forward_rt=True)
+            wiring.connect(m, usb.o_midi, midi_decode_usb.i)
+
+            # Source mux: USB host or TRS, controlled by CSR bit
+            vbus_o = platform.request("usb_vbus_en").o
+            with m.If(self.sid_periph.usb_midi_host):
+                wiring.connect(m, midi_decode_usb.o, self.sid_periph.i_midi)
+                m.d.comb += vbus_o.eq(1)
+            with m.Else():
+                wiring.connect(m, midi_decode_trs.o, self.sid_periph.i_midi)
+                m.d.comb += vbus_o.eq(0)
+
+            # Drain RT streams (clock sync not used by SID)
+            m.d.comb += [
+                midi_decode_trs.o_rt.ready.eq(1),
+                midi_decode_usb.o_rt.ready.eq(1),
+            ]
 
         return m
 
