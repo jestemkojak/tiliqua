@@ -25,6 +25,8 @@ amaranth-soc-isr = { path="../../../rs/isr", default-features = false }
 irq = "0.2.3"
 serde = { version="1.0.219", default-features=false }
 serde_derive = "1.0.219"
+midi-types = "0.1.7"
+midi-convert = "0.2.0"
 
 [profile.release]
 codegen-units = 1
