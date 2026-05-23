@@ -46,11 +46,12 @@ import os
 import sys
 
 from amaranth import *
-from amaranth.lib import data, wiring
-from amaranth.lib.fifo import SyncFIFO
+from amaranth.lib import data, stream, wiring
+from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered
 from amaranth.lib.wiring import In, Out, connect, flipped
 from amaranth_soc import csr
 
+from tiliqua import midi
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
 from tiliqua.raster import scope
@@ -163,11 +164,33 @@ class SIDPeripheral(wiring.Component):
     class TransactionData(csr.Register, access="w"):
         transaction_data: csr.Field(csr.action.W, unsigned(16))
 
+    class MidiWrite(csr.Register, access="w"):
+        """Write a MIDI message (reserved for future firmware-generated injection)."""
+        msg: csr.Field(csr.action.W, unsigned(24))
+
+    class MidiRead(csr.Register, access="r"):
+        """Read next MIDI message from hardware FIFO; returns 0 when empty."""
+        msg: csr.Field(csr.action.R, unsigned(24))
+
+    class UsbMidiHost(csr.Register, access="w"):
+        """0 = use TRS MIDI (default). 1 = enable USB host + VBUS."""
+        host: csr.Field(csr.action.W, unsigned(1))
+
+    class UsbMidiCfg(csr.Register, access="w"):
+        """USB MIDI streaming endpoint config word (hardcoded to 1)."""
+        value: csr.Field(csr.action.W, unsigned(4))
+
     def __init__(self, *, transaction_depth=16):
         self._transactions = SyncFIFO(width=16, depth=transaction_depth)
-        # Use new CSR builder style
+        self._midi_read_fifo = SyncFIFOBuffered(width=24, depth=8)
+
         regs = csr.Builder(addr_width=5, data_width=8)
         self._transaction_data = regs.add("transaction_data", self.TransactionData(), offset=0x0)
+        self._midi_write  = regs.add("midi_write",    self.MidiWrite(),   offset=0x4)
+        self._midi_read   = regs.add("midi_read",     self.MidiRead(),    offset=0x8)
+        self._midi_host   = regs.add("usb_midi_host", self.UsbMidiHost(), offset=0xC)
+        self._midi_cfg    = regs.add("usb_midi_cfg",  self.UsbMidiCfg(),  offset=0x10)
+        self._midi_endp   = regs.add("usb_midi_endp", self.UsbMidiCfg(),  offset=0x14)
         self._bridge = csr.Bridge(regs.as_memory_map())
 
         self.sid = None
@@ -177,7 +200,11 @@ class SIDPeripheral(wiring.Component):
         self.last_audio_right = Signal(signed(24))
 
         super().__init__({
-            "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
+            "bus":           In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
+            "i_midi":        In(stream.Signature(midi.MidiMessage)),
+            # MIDI output ports (driven from CSR writes, read by SIDSoc)
+            "usb_midi_host":   Out(1),
+            "usb_midi_cfg_id": Out(4),
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -238,6 +265,28 @@ class SIDPeripheral(wiring.Component):
                 self.last_audio_left .eq(self.sid.audio_o.left),
                 self.last_audio_right.eq(self.sid.audio_o.right),
             ]
+
+        m.submodules.midi_read_fifo = midi_read_fifo = self._midi_read_fifo
+
+        # Accept all incoming MIDI messages; silently drop if FIFO full
+        m.d.comb += [
+            self.i_midi.ready.eq(1),
+            midi_read_fifo.w_data.eq(self.i_midi.payload),
+            midi_read_fifo.w_en.eq(self.i_midi.valid),
+        ]
+
+        # FIFO -> midi_read CSR (firmware drains by reading until 0)
+        m.d.comb += midi_read_fifo.r_en.eq(self._midi_read.element.r_stb)
+        with m.If(midi_read_fifo.r_level != 0):
+            m.d.comb += self._midi_read.f.msg.r_data.eq(midi_read_fifo.r_data)
+        with m.Else():
+            m.d.comb += self._midi_read.f.msg.r_data.eq(0)
+
+        # USB host + cfg CSR writes -> output ports.
+        with m.If(self._midi_host.f.host.w_stb):
+            m.d.sync += self.usb_midi_host.eq(self._midi_host.f.host.w_data)
+        with m.If(self._midi_cfg.f.value.w_stb):
+            m.d.sync += self.usb_midi_cfg_id.eq(self._midi_cfg.f.value.w_data)
 
         return m
 
