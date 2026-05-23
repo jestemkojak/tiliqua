@@ -102,10 +102,44 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             |w| unsafe { w.transaction_data().bits(((data as u16) << 5) | (addr as u16)) } );
     };
 
-    let (mut opts, x) = critical_section::with(|cs| {
+    let (mut opts, x, midi_voices) = critical_section::with(|cs| {
         let mut app = app.borrow_ref_mut(cs);
         app.ui.update();
-        (app.ui.opts.clone(), app.ui.pmod.sample_i())
+
+        // Poll MIDI hardware FIFO and update 3-slot voice table
+        if app.ui.opts.misc.control_source.value == ControlSource::Midi {
+            loop {
+                let word = sid.midi_read().read().bits();
+                if word == 0 { break; }
+                let bytes = [
+                    (word & 0xFF) as u8,
+                    ((word >> 8) & 0xFF) as u8,
+                    ((word >> 16) & 0xFF) as u8,
+                ];
+                if let Ok(msg) = MidiMessage::try_parse_slice(&bytes) {
+                    match msg {
+                        MidiMessage::NoteOn(_, note, vel) if u8::from(vel) > 0 => {
+                            let n = u8::from(note);
+                            let slot = app.find_midi_slot(n);
+                            app.midi_voices[slot] = MidiVoiceState {
+                                note: n,
+                                gate: true,
+                                base_freq: midi_note_to_sid_freq(n),
+                            };
+                        }
+                        MidiMessage::NoteOn(_, note, _) | MidiMessage::NoteOff(_, note, _) => {
+                            let n = u8::from(note);
+                            for v in app.midi_voices.iter_mut() {
+                                if v.note == n { v.gate = false; }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        (app.ui.opts.clone(), app.ui.pmod.sample_i(), app.midi_voices)
     });
 
     let voices: [&mut VoiceOpts; 3] = [
