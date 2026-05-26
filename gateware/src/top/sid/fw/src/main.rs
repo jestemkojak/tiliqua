@@ -30,7 +30,7 @@ use micromath::F32Ext;
 
 use midi_types::MidiMessage;
 use midi_convert::parse::MidiTryParseSlice;
-use options::{ControlSource, UsbHost};
+use options::{ControlSource, UsbHost, UnisonMode};
 
 pub const TIMER0_ISR_PERIOD_MS: u32 = 5;
 
@@ -108,6 +108,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
 
         // Poll MIDI hardware FIFO and update 3-slot voice table
         if app.ui.opts.misc.control_source.value == ControlSource::Midi {
+            let unison = app.ui.opts.poly.mode.value == UnisonMode::Unison;
             loop {
                 let word = sid.midi_read().read().bits();
                 if word == 0 { break; }
@@ -120,12 +121,19 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                     match msg {
                         MidiMessage::NoteOn(_, note, vel) if u8::from(vel) > 0 => {
                             let n = u8::from(note);
-                            let slot = app.find_midi_slot(n);
-                            app.midi_voices[slot] = MidiVoiceState {
-                                note: n,
-                                gate: true,
-                                base_freq: midi_note_to_sid_freq(n),
-                            };
+                            if unison {
+                                let freq = midi_note_to_sid_freq(n);
+                                for v in app.midi_voices.iter_mut() {
+                                    *v = MidiVoiceState { note: n, gate: true, base_freq: freq };
+                                }
+                            } else {
+                                let slot = app.find_midi_slot(n);
+                                app.midi_voices[slot] = MidiVoiceState {
+                                    note: n,
+                                    gate: true,
+                                    base_freq: midi_note_to_sid_freq(n),
+                                };
+                            }
                         }
                         MidiMessage::NoteOn(_, note, _) | MidiMessage::NoteOff(_, note, _) => {
                             let n = u8::from(note);
