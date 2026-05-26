@@ -167,11 +167,13 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         let base = (7 * n_voice) as u8;
 
         let (mut freq, gate) = if opts.misc.control_source.value == ControlSource::Midi {
-            let mut base_freq = midi_voices[n_voice].base_freq;
-            let gate = midi_voices[n_voice].gate as u8;
+            // In unison mode all voices track voice-0's note; detune is applied below.
+            let src = if opts.poly.mode.value == UnisonMode::Unison { 0 } else { n_voice };
+            let mut base_freq = midi_voices[src].base_freq;
+            let gate = midi_voices[src].gate as u8;
 
             for (ch, m) in mods.iter().enumerate() {
-                if let Some(VoiceModulationType::Frequency) = m.modulates_voice(n_voice) {
+                if let Some(VoiceModulationType::Frequency) = m.modulates_voice(src) {
                     let cv_volts: f32 = (x[ch] as f32) / 4096.0f32;
                     let delta_hz = volts_to_freq(cv_volts) - volts_to_freq(0.0f32);
                     let delta_sid = (delta_hz * 0.05960464f32 * 16.0f32) as i32;
@@ -179,18 +181,26 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                 }
             }
 
+            if opts.poly.mode.value == UnisonMode::Unison {
+                let detune_cents = opts.poly.detune.value as f32;
+                let spread: [f32; 3] = [-detune_cents / 2.0, 0.0, detune_cents / 2.0];
+                base_freq = (base_freq as f32 * 2.0f32.powf(spread[n_voice] / 1200.0)) as u16;
+            }
+
             (base_freq, gate)
         } else {
-            let mut freq: u16 = voices[n_voice].freq.value;
-            let mut gate = voices[n_voice].gate.value;
+            // In CV unison mode all voices track voice-0's CV pitch; detune applied below.
+            let src = if opts.poly.mode.value == UnisonMode::Unison { 0 } else { n_voice };
+            let mut freq: u16 = voices[src].freq.value;
+            let mut gate = voices[src].gate.value;
 
             for (ch, m) in mods.iter().enumerate() {
-                if let Some(VoiceModulationType::Frequency) = m.modulates_voice(n_voice) {
+                if let Some(VoiceModulationType::Frequency) = m.modulates_voice(src) {
                     let volts: f32 = (x[ch] as f32) / 4096.0f32;
                     let freq_hz = volts_to_freq(volts);
                     freq = 16u16 * (0.05960464f32 * freq_hz) as u16;
                 }
-                if let Some(VoiceModulationType::Gate) = m.modulates_voice(n_voice) {
+                if let Some(VoiceModulationType::Gate) = m.modulates_voice(src) {
                     if x[ch] > 2000 { gate = 1; }
                     if x[ch] < 1000 { gate = 0; }
                 }
@@ -198,6 +208,12 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
 
             voices[n_voice].freq.value = freq;
             voices[n_voice].gate.value = gate;
+
+            if opts.poly.mode.value == UnisonMode::Unison {
+                let detune_cents = opts.poly.detune.value as f32;
+                let spread: [f32; 3] = [-detune_cents / 2.0, 0.0, detune_cents / 2.0];
+                freq = (freq as f32 * 2.0f32.powf(spread[n_voice] / 1200.0)) as u16;
+            }
 
             (freq, gate)
         };
