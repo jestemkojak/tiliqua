@@ -15,6 +15,7 @@ pub enum Page {
     Filter,
     Scope,
     Misc,
+    Polyphony,
 }
 
 #[derive(Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Default, Serialize, Deserialize)]
@@ -49,6 +50,14 @@ pub enum UsbHost {
     #[default]
     Off,
     On,
+}
+
+#[derive(Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Default, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum UnisonMode {
+    #[default]
+    Poly,
+    Unison,
 }
 
 #[derive(Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Default, Serialize, Deserialize)]
@@ -102,6 +111,7 @@ int_params!(VolumeParams<u8>        { step: 1,   min: 0,      max: 15 });
 int_params!(TriggerLevelParams<i16> { step: 512, min: -16384, max: 16384 });
 int_params!(PositionParams<i16>     { step: 25,  min: -500,   max: 500 });
 int_params!(ScrollParams<u8>        { step: 1,   min: 0,      max: 60 });
+int_params!(DetuneCentsParams<u8>   { step: 5,   min: 0,      max: 50 });
 
 button_params!(OneShotButtonParams { mode: ButtonMode::OneShot });
 
@@ -121,6 +131,14 @@ pub struct MiscOpts {
     pub save_opts: ButtonOption<OneShotButtonParams>,
     #[option(false)]
     pub wipe_opts: ButtonOption<OneShotButtonParams>,
+}
+
+#[derive(OptionPage, Clone)]
+pub struct PolyOpts {
+    #[option]
+    pub mode: EnumOption<UnisonMode>,
+    #[option(10)]
+    pub detune: IntOption<DetuneCentsParams>,
 }
 
 #[derive(OptionPage, Clone)]
@@ -226,4 +244,6 @@ pub struct Opts {
     pub scope: ScopeOpts,
     #[page(Page::Misc)]
     pub misc: MiscOpts,
+    #[page(Page::Polyphony)]
+    pub poly: PolyOpts,
 }
