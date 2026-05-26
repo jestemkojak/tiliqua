@@ -88,7 +88,7 @@ fn volts_to_freq(volts: f32) -> f32 {
 fn midi_note_to_sid_freq(note: u8) -> u16 {
     // assumes 1 MHz SID clock; http://www.sidmusic.org/sid/sidtech2.html
     let freq_hz = 440.0f32 * 2.0f32.powf((note as f32 - 69.0f32) / 12.0f32);
-    (freq_hz * 0.05960464f32 * 16.0f32) as u16
+    (freq_hz * 16.777216f32) as u16
 }
 
 fn timer0_handler(app: &Mutex<RefCell<App>>) {
@@ -176,7 +176,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                 if let Some(VoiceModulationType::Frequency) = m.modulates_voice(src) {
                     let cv_volts: f32 = (x[ch] as f32) / 4096.0f32;
                     let delta_hz = volts_to_freq(cv_volts) - volts_to_freq(0.0f32);
-                    let delta_sid = (delta_hz * 0.05960464f32 * 16.0f32) as i32;
+                    let delta_sid = (delta_hz * 16.777216f32) as i32;
                     base_freq = (base_freq as i32 + delta_sid).clamp(0, 65535) as u16;
                 }
             }
@@ -198,7 +198,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                 if let Some(VoiceModulationType::Frequency) = m.modulates_voice(src) {
                     let volts: f32 = (x[ch] as f32) / 4096.0f32;
                     let freq_hz = volts_to_freq(volts);
-                    freq = 16u16 * (0.05960464f32 * freq_hz) as u16;
+                    freq = (freq_hz * 16.777216f32) as u16;
                 }
                 if let Some(VoiceModulationType::Gate) = m.modulates_voice(src) {
                     if x[ch] > 2000 { gate = 1; }
