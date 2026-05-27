@@ -46,6 +46,7 @@ struct App {
     midi_voices: [MidiVoiceState; 3],
     midi_write_ix: usize,
     midi_pitch_bend: i16,
+    midi_mod_wheel: u8,
 }
 
 impl App {
@@ -61,6 +62,7 @@ impl App {
             midi_voices: [MidiVoiceState::default(); 3],
             midi_write_ix: 0,
             midi_pitch_bend: 0,
+            midi_mod_wheel: 0,
         }
     }
 }
@@ -104,7 +106,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             |w| unsafe { w.transaction_data().bits(((data as u16) << 5) | (addr as u16)) } );
     };
 
-    let (mut opts, x, midi_voices, midi_pitch_bend) = critical_section::with(|cs| {
+    let (mut opts, x, midi_voices, midi_pitch_bend, midi_mod_wheel) = critical_section::with(|cs| {
         let mut app = app.borrow_ref_mut(cs);
         app.ui.update();
 
@@ -146,13 +148,16 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                         MidiMessage::PitchBendChange(_, bend) => {
                             app.midi_pitch_bend = i16::from(bend);
                         }
+                        MidiMessage::ControlChange(_, ctrl, val) if u8::from(ctrl) == 1 => {
+                            app.midi_mod_wheel = u8::from(val);
+                        }
                         _ => {}
                     }
                 }
             }
         }
 
-        (app.ui.opts.clone(), app.ui.pmod.sample_i(), app.midi_voices, app.midi_pitch_bend)
+        (app.ui.opts.clone(), app.ui.pmod.sample_i(), app.midi_voices, app.midi_pitch_bend, app.midi_mod_wheel)
     });
 
     let voices: [&mut VoiceOpts; 3] = [
@@ -260,8 +265,10 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             (voices[n_voice].sustain.value << 4));
     }
 
-    sid_poke(&sid, 0x15, (opts.filter.cutoff.value & 0x7) as u8);
-    sid_poke(&sid, 0x16, (opts.filter.cutoff.value >> 3) as u8);
+    let cutoff = (opts.filter.cutoff.value as u32
+        + midi_mod_wheel as u32 * 2047 / 127).min(2047) as u16;
+    sid_poke(&sid, 0x15, (cutoff & 0x7) as u8);
+    sid_poke(&sid, 0x16, (cutoff >> 3) as u8);
     sid_poke(&sid, 0x17,
         (opts.filter.filt1.value |
         (opts.filter.filt2.value << 1) |

@@ -44,6 +44,10 @@ notes are distributed across the 3 voices with round-robin voice stealing.
 The Polyphony page controls voice allocation. In poly mode each voice is
 independent. In unison mode all 3 voices play the same pitch with a
 configurable detune spread (in cents) for a fatter sound.
+
+MIDI controllers supported:
+- Pitch bend: ±2 semitone range, applied to all active voices.
+- Mod wheel (CC1): offsets the filter cutoff upward from its menu-set value.
 """
 
 import os
