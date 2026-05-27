@@ -45,6 +45,7 @@ struct App {
     ui: ui::UI<Encoder0, EurorackPmod0, I2c0, Opts>,
     midi_voices: [MidiVoiceState; 3],
     midi_write_ix: usize,
+    midi_pitch_bend: i16,
 }
 
 impl App {
@@ -59,6 +60,7 @@ impl App {
                             encoder, pca9635, pmod),
             midi_voices: [MidiVoiceState::default(); 3],
             midi_write_ix: 0,
+            midi_pitch_bend: 0,
         }
     }
 }
@@ -102,7 +104,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             |w| unsafe { w.transaction_data().bits(((data as u16) << 5) | (addr as u16)) } );
     };
 
-    let (mut opts, x, midi_voices) = critical_section::with(|cs| {
+    let (mut opts, x, midi_voices, midi_pitch_bend) = critical_section::with(|cs| {
         let mut app = app.borrow_ref_mut(cs);
         app.ui.update();
 
@@ -141,13 +143,16 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                                 if v.note == n { v.gate = false; }
                             }
                         }
+                        MidiMessage::PitchBendChange(_, bend) => {
+                            app.midi_pitch_bend = i16::from(bend);
+                        }
                         _ => {}
                     }
                 }
             }
         }
 
-        (app.ui.opts.clone(), app.ui.pmod.sample_i(), app.midi_voices)
+        (app.ui.opts.clone(), app.ui.pmod.sample_i(), app.midi_voices, app.midi_pitch_bend)
     });
 
     let voices: [&mut VoiceOpts; 3] = [
@@ -171,6 +176,10 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             let src = if opts.poly.mode.value == UnisonMode::Unison { 0 } else { n_voice };
             let mut base_freq = midi_voices[src].base_freq;
             let gate = midi_voices[src].gate as u8;
+
+            // Apply pitch bend: ±2 semitone range, bend is -8192..8191
+            let bend_semitones = (midi_pitch_bend as f32 / 8192.0f32) * 2.0f32;
+            base_freq = (base_freq as f32 * 2.0f32.powf(bend_semitones / 12.0f32)) as u16;
 
             for (ch, m) in mods.iter().enumerate() {
                 if let Some(VoiceModulationType::Frequency) = m.modulates_voice(src) {

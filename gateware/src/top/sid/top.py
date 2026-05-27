@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 """
-This example instantiates a SID chip, which can be modulated via CV.
+This example instantiates a SID chip, which can be modulated via CV or MIDI.
 
     .. code-block:: text
 
@@ -32,14 +32,18 @@ gateware. The softcore is only used for register writes.
     .. code-block:: text
 
                         ┌──────────┐  ┌───┐
-        (poll CV) ─────►│VexiiRiscv│  │SID│ ─────► (audio out)
+        (CV / MIDI) ───►│VexiiRiscv│  │SID│ ─────► (audio out)
                         └────┬─────┘  └───┘
                              │          ▲
                              └──────────┘
                            (register writes)
 
-There is a lot of design space left to explore here. For example, adding MIDI
-input, more modulation sources, adding end of chain effects and so on...
+Control source (CV or MIDI) is selected on the Misc page. In MIDI mode,
+notes are distributed across the 3 voices with round-robin voice stealing.
+
+The Polyphony page controls voice allocation. In poly mode each voice is
+independent. In unison mode all 3 voices play the same pitch with a
+configurable detune spread (in cents) for a fatter sound.
 """
 
 import os
