@@ -145,8 +145,10 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                                 if v.note == n { v.gate = false; }
                             }
                         }
-                        MidiMessage::PitchBendChange(_, bend) => {
-                            app.midi_pitch_bend = i16::from(bend);
+                        MidiMessage::PitchBendChange(_, _) => {
+                            let lsb = (bytes[1] & 0x7F) as i16;
+                            let msb = (bytes[2] & 0x7F) as i16;
+                            app.midi_pitch_bend = (msb << 7 | lsb) - 8192;
                         }
                         MidiMessage::ControlChange(_, ctrl, val) if u8::from(ctrl) == 1 => {
                             app.midi_mod_wheel = u8::from(val);
@@ -182,7 +184,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             let mut base_freq = midi_voices[src].base_freq;
             let gate = midi_voices[src].gate as u8;
 
-            // Apply pitch bend: ±2 semitone range, bend is -8192..8191
+            // Apply pitch bend: +/-2 semitone range, bend is -8192..8191
             let bend_semitones = (midi_pitch_bend as f32 / 8192.0f32) * 2.0f32;
             base_freq = (base_freq as f32 * 2.0f32.powf(bend_semitones / 12.0f32)) as u16;
 
