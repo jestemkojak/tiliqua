@@ -75,11 +75,14 @@ impl App {
         }
         // 2. Free slot (gate released)
         for (i, v) in self.midi_voices.iter().enumerate() {
-            if !v.gate { return i; }
+            if !v.gate {
+                self.midi_write_ix = (i + 1) % self.midi_voices.len();
+                return i;
+            }
         }
         // 3. Steal oldest via round-robin write index
         let slot = self.midi_write_ix;
-        self.midi_write_ix = (self.midi_write_ix + 1) % 3;
+        self.midi_write_ix = (self.midi_write_ix + 1) % self.midi_voices.len();
         slot
     }
 }
@@ -175,7 +178,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         opts.modulate.in3.value,
     ];
 
-    for n_voice in 0usize..3usize {
+    for n_voice in 0usize..midi_voices.len() {
         let base = (7 * n_voice) as u8;
 
         let (mut freq, gate) = if opts.misc.control_source.value == ControlSource::Midi {
@@ -191,9 +194,8 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             for (ch, m) in mods.iter().enumerate() {
                 if let Some(VoiceModulationType::Frequency) = m.modulates_voice(src) {
                     let cv_volts: f32 = (x[ch] as f32) / 4096.0f32;
-                    let delta_hz = volts_to_freq(cv_volts) - volts_to_freq(0.0f32);
-                    let delta_sid = (delta_hz * 16.777216f32) as i32;
-                    base_freq = (base_freq as i32 + delta_sid).clamp(0, 65535) as u16;
+                    let ratio = volts_to_freq(cv_volts) / volts_to_freq(0.0f32);
+                    base_freq = (base_freq as f32 * ratio).clamp(0.0, 65535.0) as u16;
                 }
             }
 
@@ -287,20 +289,22 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
 
     let usb_en = opts.misc.usb_host.value == UsbHost::On;
     sid.usb_midi_host().write(|w| unsafe { w.host().bit(usb_en) });
-    sid.usb_midi_cfg().write(|w| unsafe { w.value().bits(1) });
-    sid.usb_midi_endp().write(|w| unsafe { w.value().bits(1) });
 
-    if opts.misc.control_source.value == ControlSource::Cv {
-        critical_section::with(|cs| {
-            let mut app = app.borrow_ref_mut(cs);
+    critical_section::with(|cs| {
+        let mut app = app.borrow_ref_mut(cs);
+        if opts.misc.control_source.value == ControlSource::Cv {
             app.ui.opts.voice1.freq.value = voices[0].freq.value;
             app.ui.opts.voice1.gate.value = voices[0].gate.value;
             app.ui.opts.voice2.freq.value = voices[1].freq.value;
             app.ui.opts.voice2.gate.value = voices[1].gate.value;
             app.ui.opts.voice3.freq.value = voices[2].freq.value;
             app.ui.opts.voice3.gate.value = voices[2].gate.value;
-        });
-    }
+        } else {
+            app.ui.opts.voice1.gate.value = midi_voices[0].gate as u8;
+            app.ui.opts.voice2.gate.value = midi_voices[1].gate as u8;
+            app.ui.opts.voice3.gate.value = midi_voices[2].gate as u8;
+        }
+    });
 }
 
 #[entry]
@@ -359,6 +363,12 @@ fn main() -> ! {
 
     let app = Mutex::new(RefCell::new(App::new(opts)));
     let hue = 5u8;
+
+    {
+        let sid = unsafe { pac::Peripherals::steal() }.SID_PERIPH;
+        sid.usb_midi_cfg().write(|w| unsafe { w.value().bits(1) });
+        sid.usb_midi_endp().write(|w| unsafe { w.value().bits(1) });
+    }
 
     palette::ColorPalette::default().write_to_hardware(&mut display);
 

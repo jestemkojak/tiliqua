@@ -46,7 +46,7 @@ independent. In unison mode all 3 voices play the same pitch with a
 configurable detune spread (in cents) for a fatter sound.
 
 MIDI controllers supported:
-- Pitch bend: ±2 semitone range, applied to all active voices.
+- Pitch bend: +/-2 semitone range, applied to all active voices.
 - Mod wheel (CC1): offsets the filter cutoff upward from its menu-set value.
 """
 
