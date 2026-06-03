@@ -6,11 +6,16 @@ import os
 import sys
 
 from amaranth import *
-from amaranth.lib import data, stream, wiring  # data, stream used by A3+ classes
-from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered  # used by A3+ classes
-from amaranth.lib.memory import Memory  # used by A3
-from amaranth.lib.wiring import In, Out, connect, flipped  # connect/flipped used by A3+
-from amaranth_soc import csr, wishbone  # used by A3+
+from amaranth.lib import data, stream, wiring
+from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered
+from amaranth.lib.memory import Memory
+from amaranth.lib.wiring import In, Out, connect, flipped
+from amaranth_soc import csr, wishbone
+
+from tiliqua.build import sim
+from tiliqua.build.cli import top_level_cli
+from tiliqua.build.types import BitstreamHelp
+from tiliqua.tiliqua_soc import TiliquaSoc
 
 
 class Cpu6502(wiring.Component):
@@ -318,3 +323,97 @@ class PlayTimerPeripheral(wiring.Component):
             m.d.sync += counter.eq(counter + 1)
 
         return m
+
+
+class SIDPlayerSoc(TiliquaSoc):
+    """SoC that runs PSID tunes: 6502 in gateware, PSID loaded from USB by RISC-V."""
+
+    module_docstring = sys.modules[__name__].__doc__
+
+    bitstream_help = BitstreamHelp(
+        brief="PSID music player from USB mass storage.",
+        io_left=["", "", "", "", "voice0", "voice1", "voice2", "voice mix"],
+        io_right=["navigate menu", "USB drive", "video out", "", "", ""],
+    )
+
+    # Byte offset within PSRAM where the 6502's 64KB address space begins.
+    # System PSRAM base = 0x20000000; 6502 base = 0x20800000 → offset 8MB.
+    CPU6502_PSRAM_BASE_BYTES = 0x00800000
+
+    @staticmethod
+    def _import_sid_top():
+        """Load src/top/sid/top.py by path to avoid 'top' namespace collision
+        when running as a script (Python adds src/top/sid_player/ to sys.path,
+        shadowing the top package with the current top.py script)."""
+        import importlib.util
+        _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../sid/top.py")
+        spec = importlib.util.spec_from_file_location("_sid_top", os.path.realpath(_p))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_sid_top"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def __init__(self, **kwargs):
+        _sid = self._import_sid_top()
+        SIDPeripheral = _sid.SIDPeripheral
+        super().__init__(finalize_csr_bridge=False, mainram_size=0x4000, **kwargs)
+        self.sid_periph = SIDPeripheral()
+        self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
+        self.play_timer = PlayTimerPeripheral(clk_hz=int(60e6))
+        self.csr_decoder.add(self.play_timer.bus, addr=0x1100, name="play_timer")
+        self.finalize_csr_bridge()
+
+    def elaborate(self, platform):
+        _sid = self._import_sid_top()
+        SID = _sid.SID
+        m = Module()
+
+        m.submodules.sid = sid = SID()
+        m.submodules.sid_periph = self.sid_periph
+        m.submodules.play_timer = self.play_timer
+
+        # 6502 + bridge
+        m.submodules.cpu = cpu = Cpu6502()
+        m.submodules.bridge = bridge = Cpu6502Bridge(
+            sid_fifo=self.sid_periph._transactions,
+            psram_base_bytes=self.CPU6502_PSRAM_BASE_BYTES,
+        )
+        self.psram_periph.add_master(bridge.psram_bus)
+
+        # NMI latch: set on timer pulse, clear when CPU fetches NMI vector ($FFFA).
+        nmi_l = Signal()
+        with m.If(self.play_timer.nmi_pulse):
+            m.d.sync += nmi_l.eq(1)
+        with m.Elif(cpu.AB == 0xFFFA):
+            m.d.sync += nmi_l.eq(0)
+
+        m.d.comb += [
+            bridge.cpu_AB.eq(cpu.AB),
+            bridge.cpu_DO.eq(cpu.DO),
+            bridge.cpu_WE.eq(cpu.WE),
+            cpu.DI.eq(bridge.cpu_DI),
+            cpu.RDY.eq(bridge.cpu_RDY),
+            cpu.reset.eq(self.play_timer.cpu_reset),
+            cpu.IRQ.eq(0),
+            cpu.NMI.eq(nmi_l),
+        ]
+
+        m.submodules += super().elaborate(platform)
+        self.sid_periph.sid = sid
+
+        pmod0 = self.pmod0_periph.pmod
+        m.d.comb += [
+            pmod0.i_cal.valid.eq(1),
+            pmod0.i_cal.payload[0].as_value().eq(sid.voice0_dca),
+            pmod0.i_cal.payload[1].as_value().eq(sid.voice1_dca),
+            pmod0.i_cal.payload[2].as_value().eq(sid.voice2_dca),
+            pmod0.i_cal.payload[3].as_value().eq(self.sid_periph.last_audio_left >> 8),
+        ]
+
+        return m
+
+
+if __name__ == "__main__":
+    this_path = os.path.dirname(os.path.realpath(__file__))
+    top_level_cli(SIDPlayerSoc, path=this_path,
+                  archiver_callback=lambda a: a.with_option_storage())
