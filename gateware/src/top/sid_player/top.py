@@ -12,6 +12,8 @@ from amaranth.lib.memory import Memory
 from amaranth.lib.wiring import In, Out, connect, flipped
 from amaranth_soc import csr, wishbone
 
+from luna.gateware.stream.future import Packet
+
 from tiliqua.build import sim
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
@@ -325,6 +327,126 @@ class PlayTimerPeripheral(wiring.Component):
         return m
 
 
+_USB_STATUS_LAYOUT = data.StructLayout({
+    "connected": 1, "ready": 1, "busy": 1,
+    "block_size": 16, "block_count": 32})
+_USB_RESP_LAYOUT = data.StructLayout({"done": 1, "error": 1})
+
+
+class USBMSCPeripheral(wiring.Component):
+    """CSR wrapper around guh USBMSCHost: status, LBA/start command, packed
+    32-bit read-data FIFO drained by firmware."""
+
+    class Status(csr.Register, access="r"):
+        connected:   csr.Field(csr.action.R, unsigned(1))
+        ready:       csr.Field(csr.action.R, unsigned(1))
+        busy:        csr.Field(csr.action.R, unsigned(1))
+        rx_avail:    csr.Field(csr.action.R, unsigned(1))
+
+    class BlockSize(csr.Register, access="r"):
+        value: csr.Field(csr.action.R, unsigned(16))
+
+    class BlockCount(csr.Register, access="r"):
+        value: csr.Field(csr.action.R, unsigned(32))
+
+    class Lba(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(32))
+
+    class Start(csr.Register, access="w"):
+        strobe: csr.Field(csr.action.W, unsigned(1))
+
+    class RxData(csr.Register, access="r"):
+        word: csr.Field(csr.action.R, unsigned(32))
+
+    class Resp(csr.Register, access="r"):
+        done:  csr.Field(csr.action.R, unsigned(1))
+        error: csr.Field(csr.action.R, unsigned(1))
+
+    # Ports — all class-level so no dict/annotation conflict.
+    bus:       In(csr.Signature(addr_width=5, data_width=8))
+    rx_data:   In(stream.Signature(Packet(unsigned(8))))
+    lba_o:     Out(32)
+    start_o:   Out(1)
+    status_i:  In(_USB_STATUS_LAYOUT)
+    resp_i:    In(_USB_RESP_LAYOUT)
+    dbg_word_level: Out(8)
+    dbg_word_data:  Out(32)
+
+    def __init__(self, *, word_fifo_depth=256):
+        self._word_fifo = SyncFIFOBuffered(width=32, depth=word_fifo_depth)
+        regs = csr.Builder(addr_width=5, data_width=8)
+        self._status      = regs.add("status",      self.Status(),     offset=0x00)
+        self._block_size  = regs.add("block_size",  self.BlockSize(),  offset=0x04)
+        self._block_count = regs.add("block_count", self.BlockCount(), offset=0x08)
+        self._lba         = regs.add("lba",         self.Lba(),        offset=0x0C)
+        self._start       = regs.add("start",       self.Start(),      offset=0x10)
+        self._rx_data_reg = regs.add("rx_data",     self.RxData(),     offset=0x14)
+        self._resp        = regs.add("resp",        self.Resp(),       offset=0x18)
+        self._bridge = csr.Bridge(regs.as_memory_map())
+        super().__init__()
+        self.bus.memory_map = self._bridge.bus.memory_map
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bridge = self._bridge
+        wiring.connect(m, wiring.flipped(self.bus), self._bridge.bus)
+        m.submodules.word_fifo = wf = self._word_fifo
+
+        # Pack incoming bytes (little-endian) into 32-bit words.
+        byte_ix = Signal(2)
+        acc = Signal(32)
+        m.d.comb += [self.rx_data.ready.eq(1), wf.w_en.eq(0)]
+        with m.If(self.rx_data.valid & self.rx_data.ready):
+            b = self.rx_data.payload.data
+            with m.Switch(byte_ix):
+                for i in range(4):
+                    with m.Case(i):
+                        m.d.sync += acc[i*8:(i+1)*8].eq(b)
+            m.d.sync += byte_ix.eq(byte_ix + 1)
+            with m.If(byte_ix == 3):
+                m.d.comb += [wf.w_data.eq(Cat(acc[0:24], b)), wf.w_en.eq(1)]
+
+        # Status / capacity readback.
+        m.d.comb += [
+            self._status.f.connected.r_data.eq(self.status_i.connected),
+            self._status.f.ready.r_data.eq(self.status_i.ready),
+            self._status.f.busy.r_data.eq(self.status_i.busy),
+            self._status.f.rx_avail.r_data.eq(wf.r_level != 0),
+            self._block_size.f.value.r_data.eq(self.status_i.block_size),
+            self._block_count.f.value.r_data.eq(self.status_i.block_count),
+        ]
+
+        # Command: latch LBA, pulse start.
+        with m.If(self._lba.f.value.w_stb):
+            m.d.sync += self.lba_o.eq(self._lba.f.value.w_data)
+        m.d.comb += self.start_o.eq(
+            self._start.f.strobe.w_stb & self._start.f.strobe.w_data)
+
+        # Drain word FIFO on rx_data CSR read.
+        m.d.comb += wf.r_en.eq(self._rx_data_reg.f.word.r_stb)
+        with m.If(wf.r_level != 0):
+            m.d.comb += self._rx_data_reg.f.word.r_data.eq(wf.r_data)
+        with m.Else():
+            m.d.comb += self._rx_data_reg.f.word.r_data.eq(0)
+
+        # Sticky response latch (set on resp_i.done).
+        resp_done_r = Signal()
+        resp_error_r = Signal()
+        with m.If(self.resp_i.done):
+            m.d.sync += [resp_done_r.eq(1),
+                         resp_error_r.eq(self.resp_i.error)]
+        m.d.comb += [
+            self._resp.f.done.r_data.eq(resp_done_r),
+            self._resp.f.error.r_data.eq(resp_error_r),
+        ]
+
+        m.d.comb += [
+            self.dbg_word_level.eq(wf.r_level),
+            self.dbg_word_data.eq(wf.r_data),
+        ]
+        return m
+
+
 class SIDPlayerSoc(TiliquaSoc):
     """SoC that runs PSID tunes: 6502 in gateware, PSID loaded from USB by RISC-V."""
 
@@ -361,6 +483,8 @@ class SIDPlayerSoc(TiliquaSoc):
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
         self.play_timer = PlayTimerPeripheral(clk_hz=int(60e6))
         self.csr_decoder.add(self.play_timer.bus, addr=0x1100, name="play_timer")
+        self.usb_msc = USBMSCPeripheral()
+        self.csr_decoder.add(self.usb_msc.bus, addr=0x1200, name="usb_msc")
         self.finalize_csr_bridge()
 
     def elaborate(self, platform):
@@ -400,6 +524,25 @@ class SIDPlayerSoc(TiliquaSoc):
 
         m.submodules += super().elaborate(platform)
         self.sid_periph.sid = sid
+
+        if sim.is_hw(platform):
+            from guh.engines.msc import USBMSCHost
+            ulpi = platform.request(platform.default_usb_connection)
+            m.submodules.usb = usb = USBMSCHost(bus=ulpi)
+            m.submodules.usb_msc = self.usb_msc
+            wiring.connect(m, usb.rx_data, self.usb_msc.rx_data)
+            m.d.comb += [
+                self.usb_msc.status_i.connected.eq(usb.status.connected),
+                self.usb_msc.status_i.ready.eq(usb.status.ready),
+                self.usb_msc.status_i.busy.eq(usb.status.busy),
+                self.usb_msc.status_i.block_size.eq(usb.status.block_size),
+                self.usb_msc.status_i.block_count.eq(usb.status.block_count),
+                usb.cmd.lba.eq(self.usb_msc.lba_o),
+                usb.cmd.start.eq(self.usb_msc.start_o),
+                self.usb_msc.resp_i.done.eq(usb.resp.done),
+                self.usb_msc.resp_i.error.eq(usb.resp.error),
+                platform.request("usb_vbus_en").o.eq(1),
+            ]
 
         pmod0 = self.pmod0_periph.pmod
         m.d.comb += [
