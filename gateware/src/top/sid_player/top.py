@@ -101,3 +101,68 @@ class Cpu6502(wiring.Component):
             )
 
         return m
+
+
+class Cpu6502Bridge(wiring.Component):
+    """Address decoder / memory router for the 6502.
+
+      $0000-$07FF -> 2KB BRAM           (single cycle, RDY stays 1)
+      $D400-$D41F + WE -> SID FIFO push (single cycle, RDY stays 1)
+      else        -> PSRAM via Wishbone (multi-cycle, RDY=0 until done)
+
+    PSRAM is word-granular (sel must be 0b1111), so byte writes to PSRAM do
+    read-modify-write. See plan "Critical Constraints" #1.
+    """
+
+    # CPU-facing side (connects to Cpu6502)
+    cpu_AB:  In(16)
+    cpu_DO:  In(8)
+    cpu_WE:  In(1)
+    cpu_DI:  Out(8)
+    cpu_RDY: Out(1)
+
+    # Wishbone master into PSRAM (filled in Task A4).
+    psram_bus: Out(wishbone.Signature(
+        addr_width=22, data_width=32, granularity=8,
+        features={"cti", "bte"}))
+
+    def __init__(self, *, sid_fifo, psram_base_bytes):
+        self._sid_fifo = sid_fifo
+        self._psram_base_bytes = psram_base_bytes
+        super().__init__()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        bram = Memory(shape=unsigned(8), depth=2048, init=[])
+        m.submodules.bram = bram
+        wr = bram.write_port(granularity=8)
+        rd = bram.read_port(domain="comb")
+
+        is_bram = self.cpu_AB < 0x0800
+        is_sid  = (self.cpu_AB >= 0xD400) & (self.cpu_AB <= 0xD41F)
+
+        # Default: single-cycle, no stall (overridden by PSRAM path in A4).
+        m.d.comb += self.cpu_RDY.eq(1)
+
+        # --- BRAM ---
+        m.d.comb += [
+            rd.addr.eq(self.cpu_AB[0:11]),
+            wr.addr.eq(self.cpu_AB[0:11]),
+            wr.data.eq(self.cpu_DO),
+            wr.en.eq(is_bram & self.cpu_WE),
+        ]
+
+        # --- SID FIFO ---
+        m.d.comb += [
+            self._sid_fifo.w_data.eq((self.cpu_DO << 5) | self.cpu_AB[0:5]),
+            self._sid_fifo.w_en.eq(is_sid & self.cpu_WE),
+        ]
+
+        # --- Read data mux (PSRAM byte added in A4) ---
+        with m.If(is_bram):
+            m.d.comb += self.cpu_DI.eq(rd.data)
+        with m.Else():
+            m.d.comb += self.cpu_DI.eq(0xFF)  # placeholder until A4
+
+        return m
