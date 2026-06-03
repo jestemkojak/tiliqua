@@ -249,3 +249,72 @@ class Cpu6502Bridge(wiring.Component):
                     m.next = "IDLE"
 
         return m
+
+
+class PlayTimerPeripheral(wiring.Component):
+    """CSR control of the 6502 + periodic NMI at the PSID play rate.
+
+    CSR register 'control': bit0 reset, bit1 play_rate (0=PAL/50,1=NTSC/60),
+    bit2 irq_enable. Emits nmi_pulse (1 cycle) at the selected rate when enabled
+    and not in reset. Also drives cpu_reset out.
+    """
+
+    class Control(csr.Register, access="w"):
+        reset:      csr.Field(csr.action.W, unsigned(1))
+        play_rate:  csr.Field(csr.action.W, unsigned(1))
+        irq_enable: csr.Field(csr.action.W, unsigned(1))
+
+    def __init__(self, *, clk_hz=60_000_000, rate_hz_pal=50, rate_hz_ntsc=60):
+        self._div_pal  = clk_hz // rate_hz_pal
+        self._div_ntsc = clk_hz // rate_hz_ntsc
+        regs = csr.Builder(addr_width=2, data_width=8)
+        self._control = regs.add("control", self.Control(), offset=0x0)
+        self._bridge = csr.Bridge(regs.as_memory_map())
+        super().__init__({
+            "bus":          In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
+            "nmi_pulse":    Out(1),
+            "cpu_reset":    Out(1),
+            "dbg_reset":    In(1),
+            "dbg_play_rate":  In(1),
+            "dbg_irq_enable": In(1),
+        })
+        self.bus.memory_map = self._bridge.bus.memory_map
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bridge = self._bridge
+        wiring.connect(m, wiring.flipped(self.bus), self._bridge.bus)
+
+        reset_r = Signal()
+        rate_r  = Signal()
+        en_r    = Signal()
+        with m.If(self._control.f.reset.w_stb):
+            m.d.sync += reset_r.eq(self._control.f.reset.w_data)
+        with m.If(self._control.f.play_rate.w_stb):
+            m.d.sync += rate_r.eq(self._control.f.play_rate.w_data)
+        with m.If(self._control.f.irq_enable.w_stb):
+            m.d.sync += en_r.eq(self._control.f.irq_enable.w_data)
+
+        reset_eff = reset_r | self.dbg_reset
+        rate_eff  = rate_r  | self.dbg_play_rate
+        en_eff    = en_r    | self.dbg_irq_enable
+
+        m.d.comb += self.cpu_reset.eq(reset_eff)
+
+        period = Signal(32)
+        with m.If(rate_eff):
+            m.d.comb += period.eq(self._div_ntsc)
+        with m.Else():
+            m.d.comb += period.eq(self._div_pal)
+
+        counter = Signal(32)
+        m.d.comb += self.nmi_pulse.eq(0)
+        with m.If(~en_eff | reset_eff):
+            m.d.sync += counter.eq(0)
+        with m.Elif(counter >= (period - 1)):
+            m.d.sync += counter.eq(0)
+            m.d.comb += self.nmi_pulse.eq(1)
+        with m.Else():
+            m.d.sync += counter.eq(counter + 1)
+
+        return m
