@@ -13,9 +13,10 @@ class FakePSRAM(wiring.Component):
     """
 
     def __init__(self, *, addr_width=22, data_width=32,
-                 storage_words=512, latency_cycles=4):
+                 storage_words=512, latency_cycles=4, init_words=None):
         self.latency_cycles = latency_cycles
         self.storage_words = storage_words
+        self._init_words = init_words or []
         super().__init__({
             "bus": In(wishbone.Signature(
                 addr_width=addr_width,
@@ -30,7 +31,7 @@ class FakePSRAM(wiring.Component):
 
         bus = self.bus
 
-        memory = Memory(shape=unsigned(self.bus.signature.data_width), depth=self.storage_words, init=[])
+        memory = Memory(shape=unsigned(self.bus.signature.data_width), depth=self.storage_words, init=self._init_words)
         m.submodules.memory = memory
         mem_wr_port = memory.write_port(granularity=8)
         mem_rd_port = memory.read_port()
