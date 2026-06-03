@@ -212,6 +212,9 @@ class SIDPeripheral(wiring.Component):
         super().__init__({
             "bus":           In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
             "i_midi":        In(stream.Signature(midi.MidiMessage)),
+            # External SID write path (e.g. from 6502 bridge in sid_player)
+            "ext_w_en":      In(1),
+            "ext_w_data":    In(16),
             # MIDI output ports (driven from CSR writes, read by SIDSoc)
             "usb_midi_host":   Out(1),
             "usb_midi_cfg_id": Out(4),
@@ -226,10 +229,10 @@ class SIDPeripheral(wiring.Component):
         connect(m, flipped(self.bus), self._bridge.bus)
         m.submodules.transactions = self._transactions
 
-        # CSRs -> Transactions FIFO
+        # CSRs -> Transactions FIFO (ORed with optional external write path)
         m.d.comb += [
-            self._transactions.w_en      .eq(self._transaction_data.f.transaction_data.w_stb),
-            self._transactions.w_data    .eq(self._transaction_data.f.transaction_data.w_data),
+            self._transactions.w_en  .eq(self._transaction_data.f.transaction_data.w_stb | self.ext_w_en),
+            self._transactions.w_data.eq(Mux(self.ext_w_en, self.ext_w_data, self._transaction_data.f.transaction_data.w_data)),
         ]
 
         DIVIDE_BY = 60 # sync clk / 60 should be ~1MHz. TODO generate this constant
@@ -361,6 +364,9 @@ class SIDSoc(TiliquaSoc):
         pmod0 = self.pmod0_periph.pmod
 
         self.sid_periph.sid = sid
+
+        # ext_w_* unused in SIDSoc (RISC-V uses CSR path); drive to 0.
+        m.d.comb += [self.sid_periph.ext_w_en.eq(0), self.sid_periph.ext_w_data.eq(0)]
 
         m.d.comb += [
             pmod0.i_cal.valid.eq(1),

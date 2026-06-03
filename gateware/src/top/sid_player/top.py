@@ -133,8 +133,11 @@ class Cpu6502Bridge(wiring.Component):
         addr_width=22, data_width=32, granularity=8,
         features={"cti", "bte"}))
 
-    def __init__(self, *, sid_fifo, psram_base_bytes):
-        self._sid_fifo = sid_fifo
+    # SID write outputs: connect to SIDPeripheral.ext_w_en / ext_w_data
+    sid_w_en:   Out(1)
+    sid_w_data: Out(16)
+
+    def __init__(self, *, psram_base_bytes):
         self._psram_base_bytes = psram_base_bytes
         super().__init__()
 
@@ -157,10 +160,10 @@ class Cpu6502Bridge(wiring.Component):
             wr.data.eq(self.cpu_DO),
             wr.en.eq(is_bram & self.cpu_WE),
         ]
-        # SID FIFO
+        # SID write: drive output ports, connected to SIDPeripheral.ext_w_*
         m.d.comb += [
-            self._sid_fifo.w_data.eq((self.cpu_DO << 5) | self.cpu_AB[0:5]),
-            self._sid_fifo.w_en.eq(is_sid & self.cpu_WE),
+            self.sid_w_data.eq((self.cpu_DO << 5) | self.cpu_AB[0:5]),
+            self.sid_w_en.eq(is_sid & self.cpu_WE),
         ]
 
         bus = self.psram_bus
@@ -499,10 +502,13 @@ class SIDPlayerSoc(TiliquaSoc):
         # 6502 + bridge
         m.submodules.cpu = cpu = Cpu6502()
         m.submodules.bridge = bridge = Cpu6502Bridge(
-            sid_fifo=self.sid_periph._transactions,
             psram_base_bytes=self.CPU6502_PSRAM_BASE_BYTES,
         )
         self.psram_periph.add_master(bridge.psram_bus)
+        m.d.comb += [
+            self.sid_periph.ext_w_en  .eq(bridge.sid_w_en),
+            self.sid_periph.ext_w_data.eq(bridge.sid_w_data),
+        ]
 
         # NMI latch: set on timer pulse, clear when CPU fetches NMI vector ($FFFA).
         nmi_l = Signal()

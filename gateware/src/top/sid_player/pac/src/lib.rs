@@ -9,14 +9,12 @@ compile_error!(r#"Only one of the "minerva" or "vexriscv" features can be select
 #[macro_use]
 mod macros;
 
-#[cfg(target_arch = "riscv32")]
 pub mod cpu;
-#[cfg(target_arch = "riscv32")]
 pub mod csr;
 pub mod register {
-    #[cfg(all(target_arch = "riscv32", feature = "minerva"))]
+    #[cfg(feature = "minerva")]
     pub use crate::cpu::minerva::register::*;
-    #[cfg(all(target_arch = "riscv32", feature = "vexriscv"))]
+    #[cfg(feature = "vexriscv")]
     pub use crate::cpu::vexriscv::register::*;
 }
 
