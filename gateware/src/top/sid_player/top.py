@@ -141,28 +141,111 @@ class Cpu6502Bridge(wiring.Component):
 
         is_bram = self.cpu_AB < 0x0800
         is_sid  = (self.cpu_AB >= 0xD400) & (self.cpu_AB <= 0xD41F)
+        is_psram = ~is_bram & ~is_sid
 
-        # Default: single-cycle, no stall (overridden by PSRAM path in A4).
-        m.d.comb += self.cpu_RDY.eq(1)
-
-        # --- BRAM ---
+        # BRAM
         m.d.comb += [
             rd.addr.eq(self.cpu_AB[0:11]),
             wr.addr.eq(self.cpu_AB[0:11]),
             wr.data.eq(self.cpu_DO),
             wr.en.eq(is_bram & self.cpu_WE),
         ]
-
-        # --- SID FIFO ---
+        # SID FIFO
         m.d.comb += [
             self._sid_fifo.w_data.eq((self.cpu_DO << 5) | self.cpu_AB[0:5]),
             self._sid_fifo.w_en.eq(is_sid & self.cpu_WE),
         ]
 
-        # --- Read data mux (PSRAM byte added in A4) ---
+        bus = self.psram_bus
+        # Byte address -> word index. base is in bytes; >>2 -> word.
+        byte_addr = Signal(24)
+        m.d.comb += byte_addr.eq(self._psram_base_bytes + self.cpu_AB)
+        word_adr = byte_addr[2:24]      # 22-bit word index
+        byte_sel = self.cpu_AB[0:2]     # which byte within the word
+
+        psram_di = Signal(8)
+        captured_word = Signal(32)
+        rmw_word = Signal(32)
+
+        # FakePSRAM (and the real core) assert sel==0b1111 on every cycle;
+        # drive it constantly since byte-lane masking is never used.
+        m.d.comb += bus.sel.eq(0b1111)
+
+        # Default: single-cycle paths do not stall.
+        m.d.comb += self.cpu_RDY.eq(~is_psram)
+
         with m.If(is_bram):
             m.d.comb += self.cpu_DI.eq(rd.data)
         with m.Else():
-            m.d.comb += self.cpu_DI.eq(0xFF)  # placeholder until A4
+            m.d.comb += self.cpu_DI.eq(psram_di)
+
+        # Mux selected byte out of a 32-bit word.
+        def select_byte(word):
+            b = Signal(8)
+            with m.Switch(byte_sel):
+                for i in range(4):
+                    with m.Case(i):
+                        m.d.comb += b.eq(word[i*8:(i+1)*8])
+            return b
+
+        with m.FSM(name="psram_fsm"):
+            with m.State("IDLE"):
+                m.d.comb += self.cpu_RDY.eq(~is_psram)  # stall only on psram access
+                with m.If(is_psram):
+                    m.d.comb += self.cpu_RDY.eq(0)
+                    with m.If(self.cpu_WE):
+                        m.next = "READ-FOR-RMW"
+                    with m.Else():
+                        m.next = "READ"
+
+            # --- plain read ---
+            with m.State("READ"):
+                m.d.comb += [
+                    self.cpu_RDY.eq(0),
+                    bus.cyc.eq(1), bus.stb.eq(1), bus.we.eq(0),
+                    bus.adr.eq(word_adr),
+                    bus.cti.eq(wishbone.CycleType.CLASSIC),
+                ]
+                with m.If(bus.ack):
+                    m.d.sync += captured_word.eq(bus.dat_r)
+                    m.next = "READ-DONE"
+
+            with m.State("READ-DONE"):
+                # Present the byte for one cycle with RDY=1 so the CPU latches it.
+                m.d.comb += [
+                    self.cpu_RDY.eq(1),
+                    psram_di.eq(select_byte(captured_word)),
+                ]
+                m.next = "IDLE"
+
+            # --- read-modify-write for byte writes ---
+            with m.State("READ-FOR-RMW"):
+                m.d.comb += [
+                    self.cpu_RDY.eq(0),
+                    bus.cyc.eq(1), bus.stb.eq(1), bus.we.eq(0),
+                    bus.adr.eq(word_adr),
+                    bus.cti.eq(wishbone.CycleType.CLASSIC),
+                ]
+                with m.If(bus.ack):
+                    new_word = Signal(32)
+                    m.d.comb += new_word.eq(bus.dat_r)
+                    # Replace the addressed byte.
+                    with m.Switch(byte_sel):
+                        for i in range(4):
+                            with m.Case(i):
+                                m.d.comb += new_word[i*8:(i+1)*8].eq(self.cpu_DO)
+                    m.d.sync += rmw_word.eq(new_word)
+                    m.next = "WRITE"
+
+            with m.State("WRITE"):
+                m.d.comb += [
+                    self.cpu_RDY.eq(0),
+                    bus.cyc.eq(1), bus.stb.eq(1), bus.we.eq(1),
+                    bus.adr.eq(word_adr),
+                    bus.dat_w.eq(rmw_word),
+                    bus.cti.eq(wishbone.CycleType.CLASSIC),
+                ]
+                with m.If(bus.ack):
+                    m.next = "IDLE"
 
         return m

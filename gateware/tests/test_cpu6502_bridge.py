@@ -95,5 +95,61 @@ class Cpu6502BridgeTests(unittest.TestCase):
         sim.run()
 
 
+from amaranth.lib import wiring as _wiring
+from tiliqua.test import psram as test_psram
+
+
+class Cpu6502BridgePsramTests(unittest.TestCase):
+    def _build(self):
+        sid_fifo = SyncFIFO(width=16, depth=16)
+        # psram_base_bytes=0 keeps word math simple
+        bridge = Cpu6502Bridge(sid_fifo=sid_fifo, psram_base_bytes=0x0)
+        fake = test_psram.FakePSRAM(addr_width=22, data_width=32,
+                                    storage_words=4096, latency_cycles=4)
+        m = Module()
+        m.submodules.bridge = bridge
+        m.submodules.sid_fifo = sid_fifo
+        m.submodules.fake = fake
+        _wiring.connect(m, bridge.psram_bus, fake.bus)
+        return m, bridge, fake
+
+    def test_psram_rmw_preserves_adjacent_byte(self):
+        m, bridge, fake = self._build()
+
+        async def testbench(ctx):
+            # Write 0x33 to byte $0002 (RMW into word 0).
+            ctx.set(bridge.cpu_WE, 1)
+            ctx.set(bridge.cpu_AB, 0x0002)
+            ctx.set(bridge.cpu_DO, 0x33)
+            # Wait for the write to complete (RDY returns high).
+            for _ in range(64):
+                await ctx.tick()
+                if ctx.get(bridge.cpu_RDY) == 1:
+                    break
+            self.assertEqual(ctx.get(bridge.cpu_RDY), 1)
+            # Write 0x77 to byte $0003 (RMW must preserve byte 2).
+            ctx.set(bridge.cpu_AB, 0x0003)
+            ctx.set(bridge.cpu_DO, 0x77)
+            await ctx.tick()
+            for _ in range(64):
+                await ctx.tick()
+                if ctx.get(bridge.cpu_RDY) == 1:
+                    break
+            # Read back byte $0002, expect preserved 0x33.
+            ctx.set(bridge.cpu_WE, 0)
+            ctx.set(bridge.cpu_AB, 0x0002)
+            await ctx.tick()
+            for _ in range(64):
+                await ctx.tick()
+                if ctx.get(bridge.cpu_RDY) == 1:
+                    break
+            self.assertEqual(ctx.get(bridge.cpu_DI), 0x33)
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+
 if __name__ == "__main__":
     unittest.main()
