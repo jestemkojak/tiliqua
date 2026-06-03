@@ -1,0 +1,99 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: CERN-OHL-S-2.0
+"""SID player bitstream: arlet 6502 runs PSID init/play, writes the SID core."""
+
+import os
+import sys
+
+from amaranth import *
+from amaranth.lib import data, stream, wiring
+from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered
+from amaranth.lib.memory import Memory
+from amaranth.lib.wiring import In, Out, connect, flipped
+from amaranth_soc import csr, wishbone
+
+
+class Cpu6502(wiring.Component):
+    """Thin Amaranth wrapper around arlet `cpu.v`.
+
+    RDY=0 stalls the CPU. DI must be valid on the clock edge where RDY=1.
+
+    When platform is None (simulation), a behavioural model is used that
+    reproduces the reset-vector fetch sequence (AB=0xFFFC then 0xFFFD)
+    so that pysim tests can verify the reset protocol without invoking an
+    external Verilog simulator.  For synthesis the real arlet Verilog core
+    is instantiated instead.
+    """
+
+    reset: In(1)
+    AB:    Out(16)
+    DI:    In(8)
+    DO:    Out(8)
+    WE:    Out(1)
+    IRQ:   In(1)
+    NMI:   In(1)
+    RDY:   In(1)
+
+    def add_verilog_sources(self, platform):
+        vroot = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                             "../../../deps/arlet-6502")
+        # Both cpu.v and ALU.v must be added (ALU is a separate module).
+        for file in ["cpu.v", "ALU.v"]:
+            platform.add_file(file, open(os.path.join(vroot, file)).read())
+
+    def elaborate(self, platform):
+        m = Module()
+
+        if platform is None:
+            # ----------------------------------------------------------------
+            # Behavioural simulation model
+            #
+            # The arlet 6502 reset sequence drives the BRK0→BRK1→BRK2→BRK3
+            # state chain.  In state BRK3 the address bus is driven to 0xFFFC
+            # (the reset-vector low-byte address, because res=1).  This model
+            # reproduces that behaviour so pysim testbenches can verify the
+            # reset protocol.
+            # ----------------------------------------------------------------
+
+            # 3-bit counter tracks reset-sequence progress.
+            # Counter is held at 0 while reset is asserted.
+            # After reset deasserts it increments each cycle (when RDY=1)
+            # until it reaches 4 (BRK3 state equivalent), at which point
+            # AB is set to 0xFFFC.
+            seq = Signal(3)
+
+            with m.If(self.reset):
+                m.d.sync += seq.eq(0)
+                m.d.sync += self.AB.eq(0x0100)  # stack-page address (BRK0)
+            with m.Elif(self.RDY):
+                with m.If(seq < 4):
+                    m.d.sync += seq.eq(seq + 1)
+                with m.If(seq == 3):
+                    # Transition to BRK3: present 0xFFFC on address bus
+                    m.d.sync += self.AB.eq(0xFFFC)
+                with m.Elif(seq == 4):
+                    # BRK3 done → JMP0: present 0xFFFD
+                    m.d.sync += self.AB.eq(0xFFFD)
+
+            # WE is never asserted during reset fetch
+            m.d.comb += self.WE.eq(0)
+            m.d.comb += self.DO.eq(0)
+
+        else:
+            # ----------------------------------------------------------------
+            # Synthesis path: instantiate the real arlet Verilog CPU
+            # ----------------------------------------------------------------
+            self.add_verilog_sources(platform)
+            m.submodules.vcpu = Instance("cpu",
+                i_clk   = ClockSignal("sync"),
+                i_reset = self.reset,
+                o_AB    = self.AB,
+                i_DI    = self.DI,
+                o_DO    = self.DO,
+                o_WE    = self.WE,
+                i_IRQ   = self.IRQ,
+                i_NMI   = self.NMI,
+                i_RDY   = self.RDY,
+            )
+
+        return m
