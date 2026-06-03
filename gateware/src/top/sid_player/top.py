@@ -6,11 +6,11 @@ import os
 import sys
 
 from amaranth import *
-from amaranth.lib import data, stream, wiring
-from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered
-from amaranth.lib.memory import Memory
-from amaranth.lib.wiring import In, Out, connect, flipped
-from amaranth_soc import csr, wishbone
+from amaranth.lib import data, stream, wiring  # data, stream used by A3+ classes
+from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered  # used by A3+ classes
+from amaranth.lib.memory import Memory  # used by A3
+from amaranth.lib.wiring import In, Out, connect, flipped  # connect/flipped used by A3+
+from amaranth_soc import csr, wishbone  # used by A3+
 
 
 class Cpu6502(wiring.Component):
@@ -23,6 +23,10 @@ class Cpu6502(wiring.Component):
     so that pysim tests can verify the reset protocol without invoking an
     external Verilog simulator.  For synthesis the real arlet Verilog core
     is instantiated instead.
+
+    NOTE: In the simulation model, AB is driven via m.d.sync (registered),
+    so it is one cycle behind the combinatorial AB of the real Verilog core.
+    Bridge tests must account for this one-cycle latency.
     """
 
     reset: In(1)
