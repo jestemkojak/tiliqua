@@ -14,9 +14,12 @@ from amaranth_soc import csr, wishbone
 
 from luna.gateware.stream.future import Packet
 
+from tiliqua import dsp
 from tiliqua.build import sim
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
+from tiliqua.raster import PSQ, scope
+from tiliqua.raster.plot import FramebufferPlotter
 from tiliqua.tiliqua_soc import TiliquaSoc
 
 
@@ -537,6 +540,18 @@ class SIDPlayerSoc(TiliquaSoc):
         self.csr_decoder.add(self.play_timer.bus, addr=0x1100, name="play_timer")
         self.usb_msc = USBMSCPeripheral()
         self.csr_decoder.add(self.usb_msc.bus, addr=0x1200, name="usb_msc")
+
+        # Dedicated plotter for the scope (base SoC plotter's 3 ports are
+        # taken by pixel_plot/blit/line). One port per scope channel.
+        self.scope_plotter = FramebufferPlotter(
+            bus_signature=self.psram_periph.bus.signature.flip(), n_ports=4)
+        self.psram_periph.add_master(self.scope_plotter.bus)
+
+        # 4-channel oscilloscope: V1, V2, V3, mix.
+        self.scope_periph = scope.ScopePeripheral(
+            n_channels=4, fs=self.clock_settings.audio_clock.fs())
+        self.csr_decoder.add(self.scope_periph.bus, addr=0x1300, name="scope_periph")
+
         self.finalize_csr_bridge()
 
     def elaborate(self, platform):
@@ -607,6 +622,33 @@ class SIDPlayerSoc(TiliquaSoc):
             pmod0.i_cal.payload[2].as_value().eq(sid.voice2_dca),
             pmod0.i_cal.payload[3].as_value().eq(self.sid_periph.last_audio_left >> 8),
         ]
+
+        # --- Voice scope ---------------------------------------------------
+        m.submodules.scope_plotter = self.scope_plotter
+        m.submodules.scope_periph  = self.scope_periph
+
+        # Each scope channel drives one plotter port.
+        for n in range(4):
+            wiring.connect(m, self.scope_periph.o[n], self.scope_plotter.i[n])
+
+        # Plotter writes into the live framebuffer (fan-out from fb.fbp,
+        # same pattern as the base plotter/persist consumers).
+        wiring.connect(m, wiring.flipped(self.fb.fbp), self.scope_plotter.fbp)
+        self.scope_periph.source = pmod0.i_cal
+
+        # Non-blocking tap of the 4 audio channels already on i_cal.
+        # We deliberately ignore plot_fifo.i.ready so the SID audio stream
+        # is never stalled by plotting (drops samples if the FIFO is full).
+        m.submodules.plot_fifo = plot_fifo = dsp.SyncFIFOBuffered(
+            shape=data.ArrayLayout(PSQ, 4), depth=32)
+        m.d.comb += [
+            plot_fifo.i.valid.eq(pmod0.i_cal.valid & pmod0.i_cal.ready),
+            plot_fifo.i.payload[0].eq(pmod0.i_cal.payload[0]),
+            plot_fifo.i.payload[1].eq(pmod0.i_cal.payload[1]),
+            plot_fifo.i.payload[2].eq(pmod0.i_cal.payload[2]),
+            plot_fifo.i.payload[3].eq(pmod0.i_cal.payload[3]),
+        ]
+        wiring.connect(m, plot_fifo.o, self.scope_periph.i)
 
         return m
 
