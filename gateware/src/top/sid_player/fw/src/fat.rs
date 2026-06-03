@@ -40,6 +40,8 @@ pub struct MscStorage<'a> {
     msc: &'a UsbMsc,
     /// Current byte position within the virtual disk image.
     pos: u64,
+    /// Block size in bytes (from the MSC device).
+    block_size: u32,
     /// LBA currently held in `cache`, or None if cache is cold.
     cache_lba: Option<u32>,
     /// Single-block read cache.
@@ -48,9 +50,12 @@ pub struct MscStorage<'a> {
 
 impl<'a> MscStorage<'a> {
     pub fn new(msc: &'a UsbMsc) -> Self {
+        let block_size = msc.block_size() as u32;
+        let block_size = if block_size == 0 { 512 } else { block_size };
         Self {
             msc,
             pos: 0,
+            block_size,
             cache_lba: None,
             cache: [0u8; 512],
         }
@@ -79,6 +84,9 @@ impl<'a> Read for MscStorage<'a> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // Cache and read_block are always 512-byte — use that regardless of
+        // self.block_size (which may differ on exotic drives but read_block
+        // always transfers exactly 512 bytes).
         let lba = (self.pos / 512) as u32;
         let offset_in_block = (self.pos % 512) as usize;
         self.ensure_block(lba)?;
