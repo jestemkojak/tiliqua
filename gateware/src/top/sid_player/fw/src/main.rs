@@ -7,7 +7,6 @@ use riscv_rt::entry;
 use tiliqua_pac as pac;
 use tiliqua_fw::*;
 
-mod usb_msc;
 use tiliqua_lib::*;
 use pac::constants::*;
 

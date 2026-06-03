@@ -23,6 +23,7 @@ colorsys = { version = "*", default-features = false }
 critical-section = "1.2.0"
 amaranth-soc-isr = { path="../../../rs/isr", default-features = false }
 irq = "0.2.3"
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false }
 [profile.release]
 codegen-units = 1
 debug = true

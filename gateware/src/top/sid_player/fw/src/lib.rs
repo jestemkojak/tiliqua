@@ -12,3 +12,5 @@ pub mod handlers;
 
 pub mod bootstrap;
 pub mod psid;
+pub mod usb_msc;
+pub mod fat;
