@@ -18,8 +18,7 @@ def image_to_words(path):
 
 class SidPlayerTuneTests(unittest.TestCase):
     def test_play_routine_writes_sid_register(self):
-        sid_fifo = SyncFIFO(width=16, depth=64)
-        bridge = Cpu6502Bridge(sid_fifo=sid_fifo, psram_base_bytes=0x0)
+        bridge = Cpu6502Bridge(psram_base_bytes=0x0)
         # 2000 Hz / 50 Hz = 40-cycle NMI period (fast enough to see 2+ writes).
         timer = PlayTimerPeripheral(clk_hz=2000, rate_hz_pal=50, rate_hz_ntsc=60)
 
@@ -31,12 +30,19 @@ class SidPlayerTuneTests(unittest.TestCase):
             init_words=init_words,
         )
 
+        # External FIFO fed by bridge's SID write output ports.
+        sid_fifo = SyncFIFO(width=16, depth=64)
+
         m = Module()
         m.submodules.bridge = bridge
         m.submodules.timer = timer
         m.submodules.sid_fifo = sid_fifo
         m.submodules.fake = fake
         wiring.connect(m, bridge.psram_bus, fake.bus)
+        m.d.comb += [
+            sid_fifo.w_en  .eq(bridge.sid_w_en),
+            sid_fifo.w_data.eq(bridge.sid_w_data),
+        ]
 
         # Sticky NMI latch: set by timer pulse, clearable by testbench.
         nmi_l = Signal()

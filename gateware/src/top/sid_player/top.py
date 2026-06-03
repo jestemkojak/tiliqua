@@ -153,17 +153,23 @@ class Cpu6502Bridge(wiring.Component):
         is_sid  = (self.cpu_AB >= 0xD400) & (self.cpu_AB <= 0xD41F)
         is_psram = ~is_bram & ~is_sid
 
-        # BRAM
+        # BRAM (address/data/write-enable wiring)
         m.d.comb += [
             rd.addr.eq(self.cpu_AB[0:11]),
             wr.addr.eq(self.cpu_AB[0:11]),
             wr.data.eq(self.cpu_DO),
             wr.en.eq(is_bram & self.cpu_WE),
         ]
-        # SID write: drive output ports, connected to SIDPeripheral.ext_w_*
+        # SID write outputs — latched at decode and pulsed for one cycle in
+        # WRITE-ACK.  Registering these means the downstream FIFO push does not
+        # depend on the CPU still holding cpu_AB/cpu_DO when it is captured, and
+        # (crucially) keeps the SID decode out of any combinational path that
+        # could feed cpu_RDY back into the CPU.
+        sid_w_en_r   = Signal()
+        sid_w_data_r = Signal(16)
         m.d.comb += [
-            self.sid_w_data.eq((self.cpu_DO << 5) | self.cpu_AB[0:5]),
-            self.sid_w_en.eq(is_sid & self.cpu_WE),
+            self.sid_w_en.eq(sid_w_en_r),
+            self.sid_w_data.eq(sid_w_data_r),
         ]
 
         bus = self.psram_bus
@@ -181,13 +187,22 @@ class Cpu6502Bridge(wiring.Component):
         # drive it constantly since byte-lane masking is never used.
         m.d.comb += bus.sel.eq(0b1111)
 
-        # Default: single-cycle paths do not stall.
-        m.d.comb += self.cpu_RDY.eq(~is_psram)
-
+        # Pipeline register to break combinatorial loop:
+        #   cpu_AB → is_bram → cpu_DI → CPU.DIMUX (arlet, when RDY=1) → cpu_AB
+        # cpu_DI is now driven from di_r (a FF), so there is no combinatorial
+        # path from cpu_AB to cpu_DI.  All read paths gain one stall cycle so
+        # di_r is valid before RDY is asserted.
+        cpu_di_next = Signal(8)
+        di_r = Signal(8)
         with m.If(is_bram):
-            m.d.comb += self.cpu_DI.eq(rd.data)
+            m.d.comb += cpu_di_next.eq(rd.data)
         with m.Else():
-            m.d.comb += self.cpu_DI.eq(psram_di)
+            m.d.comb += cpu_di_next.eq(psram_di)
+        m.d.sync += di_r.eq(cpu_di_next)
+        m.d.comb += self.cpu_DI.eq(di_r)
+
+        # Default stall; every FSM state overrides as needed.
+        m.d.comb += self.cpu_RDY.eq(0)
 
         # Mux selected byte out of a 32-bit word.
         def select_byte(word):
@@ -200,13 +215,42 @@ class Cpu6502Bridge(wiring.Component):
 
         with m.FSM(name="psram_fsm"):
             with m.State("IDLE"):
-                m.d.comb += self.cpu_RDY.eq(~is_psram)  # stall only on psram access
+                # IDLE never asserts cpu_RDY (it stays 0 from the default
+                # above).  Asserting RDY combinationally here would make it
+                # depend on cpu_AB, and arlet's 6502 feeds RDY back into its
+                # address mux (cpu.v: DIMUX = ~RDY ? DIHOLD : DI; AB = {DIMUX,
+                # ADD}), forming a combinational loop cpu_AB -> RDY -> DIMUX ->
+                # cpu_AB that yosys/abc9 rejects.  Every access therefore acks
+                # from a registered FSM state instead.
                 with m.If(is_psram):
-                    m.d.comb += self.cpu_RDY.eq(0)
                     with m.If(self.cpu_WE):
                         m.next = "READ-FOR-RMW"
                     with m.Else():
                         m.next = "READ"
+                with m.Elif(is_bram & ~self.cpu_WE):
+                    # BRAM read: stall one cycle so di_r captures bram data.
+                    m.next = "BRAM-WAIT"
+                with m.Else():
+                    # BRAM write or SID write: latch the SID push (if any) and
+                    # ack one cycle later in WRITE-ACK.
+                    with m.If(is_sid & self.cpu_WE):
+                        m.d.sync += [
+                            sid_w_en_r.eq(1),
+                            sid_w_data_r.eq((self.cpu_DO << 5) | self.cpu_AB[0:5]),
+                        ]
+                    m.next = "WRITE-ACK"
+
+            with m.State("WRITE-ACK"):
+                # BRAM/SID write completes here.  cpu_RDY is a function of the
+                # (registered) FSM state only, never of cpu_AB.
+                m.d.comb += self.cpu_RDY.eq(1)
+                m.d.sync += sid_w_en_r.eq(0)   # one-cycle SID push pulse
+                m.next = "IDLE"
+
+            with m.State("BRAM-WAIT"):
+                # di_r = bram[AB] registered from the IDLE cycle; present to CPU.
+                m.d.comb += self.cpu_RDY.eq(1)
+                m.next = "IDLE"
 
             # --- plain read ---
             with m.State("READ"):
@@ -221,11 +265,16 @@ class Cpu6502Bridge(wiring.Component):
                     m.next = "READ-DONE"
 
             with m.State("READ-DONE"):
-                # Present the byte for one cycle with RDY=1 so the CPU latches it.
+                # psram_di valid this cycle → di_r will capture it on the next edge.
                 m.d.comb += [
-                    self.cpu_RDY.eq(1),
+                    self.cpu_RDY.eq(0),
                     psram_di.eq(select_byte(captured_word)),
                 ]
+                m.next = "READ-PRESENT"
+
+            with m.State("READ-PRESENT"):
+                # di_r = psram_di registered from READ-DONE; present to CPU.
+                m.d.comb += self.cpu_RDY.eq(1)
                 m.next = "IDLE"
 
             # --- read-modify-write for byte writes ---
