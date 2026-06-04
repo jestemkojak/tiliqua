@@ -127,23 +127,23 @@ fn main() -> ! {
         core::slice::from_raw_parts_mut((PSRAM_BASE + 0x700000) as *mut u8, 65536)
     };
 
-    let len = if usb_ready {
+    let (mut len, mut playing_fallback) = if usb_ready {
         match fat::load_first_sid(&msc, tune_buf) {
-            Ok(n)  => { info!("USB: loaded {} bytes", n); n },
+            Ok(n)  => { info!("USB: loaded {} bytes", n); (n, false) },
             Err(_) => {
                 info!("No .SID on USB — using built-in tune");
                 tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
-                FALLBACK_SID.len()
+                (FALLBACK_SID.len(), true)
             }
         }
     } else {
         info!("No USB drive — using built-in tune");
         tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
-        FALLBACK_SID.len()
+        (FALLBACK_SID.len(), true)
     };
     info!("Loaded {} bytes", len);
 
-    let hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
+    let mut hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
     info!("PSID v{}: songs={} start={} init={:#x} play={:#x}",
           hdr.version, hdr.songs, hdr.start_song, hdr.init_addr, hdr.play_addr);
 
@@ -195,6 +195,42 @@ fn main() -> ! {
 
     loop {
         encoder.update();
+
+        // -- Hot-plug: if playing fallback and USB drive appears, reload from it --
+        if playing_fallback && msc.ready() {
+            if let Ok(n) = fat::load_first_sid(&msc, tune_buf) {
+                info!("Hot-plug: loaded {} bytes from USB", n);
+                len = n;
+                hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
+                current_subtune = hdr.start_song;
+                paused = false;
+                playing_fallback = false;
+
+                let pr = &tune_buf[hdr.data_offset as usize..len];
+                let la = hdr.effective_load_addr(pr);
+                let p  = if hdr.load_addr == 0 { &pr[2..] } else { pr };
+                write_6502_mem(CPU6502_PSRAM_BASE, la, p);
+                write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::INIT_STUB_ADDR,
+                               &bootstrap::init_stub((current_subtune - 1) as u8, hdr.init_addr));
+                write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
+                               &bootstrap::nmi_stub(hdr.play_addr));
+                write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &bootstrap::vectors());
+
+                let rate = hdr.is_ntsc(current_subtune);
+                play_timer.control().write(|w| {
+                    w.reset().set_bit().play_rate().bit(rate).irq_enable().clear_bit()
+                });
+                play_timer.control().write(|w| {
+                    w.reset().clear_bit().play_rate().bit(rate).irq_enable().clear_bit()
+                });
+                for _ in 0..2_000_000u32 { unsafe { core::arch::asm!("nop"); } }
+                play_timer.control().write(|w| {
+                    w.reset().clear_bit().play_rate().bit(rate).irq_enable().set_bit()
+                });
+
+                redraw = true;
+            }
+        }
 
         // -- Button: toggle pause --
         if encoder.poke_btn() {
