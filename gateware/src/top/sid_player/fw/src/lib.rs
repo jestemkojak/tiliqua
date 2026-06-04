@@ -10,6 +10,11 @@ pub use tiliqua_hal as hal;
 hal::impl_tiliqua_soc_pac!();
 
 #[cfg(not(test))]
+hal::impl_scope! {
+    Scope0: pac::SCOPE_PERIPH,
+}
+
+#[cfg(not(test))]
 pub mod handlers;
 
 // Host-testable pure modules (no pac dependency)

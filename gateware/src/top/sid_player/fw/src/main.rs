@@ -14,6 +14,11 @@ use tiliqua_lib::*;
 use tiliqua_lib::color::HI8;
 use pac::constants::*;
 
+use tiliqua_hal::persist::Persist;
+use tiliqua_lib::scope::{Timebase, VScale};
+use tiliqua_hal::embedded_graphics::primitives::{Rectangle, PrimitiveStyle};
+use tiliqua_hal::embedded_graphics::geometry::Size;
+
 use tiliqua_hal::encoder::Encoder;
 use tiliqua_hal::embedded_graphics::{
     prelude::*,
@@ -63,6 +68,30 @@ fn main() -> ! {
     );
 
     palette::ColorPalette::default().write_to_hardware(&mut display);
+
+    // --- Voice scope: fixed config, always on -----------------------------
+    let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
+    let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
+
+    // Crisp look: low persistence => fast decay (clears additive traces).
+    persist.set_persistence(2);
+
+    scope.set_intensity(8);
+    scope.set_yscale(VScale::Scale1V);
+    scope.set_timebase(Timebase::Timebase5ms);
+    scope.set_trigger_level(0);
+    scope.set_hue(0);          // per-channel hue is auto-offset (+3 per ch)
+    scope.set_xpos_px(0);
+
+    // Stack four traces below the header band. ypos is an offset from screen
+    // centre (240 on a 480-tall fb); these put rows at ~120/200/280/360.
+    scope.set_ypos_px(0, -120); // V1
+    scope.set_ypos_px(1, -40);  // V2
+    scope.set_ypos_px(2, 40);   // V3
+    scope.set_ypos_px(3, 120);  // MIX
+
+    // Free-run (trigger_always = true) so traces show without a trigger edge.
+    scope.set_enabled(true, true);
 
     // -----------------------------------------------------------------
     // Step 1: Show banner, wait for USB drive, load tune.
@@ -199,35 +228,28 @@ fn main() -> ! {
         if redraw {
             redraw = false;
 
-            display.clear(HI8::BLACK).ok();
-
-            // Header.
-            Text::new("SID PLAYER", Point::new(20, 20), style)
+            // Clear only the header band, leaving the scope area untouched.
+            Rectangle::new(Point::new(0, 0), Size::new(640, 64))
+                .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
                 .draw(&mut display)
                 .ok();
 
-            // Metadata from PSID header (offsets per C64 PSID spec).
-            let name_str      = trim_ascii(&tune_buf[0x16..0x36]);
-            let author_str    = trim_ascii(&tune_buf[0x36..0x56]);
-            let copyright_str = trim_ascii(&tune_buf[0x56..0x76]);
+            let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
+            let author_str = trim_ascii(&tune_buf[0x36..0x56]);
 
-            Text::new(name_str, Point::new(20, 40), style)
-                .draw(&mut display)
-                .ok();
-            Text::new(author_str, Point::new(20, 60), style_dim)
-                .draw(&mut display)
-                .ok();
-            Text::new(copyright_str, Point::new(20, 80), style_dim)
+            // Line 1: title + tune name.
+            let mut line1: String<80> = String::new();
+            write!(line1, "SID PLAYER  {}", name_str).ok();
+            Text::new(line1.as_str(), Point::new(20, 18), style)
                 .draw(&mut display)
                 .ok();
 
-            // Status line.
-            let mut status: String<64> = String::new();
-            write!(status, "Song: {} / {}  [{}]",
-                   current_subtune, hdr.songs,
+            // Line 2: author + song / state.
+            let mut line2: String<96> = String::new();
+            write!(line2, "{}   Song {}/{} [{}]",
+                   author_str, current_subtune, hdr.songs,
                    if paused { "PAUSED" } else { "PLAYING" }).ok();
-
-            Text::new(status.as_str(), Point::new(20, 110), style)
+            Text::new(line2.as_str(), Point::new(20, 40), style_dim)
                 .draw(&mut display)
                 .ok();
         }
