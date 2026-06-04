@@ -634,7 +634,6 @@ class SIDPlayerSoc(TiliquaSoc):
         # Plotter writes into the live framebuffer (fan-out from fb.fbp,
         # same pattern as the base plotter/persist consumers).
         wiring.connect(m, wiring.flipped(self.fb.fbp), self.scope_plotter.fbp)
-        self.scope_periph.source = pmod0.i_cal
 
         # Non-blocking tap of the 4 audio channels already on i_cal.
         # We deliberately ignore plot_fifo.i.ready so the SID audio stream
