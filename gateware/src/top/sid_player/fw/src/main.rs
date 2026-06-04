@@ -93,8 +93,11 @@ fn main() -> ! {
     // Free-run (trigger_always = true) so traces show without a trigger edge.
     scope.set_enabled(true, true);
 
+    // Fallback tune embedded at build time — plays if no USB drive is present.
+    static FALLBACK_SID: &[u8] = include_bytes!("../Gyroscope_3.sid");
+
     // -----------------------------------------------------------------
-    // Step 1: Show banner, wait for USB drive, load tune.
+    // Step 1: Show banner, try USB for ~2 s, fall back to built-in tune.
     // -----------------------------------------------------------------
     let style     = MonoTextStyle::new(&FONT_9X15_BOLD, HI8::new(0, 0xB));
     let style_dim = MonoTextStyle::new(&FONT_9X15_BOLD, HI8::new(0, 0x7));
@@ -102,21 +105,42 @@ fn main() -> ! {
     Text::new("SID PLAYER", Point::new(20, 20), style)
         .draw(&mut display)
         .ok();
-    Text::new("Waiting for USB drive...", Point::new(20, 50), style_dim)
+    Text::new("Insert USB drive, or plays built-in tune...", Point::new(20, 50), style_dim)
         .draw(&mut display)
         .ok();
 
     let msc = UsbMsc::new(peripherals.USB_MSC);
-    msc.wait_ready();
 
-    info!("USB MSC ready — loading .SID file");
+    // Poll for USB readiness for ~2 s (60 MHz * 2 = 120_000_000 nops).
+    const USB_TIMEOUT: u32 = 120_000_000;
+    let usb_ready = {
+        let mut ready = false;
+        for _ in 0..USB_TIMEOUT {
+            if msc.ready() { ready = true; break; }
+            unsafe { core::arch::asm!("nop"); }
+        }
+        ready
+    };
 
     // Scratch buffer in PSRAM at +7 MB (well away from framebuffer at 0x20000000).
     let tune_buf: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut((PSRAM_BASE + 0x700000) as *mut u8, 65536)
     };
 
-    let len = fat::load_first_sid(&msc, tune_buf).expect("no .SID file found");
+    let len = if usb_ready {
+        match fat::load_first_sid(&msc, tune_buf) {
+            Ok(n)  => { info!("USB: loaded {} bytes", n); n },
+            Err(_) => {
+                info!("No .SID on USB — using built-in tune");
+                tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
+                FALLBACK_SID.len()
+            }
+        }
+    } else {
+        info!("No USB drive — using built-in tune");
+        tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
+        FALLBACK_SID.len()
+    };
     info!("Loaded {} bytes", len);
 
     let hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
