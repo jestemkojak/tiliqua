@@ -88,6 +88,7 @@ fn main() -> ! {
     scope.set_ypos_px(0, -120); // V1
     scope.set_ypos_px(1, -40);  // V2
     scope.set_ypos_px(2, 40);   // V3
+    scope.set_ypos_px(3, 120);  // MIX
 
     // Free-run (trigger_always = true) so traces show without a trigger edge.
     scope.set_enabled(true, true);

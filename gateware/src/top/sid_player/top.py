@@ -544,12 +544,12 @@ class SIDPlayerSoc(TiliquaSoc):
         # Dedicated plotter for the scope (base SoC plotter's 3 ports are
         # taken by pixel_plot/blit/line). One port per scope channel.
         self.scope_plotter = FramebufferPlotter(
-            bus_signature=self.psram_periph.bus.signature.flip(), n_ports=3)
+            bus_signature=self.psram_periph.bus.signature.flip(), n_ports=4)
         self.psram_periph.add_master(self.scope_plotter.bus)
 
         # 4-channel oscilloscope: V1, V2, V3, mix.
         self.scope_periph = scope.ScopePeripheral(
-            n_channels=3, fs=self.clock_settings.audio_clock.fs())
+            n_channels=4, fs=self.clock_settings.audio_clock.fs())
         self.csr_decoder.add(self.scope_periph.bus, addr=0x1300, name="scope_periph")
 
         self.finalize_csr_bridge()
@@ -628,7 +628,7 @@ class SIDPlayerSoc(TiliquaSoc):
         m.submodules.scope_periph  = self.scope_periph
 
         # Each scope channel drives one plotter port.
-        for n in range(3):
+        for n in range(4):
             wiring.connect(m, self.scope_periph.o[n], self.scope_plotter.i[n])
 
         # Plotter writes into the live framebuffer (fan-out from fb.fbp,
@@ -639,12 +639,13 @@ class SIDPlayerSoc(TiliquaSoc):
         # We deliberately ignore plot_fifo.i.ready so the SID audio stream
         # is never stalled by plotting (drops samples if the FIFO is full).
         m.submodules.plot_fifo = plot_fifo = dsp.SyncFIFOBuffered(
-            shape=data.ArrayLayout(PSQ, 3), depth=32)
+            shape=data.ArrayLayout(PSQ, 4), depth=32)
         m.d.comb += [
             plot_fifo.i.valid.eq(pmod0.i_cal.valid & pmod0.i_cal.ready),
             plot_fifo.i.payload[0].eq(pmod0.i_cal.payload[0]),
             plot_fifo.i.payload[1].eq(pmod0.i_cal.payload[1]),
             plot_fifo.i.payload[2].eq(pmod0.i_cal.payload[2]),
+            plot_fifo.i.payload[3].eq(pmod0.i_cal.payload[3]),
         ]
         wiring.connect(m, plot_fifo.o, self.scope_periph.i)
 
