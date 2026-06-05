@@ -72,6 +72,32 @@ USB note: USB sticks are partitioned (GPT/MBR) — the FAT volume is not at LBA 
 
 ---
 
+## Video / display
+
+The resolution is **bootloader-detected** (`FIXED_MODELINE = None`,
+`"video": "<match-bootloader>"`); on the test rig that's **1280×720** (the video
+PLL is fixed at 74.25 MHz = 720p60). Video was never validated during initial
+bring-up, and the firmware had been written assuming a fixed **640×480**, which
+produced a garbage/flickering display. Fixed (firmware-only, `main.rs`):
+
+- **Resolution-aware layout.** Read `display.size()` for `h_active`/`v_active`
+  instead of hardcoding 640×480; the header clear spans `h_active`, and the four
+  scope traces (V1/V2/V3/MIX) are stacked evenly below the header from the real
+  height (ypos is a *signed offset from centre* — `OffsetMode.CENTER` in gateware).
+- **Header text persistence.** The persist peripheral decays the whole
+  framebuffer every frame; the gateware re-plots the scope continuously, but the
+  text was drawn once on state-change and faded to black. Now the header is
+  redrawn **every loop** (full-width clear only on state change).
+- **Flicker.** `persist` decay was too fast (`2`) → free-running traces strobed.
+  Raised to `10` so successive sweeps overlay into a stable band.
+- **Dotted traces.** At audio fs the samples are sparse per pixel (the proper fix
+  is gateware upsampling, as in `macro_osc`'s `dsp.Resample` with `n_up=16` — see
+  open items). Mitigated firmware-only by scaling the scope down ~50% in both
+  axes (`set_xscale(7)`, `set_yscale(Scale2V)`; default shift is 6) and a slower
+  `Timebase10ms`, which packs samples denser per pixel.
+
+---
+
 ## Open items
 
 - **`flush_6502_image()` (firmware, `main.rs:54`) is still present** and called after
@@ -81,6 +107,13 @@ USB note: USB sticks are partitioned (GPT/MBR) — the FAT volume is not at LBA 
   cache-thrash works but is crude — prefer replacing it with a real cache-clean, or
   confirm empirically whether any flush is needed now that the bridge is correct.
   Needs a hardware re-test if changed.
+- **Scope upsampling** (continuous traces at full size): sid_player feeds raw
+  audio-rate samples straight into `scope_periph.i` — the per-channel
+  `dsp.Resample` upsamplers the voice-scope spec called for (and `macro_osc` has,
+  `n_up=16`) were never added, so traces are dotted. Currently mitigated in
+  firmware (scale-down + slower timebase). The proper fix is 4 `Resample` blocks,
+  but the design is at ~92% LUTs / failing 60 MHz timing — likely needs dropping
+  MIX back to 3 channels to fit.
 - **PSRAM RMW writes** (tune storing above `$07FF`): the bridge now implements the
   sub-FSM (`RD-FOR-RMW → WRITE → psram_done_r`, replacing the old WRITE→IDLE wedge),
   but this path is not yet exercised by a cosim case or validated on hardware

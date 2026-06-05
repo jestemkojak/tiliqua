@@ -91,26 +91,41 @@ fn main() -> ! {
 
     palette::ColorPalette::default().write_to_hardware(&mut display);
 
+    // Framebuffer geometry comes from the bootloader-detected modeline, not a
+    // fixed 640x480 — read it and lay everything out relative to it.
+    let h_active = display.size().width  as i16;
+    let v_active = display.size().height as i16;
+    const HEADER_H: i16 = 56; // pixels reserved at top for the text header
+
     // --- Voice scope: fixed config, always on -----------------------------
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
 
-    // Crisp look: low persistence => fast decay (clears additive traces).
-    persist.set_persistence(2);
+    // Persistence = decay rate. Too low (fast decay) makes the free-running
+    // traces strobe/flicker; this value lets successive sweeps overlay into a
+    // stable band.
+    persist.set_persistence(10);
 
     scope.set_intensity(8);
-    scope.set_yscale(VScale::Scale1V);
-    scope.set_timebase(Timebase::Timebase5ms);
+    // Scale the traces down ~50% in both axes (default scale shift is 6 → 7).
+    // Smaller in X also packs the samples denser per pixel, reducing the
+    // dotted look. (The fully-continuous fix is gateware upsampling as in
+    // macro_osc; these are the firmware-only levers.)
+    scope.set_yscale(VScale::Scale2V); // 2V/div = half the amplitude of 1V/div
+    scope.set_xscale(7);               // half the horizontal extent
+    // Slower timebase also packs more samples per pixel (less dotted).
+    scope.set_timebase(Timebase::Timebase10ms);
     scope.set_trigger_level(0);
     scope.set_hue(0);          // per-channel hue is auto-offset (+3 per ch)
     scope.set_xpos_px(0);
 
-    // Stack four traces below the header band. ypos is an offset from screen
-    // centre (240 on a 480-tall fb); these put rows at ~120/200/280/360.
-    scope.set_ypos_px(0, -120); // V1
-    scope.set_ypos_px(1, -40);  // V2
-    scope.set_ypos_px(2, 40);   // V3
-    scope.set_ypos_px(3, 120);  // MIX
+    // Stack the four traces (V1/V2/V3/MIX) evenly in the band below the header.
+    // ypos is a signed offset from screen centre (OffsetMode.CENTER in gateware).
+    let centre = v_active / 2;
+    for ch in 0..4i16 {
+        let row = HEADER_H + ((ch * 2 + 1) * (v_active - HEADER_H)) / 8;
+        scope.set_ypos_px(ch as usize, row - centre);
+    }
 
     // Free-run (trigger_always = true) so traces show without a trigger edge.
     scope.set_enabled(true, true);
@@ -313,34 +328,35 @@ fn main() -> ! {
             redraw = true;
         }
 
-        // -- Redraw display when state changed --
+        // -- Header text --
+        // On a state change, clear the whole header band (full width) to wipe
+        // stale text. The text itself is redrawn *every* loop so the persist
+        // decay pass never fades the song details to black.
         if redraw {
             redraw = false;
-
-            // Clear only the header band, leaving the scope area untouched.
-            Rectangle::new(Point::new(0, 0), Size::new(640, 64))
+            Rectangle::new(Point::new(0, 0), Size::new(h_active as u32, HEADER_H as u32))
                 .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
                 .draw(&mut display)
                 .ok();
-
-            let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
-            let author_str = trim_ascii(&tune_buf[0x36..0x56]);
-
-            // Line 1: title + tune name.
-            let mut line1: String<80> = String::new();
-            write!(line1, "SID PLAYER  {}", name_str).ok();
-            Text::new(line1.as_str(), Point::new(20, 18), style)
-                .draw(&mut display)
-                .ok();
-
-            // Line 2: author + song / state.
-            let mut line2: String<96> = String::new();
-            write!(line2, "{}   Song {}/{} [{}]",
-                   author_str, current_subtune, hdr.songs,
-                   if paused { "PAUSED" } else { "PLAYING" }).ok();
-            Text::new(line2.as_str(), Point::new(20, 40), style_dim)
-                .draw(&mut display)
-                .ok();
         }
+
+        let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
+        let author_str = trim_ascii(&tune_buf[0x36..0x56]);
+
+        // Line 1: title + tune name.
+        let mut line1: String<80> = String::new();
+        write!(line1, "SID PLAYER  {}", name_str).ok();
+        Text::new(line1.as_str(), Point::new(20, 18), style)
+            .draw(&mut display)
+            .ok();
+
+        // Line 2: author + song / state.
+        let mut line2: String<96> = String::new();
+        write!(line2, "{}   Song {}/{} [{}]",
+               author_str, current_subtune, hdr.songs,
+               if paused { "PAUSED" } else { "PLAYING" }).ok();
+        Text::new(line2.as_str(), Point::new(20, 40), style_dim)
+            .draw(&mut display)
+            .ok();
     }
 }
