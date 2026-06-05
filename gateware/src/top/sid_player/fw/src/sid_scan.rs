@@ -6,6 +6,18 @@
 
 use fatfs::{FileSystem, Read, ReadWriteSeek};
 
+/// FAT 8.3 short name (≤ 12 chars incl. dot); 16 leaves headroom.
+pub type SidName = heapless::String<16>;
+/// Max `.SID` files enumerated from the root (64 × 16 B ≈ 1 KB).
+pub const MAX_SIDS: usize = 64;
+/// Fixed-capacity list of root `.SID` short names.
+pub type SidList = heapless::Vec<SidName, MAX_SIDS>;
+
+/// True if `name_bytes` ends in a case-insensitive `.SID` extension.
+fn is_sid_name(name_bytes: &[u8]) -> bool {
+    name_bytes.len() >= 4 && name_bytes[name_bytes.len() - 4..].eq_ignore_ascii_case(b".SID")
+}
+
 /// Scan the root directory of `fs` for the first `*.SID` file and read it into
 /// `dst`. Returns the number of bytes read, or `None` if no `.SID` file exists
 /// (or a read error occurs mid-scan).
@@ -13,34 +25,65 @@ use fatfs::{FileSystem, Read, ReadWriteSeek};
 /// Uses `short_file_name_as_bytes()` (no `alloc` needed): FAT 8.3 short names
 /// are uppercase with a dot, e.g. `b"0.SID"` or the LFN alias `b"GYROSC~1.SID"`.
 pub fn find_first_sid<IO: ReadWriteSeek>(fs: &FileSystem<IO>, dst: &mut [u8]) -> Option<usize> {
+    load_sid_by_index(fs, 0, dst)
+}
+
+/// Push the short name of every root `*.SID` file into `out` (in directory
+/// order), stopping at `MAX_SIDS`. Returns the number pushed.
+pub fn list_root_sids<IO: ReadWriteSeek>(fs: &FileSystem<IO>, out: &mut SidList) -> usize {
     let root = fs.root_dir();
+    for entry_result in root.iter() {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let name_bytes = entry.short_file_name_as_bytes();
+        if !is_sid_name(name_bytes) {
+            continue;
+        }
+        let mut name = SidName::new();
+        let _ = name.push_str(core::str::from_utf8(name_bytes).unwrap_or("?"));
+        if out.push(name).is_err() {
+            break; // list full
+        }
+    }
+    out.len()
+}
+
+/// Read the `idx`-th (0-based) root `*.SID` file into `dst`. Returns bytes read,
+/// or `None` if fewer than `idx+1` `.SID` files exist (or a read error occurs).
+pub fn load_sid_by_index<IO: ReadWriteSeek>(
+    fs: &FileSystem<IO>,
+    idx: usize,
+    dst: &mut [u8],
+) -> Option<usize> {
+    let root = fs.root_dir();
+    let mut count = 0usize;
     for entry_result in root.iter() {
         let entry = entry_result.ok()?;
         if entry.is_dir() {
             continue;
         }
         let name_bytes = entry.short_file_name_as_bytes();
-        log::info!(
-            "fat: file '{}'",
-            core::str::from_utf8(name_bytes).unwrap_or("<non-utf8>")
-        );
-        let is_sid = name_bytes.len() >= 4 && {
-            let ext = &name_bytes[name_bytes.len() - 4..];
-            ext.eq_ignore_ascii_case(b".SID")
-        };
-        if !is_sid {
+        if !is_sid_name(name_bytes) {
             continue;
         }
-        let mut file = entry.to_file();
-        let mut total = 0usize;
-        while total < dst.len() {
-            let n = file.read(&mut dst[total..]).ok()?;
-            if n == 0 {
-                break;
+        if count == idx {
+            let mut file = entry.to_file();
+            let mut total = 0usize;
+            while total < dst.len() {
+                let n = file.read(&mut dst[total..]).ok()?;
+                if n == 0 {
+                    break;
+                }
+                total += n;
             }
-            total += n;
+            return Some(total);
         }
-        return Some(total);
+        count += 1;
     }
     None
 }
@@ -216,5 +259,54 @@ mod tests {
             FileSystem::new(part, FsOptions::new()).is_err(),
             "mounting at LBA 0 must fail — this is the bug we fixed"
         );
+    }
+
+    #[test]
+    fn list_root_sids_returns_sid_names_in_order() {
+        let mut img = build_gpt_fat_image(&[
+            ("0.SID", b"PSID\x00\x02 first"),
+            ("READ.ME", b"not a tune"),
+            ("MUSIC.SID", b"PSID\x00\x02 second"),
+        ]);
+        let base = BASE_LBA as usize * SECTOR;
+        let part = VecDisk::new(&mut img[base..]);
+        let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+
+        let mut out: SidList = SidList::new();
+        let n = list_root_sids(&fs, &mut out);
+        assert_eq!(n, 2);
+        assert_eq!(out[0].as_str(), "0.SID");
+        assert_eq!(out[1].as_str(), "MUSIC.SID");
+    }
+
+    #[test]
+    fn load_sid_by_index_reads_the_nth_tune() {
+        let sid0: &[u8] = b"PSID\x00\x02 first tune payload bytes";
+        let music: &[u8] = b"PSID\x00\x02 second tune";
+        let mut img = build_gpt_fat_image(&[
+            ("0.SID", sid0),
+            ("READ.ME", b"not a tune"),
+            ("MUSIC.SID", music),
+        ]);
+        let base = BASE_LBA as usize * SECTOR;
+        let part = VecDisk::new(&mut img[base..]);
+        let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+
+        let mut dst = vec![0u8; 4096];
+        let n0 = load_sid_by_index(&fs, 0, &mut dst).expect("index 0 exists");
+        assert_eq!(&dst[..n0], sid0);
+
+        let n1 = load_sid_by_index(&fs, 1, &mut dst).expect("index 1 exists");
+        assert_eq!(&dst[..n1], music);
+    }
+
+    #[test]
+    fn load_sid_by_index_out_of_range_is_none() {
+        let mut img = build_gpt_fat_image(&[("0.SID", b"PSID one")]);
+        let base = BASE_LBA as usize * SECTOR;
+        let part = VecDisk::new(&mut img[base..]);
+        let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+        let mut dst = vec![0u8; 4096];
+        assert!(load_sid_by_index(&fs, 5, &mut dst).is_none());
     }
 }
