@@ -23,7 +23,7 @@ use tiliqua_hal::encoder::Encoder;
 use tiliqua_hal::embedded_graphics::{
     prelude::*,
     mono_font::{MonoTextStyle, ascii::FONT_9X15_BOLD},
-    text::Text,
+    text::{Text, Alignment},
     geometry::Point,
 };
 
@@ -131,7 +131,7 @@ fn main() -> ! {
     // fixed 640x480 — read it and lay everything out relative to it.
     let h_active = display.size().width  as i16;
     let v_active = display.size().height as i16;
-    const HEADER_H: i16 = 56; // pixels reserved at top for the text header
+    const HEADER_H: i16 = 104; // title + author + 3 menu rows
 
     // --- Voice scope: fixed config, always on -----------------------------
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
@@ -362,20 +362,46 @@ fn main() -> ! {
         let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
         let author_str = trim_ascii(&tune_buf[0x36..0x56]);
 
-        // Line 1: title + tune name.
+        // Title + author at top.
         let mut line1: String<80> = String::new();
         write!(line1, "SID PLAYER  {}", name_str).ok();
         Text::new(line1.as_str(), Point::new(20, 18), style)
-            .draw(&mut display)
-            .ok();
+            .draw(&mut display).ok();
+        Text::new(author_str, Point::new(20, 36), style_dim)
+            .draw(&mut display).ok();
 
-        // Line 2: author + song / state.
-        let mut line2: String<96> = String::new();
-        write!(line2, "{}   Song {}/{} [{}]",
-               author_str, current_subtune, hdr.songs,
-               if paused { "PAUSED" } else { "PLAYING" }).ok();
-        Text::new(line2.as_str(), Point::new(20, 40), style_dim)
-            .draw(&mut display)
-            .ok();
+        // Three-item menu: label left, value right, `<` modify marker.
+        let label_x  = 20i32;
+        let value_x  = 220i32;
+        let marker_x = 226i32;
+        let vy0      = 58i32;
+        let vspace   = 18i32;
+
+        for n in 0..3usize {
+            let font = if selected == n { style } else { style_dim };
+            let y = vy0 + vspace * n as i32;
+
+            let label = match n { 0 => "File", 1 => "Song", _ => "State" };
+            let mut value: String<24> = String::new();
+            match n {
+                0 => {
+                    let shown = if modify && selected == 0 { browse_idx } else { current_file };
+                    let mark  = if !file_list.is_empty() && shown == current_file { "*" } else { "" };
+                    let fname = file_list.get(shown).map(|s| s.as_str()).unwrap_or("<builtin>");
+                    write!(value, "{}{}", mark, fname).ok();
+                }
+                1 => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
+                _ => { write!(value, "{}", if paused { "PAUSED" } else { "PLAYING" }).ok(); }
+            }
+
+            Text::new(label, Point::new(label_x, y), font)
+                .draw(&mut display).ok();
+            Text::with_alignment(value.as_str(), Point::new(value_x, y), font, Alignment::Right)
+                .draw(&mut display).ok();
+            if modify && selected == n {
+                Text::new("<", Point::new(marker_x, y), font)
+                    .draw(&mut display).ok();
+            }
+        }
     }
 }
