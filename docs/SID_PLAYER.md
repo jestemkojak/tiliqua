@@ -86,5 +86,8 @@ USB note: USB sticks are partitioned (GPT/MBR) — the FAT volume is not at LBA 
   but this path is not yet exercised by a cosim case or validated on hardware
   (Gyroscope_3 never writes PSRAM). Add a cosim tune that stores above `$07FF`.
 - **Debug CSRs** (`sid_writes`, `nmi_count`, `state`, `cpu_ab`, `psram_acks`,
-  `ab_changes`) on `PlayTimerPeripheral` are still wired up. Keep through bring-up;
-  candidates for removal once hardware is stable (LUT budget is tight on the 25F).
+  `ab_changes`) — **removed** once audio + USB were confirmed on hardware (commit
+  `ad14d3b`), to reclaim LUTs on the ~95%-full 25F. `PlayTimerPeripheral` now
+  exposes only the functional `control` register. The `dbg_reset` /
+  `dbg_play_rate` / `dbg_irq_enable` inputs are kept as sim-only test stimulus
+  (control is write-only), tied to 0 in hardware.
