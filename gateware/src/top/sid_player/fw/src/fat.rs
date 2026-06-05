@@ -142,16 +142,11 @@ impl<'a> Seek for MscStorage<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// load_first_sid — find the first *.SID file in the FAT root dir
+// SID file loading and listing helpers
 // ---------------------------------------------------------------------------
 
-/// Find the first `*.SID` file in the root directory of the FAT32 volume and
-/// read its contents into `dst`.  Returns the number of bytes read.
-///
-/// Uses `short_file_name_as_bytes()` (always available without `alloc`) to
-/// detect `.SID` extension; the short name is stored uppercase in FAT 8.3
-/// format with a dot separator, e.g. `b"MUSIC.SID"`.
-pub fn load_first_sid(msc: &UsbMsc, dst: &mut [u8]) -> Result<usize, StorageError> {
+/// Mount the USB FAT volume and read the `idx`-th root `*.SID` into `dst`.
+pub fn load_sid(msc: &UsbMsc, idx: usize, dst: &mut [u8]) -> Result<usize, StorageError> {
     let storage = MscStorage::new(msc);
     log::info!("fat: partition base_lba={}", storage.base_lba());
     let fs = match FileSystem::new(storage, FsOptions::new()) {
@@ -161,7 +156,24 @@ pub fn load_first_sid(msc: &UsbMsc, dst: &mut [u8]) -> Result<usize, StorageErro
             return Err(StorageError);
         }
     };
-    // Directory scan + ".SID" match + read live in `sid_scan` so they are
-    // exercised by host tests against an in-memory disk image.
-    crate::sid_scan::find_first_sid(&fs, dst).ok_or(StorageError)
+    crate::sid_scan::load_sid_by_index(&fs, idx, dst).ok_or(StorageError)
+}
+
+/// Mount the USB FAT volume and enumerate root `*.SID` short names into `out`.
+/// Returns the number found (0 on mount failure).
+pub fn list_sids(msc: &UsbMsc, out: &mut crate::sid_scan::SidList) -> usize {
+    let storage = MscStorage::new(msc);
+    let fs = match FileSystem::new(storage, FsOptions::new()) {
+        Ok(fs) => fs,
+        Err(_) => {
+            log::info!("fat: list_sids mount failed");
+            return 0;
+        }
+    };
+    crate::sid_scan::list_root_sids(&fs, out)
+}
+
+/// Back-compat shim: load the first root `*.SID`.
+pub fn load_first_sid(msc: &UsbMsc, dst: &mut [u8]) -> Result<usize, StorageError> {
+    load_sid(msc, 0, dst)
 }
