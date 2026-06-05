@@ -169,15 +169,27 @@ execute the play routine fast enough; see **6502 playback throughput** below.
       own $5000–$5FFF region): "some notes failed". The only previously-working tune
       (`Gyroscope_3`) does **zero** PSRAM writes, so this path was never stressed.
     - *Postcard* (CIA **300 Hz**, 6×): badly choppy — only 3.33 ms/call budget.
-    - **Discriminating experiment:** disabling the scope plotter (frees its PSRAM
-      bandwidth) helped *both* only **partially** → contention is a real but
-      secondary factor; the primary limit is raw 6502/PSRAM execution speed.
-  - Leading fix: **speed up the bridge** — it currently spends a full `N=64`-cycle
-    window per bus access even when PSRAM acks sooner (`advance = phase==N-1 & …`).
-    Letting `advance` fire as soon as the access completes (and/or lowering `N`)
-    runs the CPU several× faster than a real C64, which is *safe* here (tempo is set
-    by the NMI timer, not CPU speed). Secondary levers: disable/reduce the `persist`
-    full-framebuffer DMA, and raise the 6502 bridge's PSRAM arbiter priority.
+  - **Adaptive bridge window (commit `8ac25f9`) — done, but largely ineffective.**
+    The bridge no longer burns a fixed `N=64` window: `advance` now fires on
+    `psram_done_r` for PSRAM, a 4-cycle settle for BRAM, full window for SID
+    (FIFO-drain safety). Sim shows PSRAM windows drop 64→~9. **On hardware:**
+    Postcard *slightly* better, **Commando unchanged**. Conclusion: the fixed
+    window was **not** the real cap — real HyperRAM single-word latency (~tens of
+    cycles, incl. command/latency/turnaround) is already ≈ the old 64-cycle window,
+    so uncapping PSRAM did almost nothing; the small Postcard gain came from the
+    BRAM (zeropage/stack) 64→4 speedup. **The true bottleneck is per-fetch HyperRAM
+    latency**, paid on every instruction/data byte because the 6502 has no read
+    cache.
+  - **Real fix (next):** amortise HyperRAM latency across the (sequential)
+    instruction stream. Cheapest high-value step: the bridge already reads a full
+    **32-bit word** (`captured_word`) but uses one byte and re-fetches for the next
+    3 — cache the last word/line and serve sequential byte reads from it (≈4× fewer
+    PSRAM reads for code fetch). Better: a small burst-filled line buffer / prefetch.
+  - Secondary levers: contention — the scope plotter and `persist` full-framebuffer
+    DMA compete for PSRAM. NB the firmware `scope.set_enabled(false)` experiment did
+    **not** actually stop the plotter's PSRAM writes (it only stops sample intake;
+    the plotter keeps redrawing the held line), so that experiment was inconclusive;
+    a clean test needs the plotter master gated in gateware.
 - **60 MHz timing not closed** — the `sync` domain places at **~50.5 MHz** but is
   clocked at 60 MHz (~16% over). Clocking above Fmax causes intermittent setup
   violations and is the likely source of the *general* "some songs sometimes miss
