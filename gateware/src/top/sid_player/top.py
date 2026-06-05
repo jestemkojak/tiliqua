@@ -203,10 +203,26 @@ class Cpu6502Bridge(wiring.Component):
         with m.Else():
             m.d.comb += data_k.eq(psram_byte)
 
-        # Advance pulse: fires at phase==N-1 once the access is complete.
-        # All operands are registers → no combinational path from cpu_AB.
+        # Advance pulse: fires as soon as the *current* access is ready, instead
+        # of always burning the full N-cycle window.  All operands are registers
+        # (is_*_r, psram_done_r, phase) → still no combinational path from cpu_AB,
+        # so the arlet cpu_AB→RDY→DIMUX→cpu_AB loop stays broken.
+        #
+        #   PSRAM : wait for the wishbone transaction (psram_done_r).  This is the
+        #           big win — tune code runs from PSRAM, previously paying a fixed
+        #           64-cycle window even when the access acked in a handful.
+        #   SID   : keep a ~full window so 6502 SID writes cannot outrun the
+        #           SIDPeripheral's 1 MHz FIFO drain (≈ one drain per N cycles) and
+        #           overflow it — i.e. preserve the old throttle for this class only.
+        #   BRAM  : a few cycles to let the registered-address comb read settle.
+        BRAM_MIN = 4
         advance = Signal()
-        m.d.comb += advance.eq((phase == N - 1) & (~is_psram_r | psram_done_r))
+        with m.If(is_psram_r):
+            m.d.comb += advance.eq(psram_done_r)
+        with m.Elif(is_sid_r):
+            m.d.comb += advance.eq(phase == N - 1)
+        with m.Else():  # BRAM (incl. the reset/BRK $01xx case)
+            m.d.comb += advance.eq(phase >= BRAM_MIN - 1)
         m.d.comb += self.cpu_RDY.eq(advance)
 
         # Phase counter: wraps on advance, saturates at N-1 while awaiting PSRAM.

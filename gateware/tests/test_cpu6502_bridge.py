@@ -152,5 +152,57 @@ class Cpu6502BridgePsramTests(unittest.TestCase):
         sim.run()
 
 
+async def _window_len(ctx, dut, addr, we=0):
+    """Steady-state cycles between two consecutive cpu_RDY pulses for `addr`."""
+    ctx.set(dut.cpu_WE, we)
+    ctx.set(dut.cpu_AB, addr)
+    await _to_rdy(ctx, dut, 2)   # settle onto a steady pulse
+    n = 0
+    await ctx.tick()
+    n += 1
+    while not ctx.get(dut.cpu_RDY):
+        await ctx.tick()
+        n += 1
+    return n
+
+
+class Cpu6502BridgeSpeedTests(unittest.TestCase):
+    """The bridge must not burn a fixed 64-cycle window on every access; BRAM
+    accesses should complete in a few cycles and PSRAM accesses should track the
+    actual memory latency rather than the worst-case window."""
+
+    def test_bram_window_is_fast(self):
+        dut = Cpu6502Bridge(psram_base_bytes=0x0)
+        m = Module()
+        m.submodules.bridge = dut
+
+        async def testbench(ctx):
+            wlen = await _window_len(ctx, dut, 0x0100)  # BRAM ($0000-$07FF)
+            self.assertLess(wlen, 16, f"BRAM window {wlen} cyc, expected a few")
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+    def test_psram_window_tracks_latency(self):
+        bridge = Cpu6502Bridge(psram_base_bytes=0x0)
+        fake = test_psram.FakePSRAM(addr_width=22, data_width=32,
+                                    storage_words=4096, latency_cycles=4)
+        m = Module()
+        m.submodules.bridge = bridge
+        m.submodules.fake = fake
+        _wiring.connect(m, bridge.psram_bus, fake.bus)
+
+        async def testbench(ctx):
+            wlen = await _window_len(ctx, bridge, 0x0800)  # PSRAM read (word 512)
+            self.assertLess(wlen, 32, f"PSRAM window {wlen} cyc, expected ~latency")
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+
 if __name__ == "__main__":
     unittest.main()
