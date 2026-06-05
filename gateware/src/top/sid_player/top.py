@@ -322,55 +322,19 @@ class PlayTimerPeripheral(wiring.Component):
         play_rate:  csr.Field(csr.action.W, unsigned(1))
         irq_enable: csr.Field(csr.action.W, unsigned(1))
 
-    class SidWrites(csr.Register, access="r"):
-        """Free-running count of SID register writes seen from the 6502.
-        Non-zero ⟺ the 6502 is executing and writing $D400-$D41F."""
-        count: csr.Field(csr.action.R, unsigned(32))
-
-    class NmiCount(csr.Register, access="r"):
-        """Free-running count of NMI play-ticks emitted (when enabled)."""
-        count: csr.Field(csr.action.R, unsigned(32))
-
-    class State(csr.Register, access="r"):
-        """Latched control state — lets firmware confirm the write-only
-        control bits actually took effect (reset released / NMI enabled)."""
-        reset_r:      csr.Field(csr.action.R, unsigned(1))
-        rate_r:       csr.Field(csr.action.R, unsigned(1))
-        irq_enable_r: csr.Field(csr.action.R, unsigned(1))
-
-    class CpuAb(csr.Register, access="r"):
-        """Live 6502 address bus. Stuck value ⟹ CPU stalled (e.g. at 0xFFFC =
-        reset-vector fetch never completing). Changing ⟹ CPU is fetching."""
-        ab: csr.Field(csr.action.R, unsigned(16))
-
-    class PsramAcks(csr.Register, access="r"):
-        """Count of completed PSRAM wishbone transactions from the 6502 bridge.
-        0 ⟹ the 6502's instruction fetches never complete (bridge/bus stuck)."""
-        count: csr.Field(csr.action.R, unsigned(32))
-
-    class AbChanges(csr.Register, access="r"):
-        """Count of 6502 address-bus changes ⟹ proxy for CPU making progress."""
-        count: csr.Field(csr.action.R, unsigned(32))
-
     def __init__(self, *, clk_hz=60_000_000, rate_hz_pal=50, rate_hz_ntsc=60):
         self._div_pal  = clk_hz // rate_hz_pal
         self._div_ntsc = clk_hz // rate_hz_ntsc
         regs = csr.Builder(addr_width=5, data_width=8)
         self._control    = regs.add("control",    self.Control(),   offset=0x0)
-        self._sid_writes = regs.add("sid_writes", self.SidWrites(), offset=0x4)
-        self._nmi_count  = regs.add("nmi_count",  self.NmiCount(),  offset=0x8)
-        self._state      = regs.add("state",      self.State(),     offset=0xC)
-        self._cpu_ab     = regs.add("cpu_ab",     self.CpuAb(),     offset=0x10)
-        self._psram_acks = regs.add("psram_acks", self.PsramAcks(), offset=0x14)
-        self._ab_changes = regs.add("ab_changes", self.AbChanges(), offset=0x18)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus":          In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
             "nmi_pulse":    Out(1),
             "cpu_reset":    Out(1),
-            "sid_w_pulse":  In(1),
-            "dbg_cpu_ab":   In(16),
-            "dbg_psram_ack": In(1),
+            # Sim-only stimulus: the control register is write-only, so unit
+            # tests drive these to exercise the timer without a CSR master.
+            # Tied to 0 in hardware (firmware uses the control register).
             "dbg_reset":    In(1),
             "dbg_play_rate":  In(1),
             "dbg_irq_enable": In(1),
@@ -413,39 +377,6 @@ class PlayTimerPeripheral(wiring.Component):
             m.d.comb += self.nmi_pulse.eq(1)
         with m.Else():
             m.d.sync += counter.eq(counter + 1)
-
-        # --- Debug observability (read-only CSRs) ------------------------
-        # sid_writes increments on every 1-cycle SID-write pulse from the
-        # 6502 bridge; nmi_count on every emitted play-tick.  These give the
-        # RISC-V a definitive view of whether the 6502 is actually running
-        # and writing the SID (the control bits above are write-only).
-        sid_writes = Signal(32)
-        with m.If(self.sid_w_pulse):
-            m.d.sync += sid_writes.eq(sid_writes + 1)
-        nmi_count = Signal(32)
-        with m.If(self.nmi_pulse):
-            m.d.sync += nmi_count.eq(nmi_count + 1)
-
-        # 6502 liveness: latch the address bus, count PSRAM acks and AB changes.
-        ab_latch   = Signal(16)
-        psram_acks = Signal(32)
-        ab_changes = Signal(32)
-        m.d.sync += ab_latch.eq(self.dbg_cpu_ab)
-        with m.If(self.dbg_psram_ack):
-            m.d.sync += psram_acks.eq(psram_acks + 1)
-        with m.If(self.dbg_cpu_ab != ab_latch):
-            m.d.sync += ab_changes.eq(ab_changes + 1)
-
-        m.d.comb += [
-            self._sid_writes.f.count.r_data.eq(sid_writes),
-            self._nmi_count.f.count.r_data.eq(nmi_count),
-            self._state.f.reset_r.r_data.eq(reset_r),
-            self._state.f.rate_r.r_data.eq(rate_r),
-            self._state.f.irq_enable_r.r_data.eq(en_r),
-            self._cpu_ab.f.ab.r_data.eq(ab_latch),
-            self._psram_acks.f.count.r_data.eq(psram_acks),
-            self._ab_changes.f.count.r_data.eq(ab_changes),
-        ]
 
         return m
 
@@ -640,12 +571,6 @@ class SIDPlayerSoc(TiliquaSoc):
         m.d.comb += [
             self.sid_periph.ext_w_en  .eq(bridge.sid_w_en),
             self.sid_periph.ext_w_data.eq(bridge.sid_w_data),
-            # Debug: count SID writes so firmware can confirm 6502 activity.
-            self.play_timer.sid_w_pulse.eq(bridge.sid_w_en),
-            # Debug: 6502 liveness — address bus + completed PSRAM transactions.
-            self.play_timer.dbg_cpu_ab.eq(cpu.AB),
-            self.play_timer.dbg_psram_ack.eq(
-                bridge.psram_bus.cyc & bridge.psram_bus.stb & bridge.psram_bus.ack),
         ]
 
         # NMI latch: set on timer pulse, clear when CPU fetches NMI vector ($FFFA).
