@@ -22,7 +22,7 @@ class SidPlayerTuneTests(unittest.TestCase):
         # With the windowed bridge each access takes N=64 cycles.  Set the
         # clock rate so one NMI period spans ~20 64-cycle windows, giving the
         # play routine enough time to execute between interrupts.
-        timer = PlayTimerPeripheral(clk_hz=64_000, rate_hz_pal=50, rate_hz_ntsc=60)
+        timer = PlayTimerPeripheral(clk_hz=64_000)
 
         # Pre-initialise FakePSRAM with the full 64KB image (16384 words).
         init_words = image_to_words("tests/data/tiny_tune.bin")
@@ -57,6 +57,7 @@ class SidPlayerTuneTests(unittest.TestCase):
         async def testbench(ctx):
             ctx.set(timer.dbg_irq_enable, 1)
             ctx.set(timer.dbg_reset, 0)
+            ctx.set(timer.dbg_period, 20 * 64)
 
             async def mem_read(addr):
                 ctx.set(bridge.cpu_WE, 0)

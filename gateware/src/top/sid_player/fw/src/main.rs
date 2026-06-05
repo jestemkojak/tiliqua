@@ -40,18 +40,27 @@ fn write_6502_mem(base: usize, addr: u16, data: &[u8]) {
     }
 }
 
-/// Force the RISC-V write-back L1 D-cache out to physical PSRAM.
+/// Read a little-endian u16 from the 6502's view of PSRAM (volatile).
+fn read_6502_u16(base: usize, addr: u16) -> u16 {
+    let ptr = (base + addr as usize) as *const u8;
+    let lo = unsafe { core::ptr::read_volatile(ptr) };
+    let hi = unsafe { core::ptr::read_volatile(ptr.add(1)) };
+    u16::from_le_bytes([lo, hi])
+}
+
+/// Thrash the RISC-V write-back L1 D-cache against physical PSRAM.
 ///
-/// The 6502 reads PSRAM through a *separate* wishbone master that does not see
-/// the RISC-V's private L1 cache. Stores from `write_6502_mem` linger dirty in
-/// L1 (`write_volatile` does NOT bypass the hardware cache), so the 6502 would
-/// otherwise fetch stale/zero bytes — including a null reset vector — and never
-/// run the tune. VexiiRiscv here has no usable cache-maintenance instruction,
-/// so we evict by thrashing: read a scratch region many times larger than the
-/// L1 and disjoint from the 6502 window (0x20800000+). Every cache set is
-/// refilled with clean scratch lines, writing back all dirty image lines.
-/// Must be called after writing the image and before releasing the 6502.
-fn flush_6502_image() {
+/// The 6502 accesses PSRAM through a *separate* wishbone master that does not
+/// see the RISC-V's private L1 cache, and VexiiRiscv here has no usable
+/// cache-maintenance instruction. We evict by thrashing: read a scratch region
+/// many times larger than the L1 and disjoint from the 6502 window
+/// (0x20800000+), so every cache set is refilled with clean scratch lines.
+/// This serves *both* directions of the coherency problem:
+///   - after writing the image: dirty image lines are written back to PSRAM so
+///     the 6502 fetches them (not stale/zero bytes, incl. the reset vector);
+///   - after the 6502 has run: stale cached copies of 6502-written addresses
+///     (e.g. the CIA timer) are evicted so the next RISC-V read refills fresh.
+fn thrash_l1_cache() {
     // PSRAM base, well below the 6502 window — reads here are side-effect-free.
     const SCRATCH: *const u32 = 0x2000_0000 as *const u32;
     const WORDS: usize = (64 * 1024) / 4; // 64 KiB >> any L1 config on this SoC
@@ -68,6 +77,8 @@ fn trim_ascii(s: &[u8]) -> &str {
     core::str::from_utf8(&s[..end]).unwrap_or("?")
 }
 
+/// Load the tune image, run INIT, program the play rate, and (unless `paused`)
+/// start playback. Returns the play-call rate in Hz (for display).
 fn load_and_start(
     tune_buf: &[u8],
     len: usize,
@@ -75,7 +86,7 @@ fn load_and_start(
     subtune: u16,
     play_timer: &pac::PLAY_TIMER,
     paused: bool,
-) {
+) -> u32 {
     *hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
 
     let payload_raw = &tune_buf[hdr.data_offset as usize..len];
@@ -87,21 +98,30 @@ fn load_and_start(
     write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
                    &bootstrap::nmi_stub(hdr.play_addr));
     write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &bootstrap::vectors());
-    flush_6502_image();
+    // Zero CIA #1 Timer A ($DC04/$DC05) so we can detect afterwards whether the
+    // tune's INIT routine programmed a (multispeed) rate or left it untouched.
+    write_6502_mem(CPU6502_PSRAM_BASE, 0xDC04, &[0, 0]);
+    thrash_l1_cache();
 
-    let ntsc = hdr.is_ntsc(subtune);
-    play_timer.control().write(|w| {
-        w.reset().set_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
-    });
-    play_timer.control().write(|w| {
-        w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
-    });
+    // Release the 6502: pulse reset, then run INIT during the spin.
+    play_timer.control().write(|w| w.reset().set_bit().irq_enable().clear_bit());
+    play_timer.control().write(|w| w.reset().clear_bit().irq_enable().clear_bit());
     for _ in 0..2_000_000u32 { unsafe { core::arch::asm!("nop"); } }
+
+    // INIT has run. Evict stale cache lines, read back the CIA timer it may have
+    // programmed, and compute the true per-frame / multispeed play-call period.
+    thrash_l1_cache();
+    let cia_timer = read_6502_u16(CPU6502_PSRAM_BASE, 0xDC04);
+    let period = psid::play_period_cycles(
+        CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(subtune), cia_timer);
+    info!("play rate: clock={:?} cia={} timer={:#x} period={} ({} Hz)",
+          hdr.clock(), hdr.is_cia(subtune), cia_timer, period, CLOCK_SYNC_HZ / period);
+    play_timer.period().write(|w| unsafe { w.value().bits(period) });
+
     if !paused {
-        play_timer.control().write(|w| {
-            w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().set_bit()
-        });
+        play_timer.control().write(|w| w.reset().clear_bit().irq_enable().set_bit());
     }
+    CLOCK_SYNC_HZ / period
 }
 
 #[entry]
@@ -131,7 +151,7 @@ fn main() -> ! {
     // fixed 640x480 — read it and lay everything out relative to it.
     let h_active = display.size().width  as i16;
     let v_active = display.size().height as i16;
-    const HEADER_H: i16 = 140; // title + author + 3 menu rows
+    const HEADER_H: i16 = 160; // title + author + 3 menu rows + metadata
 
     // --- Voice scope: fixed config, always on -----------------------------
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
@@ -239,7 +259,7 @@ fn main() -> ! {
     // Step 2+3: Write the tune image and start playback.
     // -----------------------------------------------------------------
     let play_timer = peripherals.PLAY_TIMER;
-    load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
+    let mut play_hz = load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
     info!("playback started");
 
     // -----------------------------------------------------------------
@@ -268,7 +288,7 @@ fn main() -> ! {
                         .map(|h| h.start_song).unwrap_or(1);
                     paused = false;
                     playing_fallback = false;
-                    load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
+                    play_hz = load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
                     redraw = true;
                 }
             }
@@ -291,7 +311,7 @@ fn main() -> ! {
                         if hdr.songs > 1 {
                             current_subtune = (current_subtune as i16 + ticks as i16)
                                 .clamp(1, hdr.songs as i16) as u16;
-                            load_and_start(tune_buf, len, &mut hdr,
+                            play_hz = load_and_start(tune_buf, len, &mut hdr,
                                            current_subtune, &play_timer, paused);
                         }
                     }
@@ -318,7 +338,7 @@ fn main() -> ! {
                                     current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
                                         .map(|h| h.start_song).unwrap_or(1);
                                     paused = false;
-                                    load_and_start(tune_buf, len, &mut hdr,
+                                    play_hz = load_and_start(tune_buf, len, &mut hdr,
                                                    current_subtune, &play_timer, paused);
                                 }
                             }
@@ -329,18 +349,11 @@ fn main() -> ! {
                 1 => { // Song
                     modify = !modify;
                 }
-                2 => { // State: toggle pause
+                2 => { // State: toggle pause (period stays programmed)
                     paused = !paused;
-                    let rate = hdr.is_ntsc(current_subtune);
-                    if paused {
-                        play_timer.control().write(|w| {
-                            w.reset().clear_bit().play_rate().bit(rate).irq_enable().clear_bit()
-                        });
-                    } else {
-                        play_timer.control().write(|w| {
-                            w.reset().clear_bit().play_rate().bit(rate).irq_enable().set_bit()
-                        });
-                    }
+                    play_timer.control().write(|w| {
+                        w.reset().clear_bit().irq_enable().bit(!paused)
+                    });
                 }
                 _ => {}
             }
@@ -404,5 +417,14 @@ fn main() -> ! {
                     .draw(&mut display).ok();
             }
         }
+
+        // Tune metadata: video standard (encoding), timing source, play rate.
+        let clock_str = match hdr.clock() { psid::Clock::Ntsc => "NTSC", psid::Clock::Pal => "PAL" };
+        let speed_str = if hdr.is_cia(current_subtune) { "CIA" } else { "VBI" };
+        let mut meta: String<40> = String::new();
+        write!(meta, "{}  {}  {} Hz", clock_str, speed_str, play_hz).ok();
+        Text::with_alignment(meta.as_str(), Point::new(cx, 140),
+                             style_dim, Alignment::Center)
+            .draw(&mut display).ok();
     }
 }

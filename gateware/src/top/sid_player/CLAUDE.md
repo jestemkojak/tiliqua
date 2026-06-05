@@ -7,6 +7,15 @@ the CPU bus is frozen and decode latched into `*_r` registers each window, so
 `cpu_RDY` is never a combinational function of live `cpu_AB` (avoids the
 arlet `cpu_AB→RDY→DIMUX→cpu_AB` comb loop — see root CLAUDE.md).
 
+## Play rate (VBlank / CIA multispeed)
+- The play routine is driven by `PlayTimerPeripheral`'s NMI; its rate is a
+  firmware-computed 32-bit `period` CSR (sys-clk cycles), **not** a PAL/NTSC bit.
+  `psid::play_period_cycles` computes it. PSID `speed` (offset $12) is VBI(0) vs
+  CIA(1) timing — **not** PAL/NTSC (that's the v2 `flags` field, offset $76).
+- CIA/multispeed rate is read back from PSRAM at `$DC04/$DC05` (CIA Timer A) *after*
+  INIT runs: zero it first, `thrash_l1_cache()` to evict, then read. Only timers set
+  during INIT are seen (not those set in PLAY / via the IRQ vector).
+
 ## Gotchas (arlet in simulation)
 - arlet's `S`/regs are X at reset, so during reset/BRK stack pushes `AB={STACKPAGE,S}=$01xx` with an X low byte. Decode addresses with bit-slice **equality** (`AB[11:]==0`, `AB[5:]==(0xD400>>5)`), not magnitude `<`/`>=` — Verilog comparisons against X yield X, poison `cpu_RDY`, and wedge the core in a BRK loop.
 - arlet never initializes `S`: a 6502 program/test tune must `LDX #$FF; TXS` before any IRQ/NMI, or `RTI` pulls garbage off the stack and the PC goes to `xxxx`.

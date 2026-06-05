@@ -120,15 +120,46 @@ Encoder-driven three-item menu rendered in the header band:
 
 ---
 
+## Playback rate (VBlank / CIA multispeed)
+
+**Symptom:** some tunes "missed" fast note changes (arpeggios) and fast envelopes
+felt wrong. **Root cause:** the play routine was driven by a fixed 50/60 Hz NMI,
+and the rate selector misread the PSID header — `psid::is_ntsc` treated the
+`speed` field (offset $12) as PAL/NTSC. Per the PSID spec `speed` is *not*
+PAL/NTSC: each bit is the song's **timing source** (`0` = VBlank, `1` = CIA #1
+timer). CIA-timed tunes are frequently **multispeed** (reprogram the CIA timer to
+call play 2–4× per frame = 100–200 Hz). Driven at 60 Hz they play 2–3× too slow,
+smearing fast effects. PAL vs NTSC actually lives in the v2 **`flags`** field
+(offset $76, bits 2–3), which the parser never read.
+
+**Fix (no new gateware decode):**
+- `psid.rs`: parse `flags` → `clock()` (PAL/NTSC); rename the speed-bit reader to
+  `is_cia()`; add pure `play_period_cycles(clk_hz, clock, cia, cia_timer)` that
+  returns the `PlayTimerPeripheral` divider (VBlank frame rate, or `φ2/(timer+1)`
+  for CIA incl. multispeed; `timer==0` → ~60 Hz default). All host-tested.
+- `PlayTimerPeripheral` (`top.py`): `control` reduced to `reset`/`irq_enable`;
+  new 32-bit `period` register holds the firmware-computed divider (period 0 =
+  never, safe pre-init default). Sim stimulus input is now `dbg_period`.
+- `main.rs` `load_and_start`: zero $DC04/$DC05 in PSRAM before release; after INIT
+  runs, `thrash_l1_cache()` evicts stale lines, read back the CIA Timer A the tune
+  programmed, compute the period, and write the `period` CSR. Returns the rate in
+  Hz; the header now shows **clock / VBI-or-CIA / Hz**.
+- The cache thrash (formerly `flush_6502_image`) now serves *both* directions:
+  flushing the written image out, and evicting so the CIA-timer read-back is fresh.
+
+**Not yet hardware-validated** — needs real multispeed/NTSC tunes. Known
+limitation: only CIA timer values written during **INIT** are detected (tunes
+that set the timer inside PLAY or via the IRQ vector fall back to the default).
+
+---
+
 ## Open items
 
-- **`flush_6502_image()` (firmware, `main.rs`) is still present** and called inside
-  `load_and_start` after writing the 6502 image. Unlike the no-audio symptom, write
-  coherency *is* a genuine concern: the RISC-V writes the image through its write-back
-  L1, while the 6502 reads PSRAM via a separate wishbone master. The current 64 KiB
-  cache-thrash works but is crude — prefer replacing it with a real cache-clean, or
-  confirm empirically whether any flush is needed now that the bridge is correct.
-  Needs a hardware re-test if changed.
+- **`thrash_l1_cache()` (firmware, `main.rs`, formerly `flush_6502_image`)** — the
+  RISC-V writes through its write-back L1 while the 6502 reads PSRAM via a separate
+  wishbone master, so coherency is a genuine concern in both directions (image-out,
+  CIA-timer read-back-in). The 64 KiB cache-thrash works but is crude — prefer a real
+  cache-clean/invalidate if VexiiRiscv gains one. Needs a hardware re-test if changed.
 - **Scope upsampling** (continuous traces at full size): sid_player feeds raw
   audio-rate samples straight into `scope_periph.i` — the per-channel
   `dsp.Resample` upsamplers the voice-scope spec called for (and `macro_osc` has,
@@ -143,6 +174,6 @@ Encoder-driven three-item menu rendered in the header band:
 - **Debug CSRs** (`sid_writes`, `nmi_count`, `state`, `cpu_ab`, `psram_acks`,
   `ab_changes`) — **removed** once audio + USB were confirmed on hardware (commit
   `ad14d3b`), to reclaim LUTs on the ~95%-full 25F. `PlayTimerPeripheral` now
-  exposes only the functional `control` register. The `dbg_reset` /
-  `dbg_play_rate` / `dbg_irq_enable` inputs are kept as sim-only test stimulus
-  (control is write-only), tied to 0 in hardware.
+  exposes `control` (reset/irq_enable) + `period`. The `dbg_reset` /
+  `dbg_irq_enable` / `dbg_period` inputs are kept as sim-only test stimulus
+  (the CSRs are write-only), tied to 0 in hardware.

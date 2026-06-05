@@ -312,32 +312,36 @@ class Cpu6502Bridge(wiring.Component):
 class PlayTimerPeripheral(wiring.Component):
     """CSR control of the 6502 + periodic NMI at the PSID play rate.
 
-    CSR register 'control': bit0 reset, bit1 play_rate (0=PAL/50,1=NTSC/60),
-    bit2 irq_enable. Emits nmi_pulse (1 cycle) at the selected rate when enabled
-    and not in reset. Also drives cpu_reset out.
+    CSR register 'control': bit0 reset, bit1 irq_enable. CSR register 'period':
+    32-bit NMI divider in sys-clk cycles (firmware computes it from the tune's
+    VBlank/CIA timing — see fw psid::play_period_cycles). Emits nmi_pulse (1
+    cycle) every `period` cycles when enabled and not in reset; period 0 = never
+    (safe default before firmware programs it). Also drives cpu_reset out.
     """
 
     class Control(csr.Register, access="w"):
         reset:      csr.Field(csr.action.W, unsigned(1))
-        play_rate:  csr.Field(csr.action.W, unsigned(1))
         irq_enable: csr.Field(csr.action.W, unsigned(1))
 
-    def __init__(self, *, clk_hz=60_000_000, rate_hz_pal=50, rate_hz_ntsc=60):
-        self._div_pal  = clk_hz // rate_hz_pal
-        self._div_ntsc = clk_hz // rate_hz_ntsc
+    class Period(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(32))
+
+    def __init__(self, *, clk_hz=60_000_000):
+        self._clk_hz = clk_hz
         regs = csr.Builder(addr_width=5, data_width=8)
-        self._control    = regs.add("control",    self.Control(),   offset=0x0)
+        self._control = regs.add("control", self.Control(), offset=0x0)
+        self._period  = regs.add("period",  self.Period(),  offset=0x4)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus":          In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
             "nmi_pulse":    Out(1),
             "cpu_reset":    Out(1),
-            # Sim-only stimulus: the control register is write-only, so unit
-            # tests drive these to exercise the timer without a CSR master.
-            # Tied to 0 in hardware (firmware uses the control register).
-            "dbg_reset":    In(1),
-            "dbg_play_rate":  In(1),
+            # Sim-only stimulus: the control/period registers are write-only, so
+            # unit tests drive these to exercise the timer without a CSR master.
+            # Tied to 0 in hardware (firmware uses the CSRs).
+            "dbg_reset":      In(1),
             "dbg_irq_enable": In(1),
+            "dbg_period":     In(32),
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -346,33 +350,27 @@ class PlayTimerPeripheral(wiring.Component):
         m.submodules.bridge = self._bridge
         wiring.connect(m, wiring.flipped(self.bus), self._bridge.bus)
 
-        reset_r = Signal()
-        rate_r  = Signal()
-        en_r    = Signal()
+        reset_r  = Signal()
+        en_r     = Signal()
+        period_r = Signal(32)
         with m.If(self._control.f.reset.w_stb):
             m.d.sync += reset_r.eq(self._control.f.reset.w_data)
-        with m.If(self._control.f.play_rate.w_stb):
-            m.d.sync += rate_r.eq(self._control.f.play_rate.w_data)
         with m.If(self._control.f.irq_enable.w_stb):
             m.d.sync += en_r.eq(self._control.f.irq_enable.w_data)
+        with m.If(self._period.f.value.w_stb):
+            m.d.sync += period_r.eq(self._period.f.value.w_data)
 
-        reset_eff = reset_r | self.dbg_reset
-        rate_eff  = rate_r  | self.dbg_play_rate
-        en_eff    = en_r    | self.dbg_irq_enable
+        reset_eff  = reset_r  | self.dbg_reset
+        en_eff     = en_r     | self.dbg_irq_enable
+        period_eff = period_r | self.dbg_period
 
         m.d.comb += self.cpu_reset.eq(reset_eff)
 
-        period = Signal(32)
-        with m.If(rate_eff):
-            m.d.comb += period.eq(self._div_ntsc)
-        with m.Else():
-            m.d.comb += period.eq(self._div_pal)
-
         counter = Signal(32)
         m.d.comb += self.nmi_pulse.eq(0)
-        with m.If(~en_eff | reset_eff):
+        with m.If(~en_eff | reset_eff | (period_eff == 0)):
             m.d.sync += counter.eq(0)
-        with m.Elif(counter >= (period - 1)):
+        with m.Elif(counter >= (period_eff - 1)):
             m.d.sync += counter.eq(0)
             m.d.comb += self.nmi_pulse.eq(1)
         with m.Else():
