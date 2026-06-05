@@ -147,167 +147,163 @@ class Cpu6502Bridge(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
+        # Bus-cycle window length in sys-clk cycles.  60 MHz / 64 ≈ 0.94 MHz
+        # effective 6502 speed — appropriate for a SID player and ample for a
+        # single arbitrated PSRAM word (real HyperRAM single-word well under 64
+        # cycles even with arbiter contention).
+        N = 64
+
         bram = Memory(shape=unsigned(8), depth=2048, init=[])
         m.submodules.bram = bram
         wr = bram.write_port(granularity=8)
         rd = bram.read_port(domain="comb")
 
-        is_bram = self.cpu_AB < 0x0800
-        is_sid  = (self.cpu_AB >= 0xD400) & (self.cpu_AB <= 0xD41F)
-        is_psram = ~is_bram & ~is_sid
+        # Window-stable registered copies of the CPU bus, latched at phase==0
+        # each window.  All bridge logic uses *_r so cpu_AB is never live.
+        cpu_AB_r  = Signal(16)
+        cpu_DO_r  = Signal(8)
+        cpu_WE_r  = Signal()
+        is_bram_r  = Signal()
+        is_sid_r   = Signal()
+        is_psram_r = Signal()
 
-        # BRAM (address/data/write-enable wiring)
-        m.d.comb += [
-            rd.addr.eq(self.cpu_AB[0:11]),
-            wr.addr.eq(self.cpu_AB[0:11]),
-            wr.data.eq(self.cpu_DO),
-            wr.en.eq(is_bram & self.cpu_WE),
-        ]
-        # SID write outputs — latched at decode and pulsed for one cycle in
-        # WRITE-ACK.  Registering these means the downstream FIFO push does not
-        # depend on the CPU still holding cpu_AB/cpu_DO when it is captured, and
-        # (crucially) keeps the SID decode out of any combinational path that
-        # could feed cpu_RDY back into the CPU.
-        sid_w_en_r   = Signal()
-        sid_w_data_r = Signal(16)
-        m.d.comb += [
-            self.sid_w_en.eq(sid_w_en_r),
-            self.sid_w_data.eq(sid_w_data_r),
-        ]
+        # Free-running phase counter 0…N-1.  Saturates at N-1 while waiting
+        # for a PSRAM access to complete; wraps to 0 on the advance pulse.
+        # Driving RDY from this register (never from live cpu_AB) is what
+        # breaks the  cpu_AB→RDY→DIMUX→cpu_AB  combinational loop in arlet.
+        phase = Signal(6)
 
         bus = self.psram_bus
-        # Byte address -> word index. base is in bytes; >>2 -> word.
         byte_addr = Signal(24)
-        m.d.comb += byte_addr.eq(self._psram_base_bytes + self.cpu_AB)
-        word_adr = byte_addr[2:24]      # 22-bit word index
-        byte_sel = self.cpu_AB[0:2]     # which byte within the word
+        m.d.comb += byte_addr.eq(self._psram_base_bytes + cpu_AB_r)
+        word_adr_r = byte_addr[2:24]   # 22-bit word index (comb from registered AB)
+        byte_sel_r = cpu_AB_r[0:2]
 
-        psram_di = Signal(8)
-        captured_word = Signal(32)
-        rmw_word = Signal(32)
-
-        # FakePSRAM (and the real core) assert sel==0b1111 on every cycle;
-        # drive it constantly since byte-lane masking is never used.
         m.d.comb += bus.sel.eq(0b1111)
 
-        # Pipeline register to break combinatorial loop:
-        #   cpu_AB → is_bram → cpu_DI → CPU.DIMUX (arlet, when RDY=1) → cpu_AB
-        # cpu_DI is now driven from di_r (a FF), so there is no combinatorial
-        # path from cpu_AB to cpu_DI.  All read paths gain one stall cycle so
-        # di_r is valid before RDY is asserted.
-        cpu_di_next = Signal(8)
-        di_r = Signal(8)
-        with m.If(is_bram):
-            m.d.comb += cpu_di_next.eq(rd.data)
+        # PSRAM access state
+        psram_done_r  = Signal()
+        captured_word = Signal(32)
+        rmw_word      = Signal(32)
+
+        # BRAM read: combinational read port addressed by registered AB.
+        m.d.comb += rd.addr.eq(cpu_AB_r[0:11])
+
+        # Byte extractor from a captured 32-bit PSRAM word.
+        psram_byte = Signal(8)
+        with m.Switch(byte_sel_r):
+            for i in range(4):
+                with m.Case(i):
+                    m.d.comb += psram_byte.eq(captured_word[i*8:(i+1)*8])
+
+        # Window data mux: BRAM (comb) or captured PSRAM byte.
+        data_k = Signal(8)
+        with m.If(is_bram_r):
+            m.d.comb += data_k.eq(rd.data)
         with m.Else():
-            m.d.comb += cpu_di_next.eq(psram_di)
-        m.d.sync += di_r.eq(cpu_di_next)
-        m.d.comb += self.cpu_DI.eq(di_r)
+            m.d.comb += data_k.eq(psram_byte)
 
-        # Default stall; every FSM state overrides as needed.
-        m.d.comb += self.cpu_RDY.eq(0)
+        # Advance pulse: fires at phase==N-1 once the access is complete.
+        # All operands are registers → no combinational path from cpu_AB.
+        advance = Signal()
+        m.d.comb += advance.eq((phase == N - 1) & (~is_psram_r | psram_done_r))
+        m.d.comb += self.cpu_RDY.eq(advance)
 
-        # Mux selected byte out of a 32-bit word.
-        def select_byte(word):
-            b = Signal(8)
-            with m.Switch(byte_sel):
-                for i in range(4):
-                    with m.Case(i):
-                        m.d.comb += b.eq(word[i*8:(i+1)*8])
-            return b
+        # Phase counter: wraps on advance, saturates at N-1 while awaiting PSRAM.
+        with m.If(advance):
+            m.d.sync += phase.eq(0)
+        with m.Elif(phase < N - 1):
+            m.d.sync += phase.eq(phase + 1)
 
+        # cpu_DI: combinationally driven by the current window's data.
+        # The arlet core reads DI at the end of the window (when advance/RDY is 1)
+        # and registers DIHOLD at the same edge. During stalls (RDY=0) it uses
+        # DIHOLD, keeping the address bus stable.
+        m.d.comb += self.cpu_DI.eq(data_k)
+
+        # Latch CPU bus at phase==0 (start of each new window) and reset PSRAM
+        # done flag so the next window's access can proceed.
+        #
+        # Decode with bit-slice EQUALITY, not magnitude comparison.  During the
+        # arlet's reset/BRK stack pushes the address is {STACKPAGE, S} = $01xx
+        # with S (and thus AB[0:8]) undefined; a `<`/`>=` comparison against
+        # such an operand yields X in Verilog, poisoning is_psram_r → advance →
+        # cpu_RDY = X and wedging the core forever.  Equality on only the
+        # high-order bits classifies $01xx as BRAM regardless of the X low byte.
+        #   BRAM  $0000-$07FF  ⟺ AB[11:] == 0
+        #   SID   $D400-$D41F  ⟺ AB[5:]  == (0xD400 >> 5)
+        is_bram_next  = (self.cpu_AB[11:] == 0)
+        is_sid_next   = (self.cpu_AB[5:] == (0xD400 >> 5))
+        is_psram_next = ~is_bram_next & ~is_sid_next
+        with m.If(advance):
+            m.d.sync += [
+                cpu_AB_r.eq(self.cpu_AB),
+                cpu_DO_r.eq(self.cpu_DO),
+                cpu_WE_r.eq(self.cpu_WE),
+                is_bram_r.eq(is_bram_next),
+                is_sid_r.eq(is_sid_next),
+                is_psram_r.eq(is_psram_next),
+                psram_done_r.eq(0),
+            ]
+
+        # BRAM write: commit on the advance pulse using registered signals.
+        m.d.comb += [
+            wr.addr.eq(cpu_AB_r[0:11]),
+            wr.data.eq(cpu_DO_r),
+            wr.en.eq(advance & is_bram_r & cpu_WE_r),
+        ]
+
+        # SID write: one-cycle pulse on advance (registered AB/DO, no comb path).
+        m.d.comb += [
+            self.sid_w_en.eq(advance & is_sid_r & cpu_WE_r),
+            self.sid_w_data.eq((cpu_DO_r << 5) | cpu_AB_r[0:5]),
+        ]
+
+        # PSRAM access sub-FSM: runs within the window, sets psram_done_r when
+        # the access completes so the advance pulse can fire at phase==N-1.
         with m.FSM(name="psram_fsm"):
             with m.State("IDLE"):
-                # IDLE never asserts cpu_RDY (it stays 0 from the default
-                # above).  Asserting RDY combinationally here would make it
-                # depend on cpu_AB, and arlet's 6502 feeds RDY back into its
-                # address mux (cpu.v: DIMUX = ~RDY ? DIHOLD : DI; AB = {DIMUX,
-                # ADD}), forming a combinational loop cpu_AB -> RDY -> DIMUX ->
-                # cpu_AB that yosys/abc9 rejects.  Every access therefore acks
-                # from a registered FSM state instead.
-                with m.If(is_psram):
-                    with m.If(self.cpu_WE):
-                        m.next = "READ-FOR-RMW"
+                with m.If((phase == 1) & is_psram_r):
+                    with m.If(cpu_WE_r):
+                        m.next = "RD-FOR-RMW"
                     with m.Else():
                         m.next = "READ"
-                with m.Elif(is_bram & ~self.cpu_WE):
-                    # BRAM read: stall one cycle so di_r captures bram data.
-                    m.next = "BRAM-WAIT"
-                with m.Else():
-                    # BRAM write or SID write: latch the SID push (if any) and
-                    # ack one cycle later in WRITE-ACK.
-                    with m.If(is_sid & self.cpu_WE):
-                        m.d.sync += [
-                            sid_w_en_r.eq(1),
-                            sid_w_data_r.eq((self.cpu_DO << 5) | self.cpu_AB[0:5]),
-                        ]
-                    m.next = "WRITE-ACK"
 
-            with m.State("WRITE-ACK"):
-                # BRAM/SID write completes here.  cpu_RDY is a function of the
-                # (registered) FSM state only, never of cpu_AB.
-                m.d.comb += self.cpu_RDY.eq(1)
-                m.d.sync += sid_w_en_r.eq(0)   # one-cycle SID push pulse
-                m.next = "IDLE"
-
-            with m.State("BRAM-WAIT"):
-                # di_r = bram[AB] registered from the IDLE cycle; present to CPU.
-                m.d.comb += self.cpu_RDY.eq(1)
-                m.next = "IDLE"
-
-            # --- plain read ---
             with m.State("READ"):
                 m.d.comb += [
-                    self.cpu_RDY.eq(0),
                     bus.cyc.eq(1), bus.stb.eq(1), bus.we.eq(0),
-                    bus.adr.eq(word_adr),
+                    bus.adr.eq(word_adr_r),
                     bus.cti.eq(wishbone.CycleType.CLASSIC),
                 ]
                 with m.If(bus.ack):
-                    m.d.sync += captured_word.eq(bus.dat_r)
-                    m.next = "READ-DONE"
+                    m.d.sync += [captured_word.eq(bus.dat_r), psram_done_r.eq(1)]
+                    m.next = "IDLE"
 
-            with m.State("READ-DONE"):
-                # psram_di valid this cycle → di_r will capture it on the next edge.
+            with m.State("RD-FOR-RMW"):
                 m.d.comb += [
-                    self.cpu_RDY.eq(0),
-                    psram_di.eq(select_byte(captured_word)),
-                ]
-                m.next = "READ-PRESENT"
-
-            with m.State("READ-PRESENT"):
-                # di_r = psram_di registered from READ-DONE; present to CPU.
-                m.d.comb += self.cpu_RDY.eq(1)
-                m.next = "IDLE"
-
-            # --- read-modify-write for byte writes ---
-            with m.State("READ-FOR-RMW"):
-                m.d.comb += [
-                    self.cpu_RDY.eq(0),
                     bus.cyc.eq(1), bus.stb.eq(1), bus.we.eq(0),
-                    bus.adr.eq(word_adr),
+                    bus.adr.eq(word_adr_r),
                     bus.cti.eq(wishbone.CycleType.CLASSIC),
                 ]
                 with m.If(bus.ack):
                     new_word = Signal(32)
                     m.d.comb += new_word.eq(bus.dat_r)
-                    # Replace the addressed byte.
-                    with m.Switch(byte_sel):
+                    with m.Switch(byte_sel_r):
                         for i in range(4):
                             with m.Case(i):
-                                m.d.comb += new_word[i*8:(i+1)*8].eq(self.cpu_DO)
+                                m.d.comb += new_word[i*8:(i+1)*8].eq(cpu_DO_r)
                     m.d.sync += rmw_word.eq(new_word)
                     m.next = "WRITE"
 
             with m.State("WRITE"):
                 m.d.comb += [
-                    self.cpu_RDY.eq(0),
                     bus.cyc.eq(1), bus.stb.eq(1), bus.we.eq(1),
-                    bus.adr.eq(word_adr),
+                    bus.adr.eq(word_adr_r),
                     bus.dat_w.eq(rmw_word),
                     bus.cti.eq(wishbone.CycleType.CLASSIC),
                 ]
                 with m.If(bus.ack):
+                    m.d.sync += psram_done_r.eq(1)
                     m.next = "IDLE"
 
         return m
@@ -326,16 +322,55 @@ class PlayTimerPeripheral(wiring.Component):
         play_rate:  csr.Field(csr.action.W, unsigned(1))
         irq_enable: csr.Field(csr.action.W, unsigned(1))
 
+    class SidWrites(csr.Register, access="r"):
+        """Free-running count of SID register writes seen from the 6502.
+        Non-zero ⟺ the 6502 is executing and writing $D400-$D41F."""
+        count: csr.Field(csr.action.R, unsigned(32))
+
+    class NmiCount(csr.Register, access="r"):
+        """Free-running count of NMI play-ticks emitted (when enabled)."""
+        count: csr.Field(csr.action.R, unsigned(32))
+
+    class State(csr.Register, access="r"):
+        """Latched control state — lets firmware confirm the write-only
+        control bits actually took effect (reset released / NMI enabled)."""
+        reset_r:      csr.Field(csr.action.R, unsigned(1))
+        rate_r:       csr.Field(csr.action.R, unsigned(1))
+        irq_enable_r: csr.Field(csr.action.R, unsigned(1))
+
+    class CpuAb(csr.Register, access="r"):
+        """Live 6502 address bus. Stuck value ⟹ CPU stalled (e.g. at 0xFFFC =
+        reset-vector fetch never completing). Changing ⟹ CPU is fetching."""
+        ab: csr.Field(csr.action.R, unsigned(16))
+
+    class PsramAcks(csr.Register, access="r"):
+        """Count of completed PSRAM wishbone transactions from the 6502 bridge.
+        0 ⟹ the 6502's instruction fetches never complete (bridge/bus stuck)."""
+        count: csr.Field(csr.action.R, unsigned(32))
+
+    class AbChanges(csr.Register, access="r"):
+        """Count of 6502 address-bus changes ⟹ proxy for CPU making progress."""
+        count: csr.Field(csr.action.R, unsigned(32))
+
     def __init__(self, *, clk_hz=60_000_000, rate_hz_pal=50, rate_hz_ntsc=60):
         self._div_pal  = clk_hz // rate_hz_pal
         self._div_ntsc = clk_hz // rate_hz_ntsc
-        regs = csr.Builder(addr_width=2, data_width=8)
-        self._control = regs.add("control", self.Control(), offset=0x0)
+        regs = csr.Builder(addr_width=5, data_width=8)
+        self._control    = regs.add("control",    self.Control(),   offset=0x0)
+        self._sid_writes = regs.add("sid_writes", self.SidWrites(), offset=0x4)
+        self._nmi_count  = regs.add("nmi_count",  self.NmiCount(),  offset=0x8)
+        self._state      = regs.add("state",      self.State(),     offset=0xC)
+        self._cpu_ab     = regs.add("cpu_ab",     self.CpuAb(),     offset=0x10)
+        self._psram_acks = regs.add("psram_acks", self.PsramAcks(), offset=0x14)
+        self._ab_changes = regs.add("ab_changes", self.AbChanges(), offset=0x18)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus":          In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
             "nmi_pulse":    Out(1),
             "cpu_reset":    Out(1),
+            "sid_w_pulse":  In(1),
+            "dbg_cpu_ab":   In(16),
+            "dbg_psram_ack": In(1),
             "dbg_reset":    In(1),
             "dbg_play_rate":  In(1),
             "dbg_irq_enable": In(1),
@@ -378,6 +413,39 @@ class PlayTimerPeripheral(wiring.Component):
             m.d.comb += self.nmi_pulse.eq(1)
         with m.Else():
             m.d.sync += counter.eq(counter + 1)
+
+        # --- Debug observability (read-only CSRs) ------------------------
+        # sid_writes increments on every 1-cycle SID-write pulse from the
+        # 6502 bridge; nmi_count on every emitted play-tick.  These give the
+        # RISC-V a definitive view of whether the 6502 is actually running
+        # and writing the SID (the control bits above are write-only).
+        sid_writes = Signal(32)
+        with m.If(self.sid_w_pulse):
+            m.d.sync += sid_writes.eq(sid_writes + 1)
+        nmi_count = Signal(32)
+        with m.If(self.nmi_pulse):
+            m.d.sync += nmi_count.eq(nmi_count + 1)
+
+        # 6502 liveness: latch the address bus, count PSRAM acks and AB changes.
+        ab_latch   = Signal(16)
+        psram_acks = Signal(32)
+        ab_changes = Signal(32)
+        m.d.sync += ab_latch.eq(self.dbg_cpu_ab)
+        with m.If(self.dbg_psram_ack):
+            m.d.sync += psram_acks.eq(psram_acks + 1)
+        with m.If(self.dbg_cpu_ab != ab_latch):
+            m.d.sync += ab_changes.eq(ab_changes + 1)
+
+        m.d.comb += [
+            self._sid_writes.f.count.r_data.eq(sid_writes),
+            self._nmi_count.f.count.r_data.eq(nmi_count),
+            self._state.f.reset_r.r_data.eq(reset_r),
+            self._state.f.rate_r.r_data.eq(rate_r),
+            self._state.f.irq_enable_r.r_data.eq(en_r),
+            self._cpu_ab.f.ab.r_data.eq(ab_latch),
+            self._psram_acks.f.count.r_data.eq(psram_acks),
+            self._ab_changes.f.count.r_data.eq(ab_changes),
+        ]
 
         return m
 
@@ -572,6 +640,12 @@ class SIDPlayerSoc(TiliquaSoc):
         m.d.comb += [
             self.sid_periph.ext_w_en  .eq(bridge.sid_w_en),
             self.sid_periph.ext_w_data.eq(bridge.sid_w_data),
+            # Debug: count SID writes so firmware can confirm 6502 activity.
+            self.play_timer.sid_w_pulse.eq(bridge.sid_w_en),
+            # Debug: 6502 liveness — address bus + completed PSRAM transactions.
+            self.play_timer.dbg_cpu_ab.eq(cpu.AB),
+            self.play_timer.dbg_psram_ack.eq(
+                bridge.psram_bus.cyc & bridge.psram_bus.stb & bridge.psram_bus.ack),
         ]
 
         # NMI latch: set on timer pulse, clear when CPU fetches NMI vector ($FFFA).

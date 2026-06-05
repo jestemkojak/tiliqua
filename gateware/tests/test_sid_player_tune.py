@@ -19,8 +19,10 @@ def image_to_words(path):
 class SidPlayerTuneTests(unittest.TestCase):
     def test_play_routine_writes_sid_register(self):
         bridge = Cpu6502Bridge(psram_base_bytes=0x0)
-        # 2000 Hz / 50 Hz = 40-cycle NMI period (fast enough to see 2+ writes).
-        timer = PlayTimerPeripheral(clk_hz=2000, rate_hz_pal=50, rate_hz_ntsc=60)
+        # With the windowed bridge each access takes N=64 cycles.  Set the
+        # clock rate so one NMI period spans ~20 64-cycle windows, giving the
+        # play routine enough time to execute between interrupts.
+        timer = PlayTimerPeripheral(clk_hz=64_000, rate_hz_pal=50, rate_hz_ntsc=60)
 
         # Pre-initialise FakePSRAM with the full 64KB image (16384 words).
         init_words = image_to_words("tests/data/tiny_tune.bin")
@@ -95,7 +97,14 @@ class SidPlayerTuneTests(unittest.TestCase):
                 opcode = await mem_read(pc)
                 pc = (pc + 1) & 0xFFFF
 
-                if opcode == 0xA9:          # LDA imm
+                if opcode == 0xA2:          # LDX imm (stack-pointer setup)
+                    regs["X"] = await mem_read(pc)
+                    pc = (pc + 1) & 0xFFFF
+
+                elif opcode == 0x9A:        # TXS (implied) — no memory effect
+                    pass
+
+                elif opcode == 0xA9:        # LDA imm
                     regs["A"] = await mem_read(pc)
                     pc = (pc + 1) & 0xFFFF
 
@@ -119,7 +128,7 @@ class SidPlayerTuneTests(unittest.TestCase):
                     await mem_write(addr, (val + 1) & 0xFF)
 
                 elif opcode == 0x40:        # RTI — return to spin loop
-                    pc = 0x0805
+                    pc = 0x0808
 
                 # Drain any SID FIFO write that just happened.
                 if ctx.get(sid_fifo.r_level) > 0:

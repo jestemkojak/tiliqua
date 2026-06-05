@@ -38,6 +38,26 @@ class Cpu6502Tests(unittest.TestCase):
 from top.sid_player.top import Cpu6502Bridge
 
 
+async def _to_rdy(ctx, dut, n):
+    """Tick until the n-th cpu_RDY (advance) pulse, leaving the simulation
+    positioned ON that pulse so window-stable outputs can be sampled.
+
+    The windowed bridge freezes the CPU bus for a 64-cycle window and pulses
+    cpu_RDY once per window on the advance cycle.  An access presented on the
+    bus is *latched* at the first advance pulse and its effect — a committed
+    BRAM/PSRAM write, a sid_w_en pulse, or settled read data on cpu_DI —
+    appears at the *next* advance pulse (the one-window pipeline the arlet core
+    expects).  So callers wait for the 2nd pulse to observe a write's effect.
+    """
+    seen = 0
+    while True:
+        if ctx.get(dut.cpu_RDY):
+            seen += 1
+            if seen == n:
+                return
+        await ctx.tick()
+
+
 class Cpu6502BridgeTests(unittest.TestCase):
     def test_bram_write_then_read(self):
         dut = Cpu6502Bridge(psram_base_bytes=0x00800000)
@@ -45,22 +65,18 @@ class Cpu6502BridgeTests(unittest.TestCase):
         m.submodules.bridge = dut
 
         async def testbench(ctx):
-            # Drive the bridge's CPU-facing side directly (no real CPU).
-            # Write 0x42 to $0200 (scratch BRAM).  Writes ack one cycle later
-            # from WRITE-ACK (keeps cpu_RDY out of the combinational address
-            # path); after one tick the FSM is in WRITE-ACK with RDY=1.
+            # Write 0x42 to $0200 (scratch BRAM).  Hold the bus stable: the
+            # write is latched at the 1st advance and commits at the 2nd.
             ctx.set(dut.cpu_AB, 0x0200)
             ctx.set(dut.cpu_DO, 0x42)
             ctx.set(dut.cpu_WE, 1)
-            await ctx.tick()
-            self.assertEqual(ctx.get(dut.cpu_RDY), 1)
-            # Read it back.  After the WRITE-ACK cycle the BRAM read stalls one
-            # more cycle for the di_r pipeline (BRAM-WAIT) — poll RDY for both.
+            await _to_rdy(ctx, dut, 2)
+            # Read back $0200.  cpu_DI is combinational from the window's
+            # latched address, so it is settled by the 2nd read advance.
             ctx.set(dut.cpu_WE, 0)
             ctx.set(dut.cpu_AB, 0x0200)
             await ctx.tick()
-            while not ctx.get(dut.cpu_RDY):
-                await ctx.tick()
+            await _to_rdy(ctx, dut, 2)
             self.assertEqual(ctx.get(dut.cpu_DI), 0x42)
 
         sim = Simulator(m)
@@ -74,17 +90,15 @@ class Cpu6502BridgeTests(unittest.TestCase):
         m.submodules.bridge = dut
 
         async def testbench(ctx):
-            # Write 0xAB to $D405 (SID register 5).
+            # Write 0xAB to $D405 (SID register 5).  sid_w_en pulses on the
+            # advance that commits the latched write (the 2nd pulse).
             ctx.set(dut.cpu_AB, 0xD405)
             ctx.set(dut.cpu_DO, 0xAB)
             ctx.set(dut.cpu_WE, 1)
-            await ctx.tick()
-            # SID write acks from WRITE-ACK after one tick; sid_w_en pulses for
-            # that single cycle with the latched sid_w_data.
-            self.assertEqual(ctx.get(dut.cpu_RDY), 1)
+            await _to_rdy(ctx, dut, 2)
             self.assertEqual(ctx.get(dut.sid_w_en), 1)
             self.assertEqual(ctx.get(dut.sid_w_data), (0xAB << 5) | 0x05)
-            ctx.set(dut.cpu_WE, 0)
+            # The pulse is one cycle wide.
             await ctx.tick()
             self.assertEqual(ctx.get(dut.sid_w_en), 0)
 
@@ -114,32 +128,22 @@ class Cpu6502BridgePsramTests(unittest.TestCase):
         m, bridge, fake = self._build()
 
         async def testbench(ctx):
-            # Write 0x33 to byte $0002 (RMW into word 0).
+            # Write 0x33 to byte $0002 (RMW into PSRAM word 0); latched at the
+            # 1st advance, committed (read-modify-write completes) by the 2nd.
             ctx.set(bridge.cpu_WE, 1)
             ctx.set(bridge.cpu_AB, 0x0002)
             ctx.set(bridge.cpu_DO, 0x33)
-            # Wait for the write to complete (RDY returns high).
-            for _ in range(64):
-                await ctx.tick()
-                if ctx.get(bridge.cpu_RDY) == 1:
-                    break
-            self.assertEqual(ctx.get(bridge.cpu_RDY), 1)
+            await _to_rdy(ctx, bridge, 2)
             # Write 0x77 to byte $0003 (RMW must preserve byte 2).
             ctx.set(bridge.cpu_AB, 0x0003)
             ctx.set(bridge.cpu_DO, 0x77)
             await ctx.tick()
-            for _ in range(64):
-                await ctx.tick()
-                if ctx.get(bridge.cpu_RDY) == 1:
-                    break
-            # Read back byte $0002, expect preserved 0x33.
+            await _to_rdy(ctx, bridge, 2)
+            # Read back byte $0002, expect preserved 0x33 (settled by 2nd pulse).
             ctx.set(bridge.cpu_WE, 0)
             ctx.set(bridge.cpu_AB, 0x0002)
             await ctx.tick()
-            for _ in range(64):
-                await ctx.tick()
-                if ctx.get(bridge.cpu_RDY) == 1:
-                    break
+            await _to_rdy(ctx, bridge, 2)
             self.assertEqual(ctx.get(bridge.cpu_DI), 0x33)
 
         sim = Simulator(m)
