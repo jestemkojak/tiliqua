@@ -38,10 +38,12 @@ impl IoError for StorageError {
 /// A block-cached read-only storage adapter over `UsbMsc`.
 pub struct MscStorage<'a> {
     msc: &'a UsbMsc,
-    /// Current byte position within the virtual disk image.
+    /// Current byte position within the FAT *volume* (partition-relative).
     pos: u64,
     /// Block size in bytes (from the MSC device).
     block_size: u32,
+    /// LBA of the FAT volume's first sector (0 for an unpartitioned drive).
+    base_lba: u32,
     /// LBA currently held in `cache`, or None if cache is cold.
     cache_lba: Option<u32>,
     /// Single-block read cache.
@@ -52,13 +54,24 @@ impl<'a> MscStorage<'a> {
     pub fn new(msc: &'a UsbMsc) -> Self {
         let block_size = msc.block_size() as u32;
         let block_size = if block_size == 0 { 512 } else { block_size };
+        // The FAT BPB lives at the start of the partition, not at LBA 0 on a
+        // partitioned (MBR/GPT) stick. Parse the partition table to find it.
+        let base_lba = crate::partition::first_partition_lba(|lba, buf| {
+            msc.read_block(lba, buf).map_err(|_| ())
+        });
         Self {
             msc,
             pos: 0,
             block_size,
+            base_lba,
             cache_lba: None,
             cache: [0u8; 512],
         }
+    }
+
+    /// The partition's starting LBA, for diagnostics.
+    pub fn base_lba(&self) -> u32 {
+        self.base_lba
     }
 
     /// Ensure `cache` holds the block at `lba`.
@@ -87,7 +100,7 @@ impl<'a> Read for MscStorage<'a> {
         // Cache and read_block are always 512-byte — use that regardless of
         // self.block_size (which may differ on exotic drives but read_block
         // always transfers exactly 512 bytes).
-        let lba = (self.pos / 512) as u32;
+        let lba = self.base_lba + (self.pos / 512) as u32;
         let offset_in_block = (self.pos % 512) as usize;
         self.ensure_block(lba)?;
         let available = 512 - offset_in_block;
@@ -140,40 +153,15 @@ impl<'a> Seek for MscStorage<'a> {
 /// format with a dot separator, e.g. `b"MUSIC.SID"`.
 pub fn load_first_sid(msc: &UsbMsc, dst: &mut [u8]) -> Result<usize, StorageError> {
     let storage = MscStorage::new(msc);
-    let fs = FileSystem::new(storage, FsOptions::new()).map_err(|_| StorageError)?;
-    let root = fs.root_dir();
-
-    for entry_result in root.iter() {
-        let entry = entry_result.map_err(|_| StorageError)?;
-        if entry.is_dir() {
-            continue;
+    log::info!("fat: partition base_lba={}", storage.base_lba());
+    let fs = match FileSystem::new(storage, FsOptions::new()) {
+        Ok(fs) => fs,
+        Err(_) => {
+            log::info!("fat: FileSystem::new failed (bad BPB at base_lba?)");
+            return Err(StorageError);
         }
-        let name_bytes = entry.short_file_name_as_bytes();
-        // short_file_name_as_bytes returns e.g. b"MUSIC.SID" (uppercase, with dot).
-        // Check for ".SID" suffix, case-insensitive (FAT short names are uppercase
-        // so a plain suffix match suffices, but eq_ignore_ascii_case is defensive).
-        let is_sid = name_bytes.len() >= 4 && {
-            let ext = &name_bytes[name_bytes.len() - 4..];
-            ext.eq_ignore_ascii_case(b".SID")
-        };
-        if !is_sid {
-            continue;
-        }
-        // Found — read the file.
-        let mut file = entry.to_file();
-        let mut total = 0usize;
-        loop {
-            if total >= dst.len() {
-                break;
-            }
-            let n = file.read(&mut dst[total..]).map_err(|_| StorageError)?;
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        return Ok(total);
-    }
-
-    Err(StorageError) // no .SID file found
+    };
+    // Directory scan + ".SID" match + read live in `sid_scan` so they are
+    // exercised by host tests against an in-memory disk image.
+    crate::sid_scan::find_first_sid(&fs, dst).ok_or(StorageError)
 }

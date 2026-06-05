@@ -29,3 +29,6 @@ fp-info-cache
 .worktrees/
 
 .superpowers/
+docs/superpowers/
+docs/notes.md
+docs/code-review-kojak.md

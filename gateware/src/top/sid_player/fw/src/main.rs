@@ -40,6 +40,28 @@ fn write_6502_mem(base: usize, addr: u16, data: &[u8]) {
     }
 }
 
+/// Force the RISC-V write-back L1 D-cache out to physical PSRAM.
+///
+/// The 6502 reads PSRAM through a *separate* wishbone master that does not see
+/// the RISC-V's private L1 cache. Stores from `write_6502_mem` linger dirty in
+/// L1 (`write_volatile` does NOT bypass the hardware cache), so the 6502 would
+/// otherwise fetch stale/zero bytes — including a null reset vector — and never
+/// run the tune. VexiiRiscv here has no usable cache-maintenance instruction,
+/// so we evict by thrashing: read a scratch region many times larger than the
+/// L1 and disjoint from the 6502 window (0x20800000+). Every cache set is
+/// refilled with clean scratch lines, writing back all dirty image lines.
+/// Must be called after writing the image and before releasing the 6502.
+fn flush_6502_image() {
+    // PSRAM base, well below the 6502 window — reads here are side-effect-free.
+    const SCRATCH: *const u32 = 0x2000_0000 as *const u32;
+    const WORDS: usize = (64 * 1024) / 4; // 64 KiB >> any L1 config on this SoC
+    let mut acc: u32 = 0;
+    for i in 0..WORDS {
+        acc = acc.wrapping_add(unsafe { core::ptr::read_volatile(SCRATCH.add(i)) });
+    }
+    core::hint::black_box(acc);
+}
+
 /// Extract a null-terminated ASCII string from a fixed-width byte slice.
 fn trim_ascii(s: &[u8]) -> &str {
     let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
@@ -54,8 +76,11 @@ fn main() -> ! {
     tiliqua_fw::handlers::logger_init(serial);
     info!("Hello from SID Player!");
 
+    info!("init: reading bootinfo from {:#x}", BOOTINFO_BASE);
     let bootinfo = unsafe { bootinfo::BootInfo::from_addr(BOOTINFO_BASE) }.unwrap();
+    info!("init: bootinfo ok");
     let modeline = bootinfo.modeline.maybe_override_fixed(FIXED_MODELINE, CLOCK_DVI_HZ);
+    info!("init: modeline ok");
     let mut display = DMAFramebuffer0::new(
         peripherals.FRAMEBUFFER_PERIPH,
         peripherals.PALETTE_PERIPH,
@@ -66,12 +91,16 @@ fn main() -> ! {
         modeline,
         BLIT_MEM_BASE,
     );
+    info!("init: display ok");
 
     palette::ColorPalette::default().write_to_hardware(&mut display);
+    info!("init: palette ok");
 
     // --- Voice scope: fixed config, always on -----------------------------
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
+    info!("init: scope ok");
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
+    info!("init: persist ok");
 
     // Crisp look: low persistence => fast decay (clears additive traces).
     persist.set_persistence(2);
@@ -92,9 +121,11 @@ fn main() -> ! {
 
     // Free-run (trigger_always = true) so traces show without a trigger edge.
     scope.set_enabled(true, true);
+    info!("init: scope enabled");
 
     // Fallback tune embedded at build time — plays if no USB drive is present.
     static FALLBACK_SID: &[u8] = include_bytes!("../Gyroscope_3.sid");
+    info!("init: fallback SID {} bytes embedded", FALLBACK_SID.len());
 
     // -----------------------------------------------------------------
     // Step 1: Show banner, try USB for ~2 s, fall back to built-in tune.
@@ -108,8 +139,10 @@ fn main() -> ! {
     Text::new("Insert USB drive, or plays built-in tune...", Point::new(20, 50), style_dim)
         .draw(&mut display)
         .ok();
+    info!("init: banner drawn");
 
     let msc = UsbMsc::new(peripherals.USB_MSC);
+    info!("init: USB MSC created, waiting up to 2s...");
 
     // Poll for USB readiness for ~2 s (60 MHz * 2 = 120_000_000 nops).
     const USB_TIMEOUT: u32 = 120_000_000;
@@ -121,6 +154,7 @@ fn main() -> ! {
         }
         ready
     };
+    info!("init: USB ready={}", usb_ready);
 
     // Scratch buffer in PSRAM at +7 MB (well away from framebuffer at 0x20000000).
     let tune_buf: &mut [u8] = unsafe {
@@ -144,8 +178,10 @@ fn main() -> ! {
     info!("Loaded {} bytes", len);
 
     let mut hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
-    info!("PSID v{}: songs={} start={} init={:#x} play={:#x}",
-          hdr.version, hdr.songs, hdr.start_song, hdr.init_addr, hdr.play_addr);
+    info!("PSID v{}: songs={} start={} init={:#x} play={:#x} speed={:#010x}",
+          hdr.version, hdr.songs, hdr.start_song, hdr.init_addr, hdr.play_addr, hdr.speed);
+    info!("PSID: data_offset={:#x} load_addr_hdr={:#x}",
+          hdr.data_offset, hdr.load_addr);
 
     // -----------------------------------------------------------------
     // Step 2: Write tune payload to the 6502 PSRAM region.
@@ -154,37 +190,88 @@ fn main() -> ! {
     let load_addr   = hdr.effective_load_addr(payload_raw);
     // If load_addr was embedded in payload (hdr.load_addr == 0), skip the 2 addr bytes.
     let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+    info!("6502 mem: writing {} bytes to load_addr={:#x} (cpu base={:#x})",
+          payload.len(), load_addr, CPU6502_PSRAM_BASE);
+    info!("6502 mem: first 4 bytes = {:02x} {:02x} {:02x} {:02x}",
+          payload.get(0).copied().unwrap_or(0),
+          payload.get(1).copied().unwrap_or(0),
+          payload.get(2).copied().unwrap_or(0),
+          payload.get(3).copied().unwrap_or(0));
     write_6502_mem(CPU6502_PSRAM_BASE, load_addr, payload);
+    // Readback to confirm PSRAM writes are visible from RISC-V
+    let rb_ptr = (CPU6502_PSRAM_BASE + load_addr as usize) as *const u8;
+    let (rb0, rb1, rb2, rb3) = unsafe {(
+        core::ptr::read_volatile(rb_ptr),
+        core::ptr::read_volatile(rb_ptr.add(1)),
+        core::ptr::read_volatile(rb_ptr.add(2)),
+        core::ptr::read_volatile(rb_ptr.add(3)),
+    )};
+    info!("6502 mem readback @{:#x}: {:02x} {:02x} {:02x} {:02x} (expected {:02x} {:02x} {:02x} {:02x})",
+          load_addr, rb0, rb1, rb2, rb3,
+          payload.get(0).copied().unwrap_or(0),
+          payload.get(1).copied().unwrap_or(0),
+          payload.get(2).copied().unwrap_or(0),
+          payload.get(3).copied().unwrap_or(0));
 
     let mut current_subtune: u16 = hdr.start_song; // 1-based
     let sub0 = (current_subtune.saturating_sub(1)) as u8;
 
-    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::INIT_STUB_ADDR,
-                   &bootstrap::init_stub(sub0, hdr.init_addr));
-    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
-                   &bootstrap::nmi_stub(hdr.play_addr));
-    write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &bootstrap::vectors());
+    let init_stub_bytes = bootstrap::init_stub(sub0, hdr.init_addr);
+    let nmi_stub_bytes  = bootstrap::nmi_stub(hdr.play_addr);
+    let vector_bytes    = bootstrap::vectors();
+    info!("6502 stubs: init@{:#x} = {:02x?}", bootstrap::INIT_STUB_ADDR, init_stub_bytes);
+    info!("6502 stubs: nmi@{:#x}  = {:02x?}", bootstrap::NMI_STUB_ADDR,  nmi_stub_bytes);
+    info!("6502 stubs: vectors@fffa = {:02x?}", vector_bytes);
+    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::INIT_STUB_ADDR, &init_stub_bytes);
+    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,  &nmi_stub_bytes);
+    write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &vector_bytes);
+    // Readback vectors
+    let vptr = (CPU6502_PSRAM_BASE + 0xFFFA) as *const u8;
+    let (v0, v1, v2, v3, v4, v5) = unsafe {(
+        core::ptr::read_volatile(vptr),
+        core::ptr::read_volatile(vptr.add(1)),
+        core::ptr::read_volatile(vptr.add(2)),
+        core::ptr::read_volatile(vptr.add(3)),
+        core::ptr::read_volatile(vptr.add(4)),
+        core::ptr::read_volatile(vptr.add(5)),
+    )};
+    info!("6502 vectors readback: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} (expected {:02x?})",
+          v0, v1, v2, v3, v4, v5, vector_bytes);
+    info!("6502 stubs: written");
+
+    // Evict the 6502 image from the RISC-V L1 D-cache to physical PSRAM, else
+    // the 6502 (a separate bus master) fetches stale/zero bytes.
+    flush_6502_image();
+    info!("6502 image: D-cache flushed to PSRAM");
 
     // -----------------------------------------------------------------
     // Step 3: Start playback.
     // -----------------------------------------------------------------
     let play_timer = peripherals.PLAY_TIMER;
     let ntsc = hdr.is_ntsc(current_subtune);
+    info!("play_timer: ntsc={} for subtune {}", ntsc, current_subtune);
 
     // Hold 6502 in reset, set play rate, disable irq.
     play_timer.control().write(|w| {
         w.reset().set_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
     });
+    info!("play_timer: reset asserted (ctrl readback bits={:#010x})",
+          play_timer.control().read().bits());
     // Release reset.
     play_timer.control().write(|w| {
         w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
     });
+    info!("play_timer: reset released, ctrl={:#010x}",
+          play_timer.control().read().bits());
     // Allow init stub to run (~2M nops at 60 MHz ≈ 33 ms).
+    info!("play_timer: waiting for 6502 init stub...");
     for _ in 0..2_000_000u32 { unsafe { core::arch::asm!("nop"); } }
     // Enable NMI play ticks.
     play_timer.control().write(|w| {
         w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().set_bit()
     });
+    info!("play_timer: NMI enabled, ctrl={:#010x} — playback started",
+          play_timer.control().read().bits());
 
     // -----------------------------------------------------------------
     // Step 4: Main loop — controls + display.
@@ -192,8 +279,29 @@ fn main() -> ! {
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused  = false;
     let mut redraw  = true; // draw immediately on first iteration
+    let mut loop_count: u32 = 0;
 
+    info!("Entering main loop");
     loop {
+        loop_count = loop_count.wrapping_add(1);
+        if loop_count % 500_000 == 0 {
+            // Debug: sid_writes>0 proves the 6502 is running and writing the
+            // SID; nmi_count climbing proves play-ticks are firing. state bits
+            // confirm the write-only control register latched (reset released
+            // = bit0 clear, NMI enabled = bit2 set).
+            let sw = play_timer.sid_writes().read().count().bits();
+            let nc = play_timer.nmi_count().read().count().bits();
+            let st = play_timer.state().read().bits();
+            // 6502 liveness: ab = current address bus (stuck ⟹ stalled, e.g.
+            // 0xfffc = reset-vector fetch never completing); acks = completed
+            // PSRAM transactions (0 ⟹ fetches never finish); abc = AB changes.
+            let ab  = play_timer.cpu_ab().read().ab().bits();
+            let ack = play_timer.psram_acks().read().count().bits();
+            let abc = play_timer.ab_changes().read().count().bits();
+            info!("main loop iter={} paused={} subtune={}/{} sid_writes={} nmi_count={} state={:#04x} ab={:#06x} psram_acks={} ab_changes={}",
+                  loop_count, paused, current_subtune, hdr.songs, sw, nc, st, ab, ack, abc);
+        }
+
         encoder.update();
 
         // -- Hot-plug: if playing fallback and USB drive appears, reload from it --
@@ -215,6 +323,7 @@ fn main() -> ! {
                 write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
                                &bootstrap::nmi_stub(hdr.play_addr));
                 write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &bootstrap::vectors());
+                flush_6502_image();
 
                 let rate = hdr.is_ntsc(current_subtune);
                 play_timer.control().write(|w| {
@@ -263,6 +372,7 @@ fn main() -> ! {
                            &bootstrap::init_stub(s0, hdr.init_addr));
             write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
                            &bootstrap::nmi_stub(hdr.play_addr));
+            flush_6502_image();
 
             // Hold 6502 in reset, switch rate.
             play_timer.control().write(|w| {

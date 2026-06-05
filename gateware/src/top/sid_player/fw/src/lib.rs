@@ -19,7 +19,9 @@ pub mod handlers;
 
 // Host-testable pure modules (no pac dependency)
 pub mod bootstrap;
+pub mod partition;
 pub mod psid;
+pub mod sid_scan;
 
 // Embedded-only modules (depend on tiliqua_pac)
 #[cfg(not(test))]
