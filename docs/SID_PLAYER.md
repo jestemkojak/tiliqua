@@ -147,14 +147,42 @@ smearing fast effects. PAL vs NTSC actually lives in the v2 **`flags`** field
 - The cache thrash (formerly `flush_6502_image`) now serves *both* directions:
   flushing the written image out, and evicting so the CIA-timer read-back is fresh.
 
-**Not yet hardware-validated** — needs real multispeed/NTSC tunes. Known
-limitation: only CIA timer values written during **INIT** are detected (tunes
-that set the timer inside PLAY or via the IRQ vector fall back to the default).
+**Hardware-validated** (rate detection): `LEK_DNB` → `PAL CIA 55 Hz` (correct,
+sounds right), `My_Day` → `NTSC VBI 59 Hz` (was wrongly 50 Hz before),
+`Postcard from Ibiza` → `PAL CIA 300 Hz` (6× multispeed read back correctly). The
+on-screen `clock / VBI-or-CIA / Hz` readout matches the SID database in every case.
+
+Known limitation: only CIA timer values written during **INIT** are detected
+(tunes that set the timer inside PLAY or via the IRQ vector fall back to the
+default). Note: correct *rate detection* does not imply correct *playback* —
+high-rate tunes (Postcard at 300 Hz) still play wrong because the 6502 can't
+execute the play routine fast enough; see **6502 playback throughput** below.
 
 ---
 
 ## Open items
 
+- **6502 playback throughput** (next priority) — heavy or high-rate tunes play
+  wrong because the emulated 6502, running its code from PSRAM, can't finish the
+  play routine before the next NMI. Evidence:
+    - *Commando* (PAL VBI 50 Hz, no SID reads, but **85 RMW writes/frame** into its
+      own $5000–$5FFF region): "some notes failed". The only previously-working tune
+      (`Gyroscope_3`) does **zero** PSRAM writes, so this path was never stressed.
+    - *Postcard* (CIA **300 Hz**, 6×): badly choppy — only 3.33 ms/call budget.
+    - **Discriminating experiment:** disabling the scope plotter (frees its PSRAM
+      bandwidth) helped *both* only **partially** → contention is a real but
+      secondary factor; the primary limit is raw 6502/PSRAM execution speed.
+  - Leading fix: **speed up the bridge** — it currently spends a full `N=64`-cycle
+    window per bus access even when PSRAM acks sooner (`advance = phase==N-1 & …`).
+    Letting `advance` fire as soon as the access completes (and/or lowering `N`)
+    runs the CPU several× faster than a real C64, which is *safe* here (tempo is set
+    by the NMI timer, not CPU speed). Secondary levers: disable/reduce the `persist`
+    full-framebuffer DMA, and raise the 6502 bridge's PSRAM arbiter priority.
+- **60 MHz timing not closed** — the `sync` domain places at **~50.5 MHz** but is
+  clocked at 60 MHz (~16% over). Clocking above Fmax causes intermittent setup
+  violations and is the likely source of the *general* "some songs sometimes miss
+  notes" symptom (distinct from the throughput issue above). Closing it on the
+  ~92%-full 25F is real work (fewer scope channels / logic trimming).
 - **`thrash_l1_cache()` (firmware, `main.rs`, formerly `flush_6502_image`)** — the
   RISC-V writes through its write-back L1 while the 6502 reads PSRAM via a separate
   wishbone master, so coherency is a genuine concern in both directions (image-out,
@@ -167,10 +195,13 @@ that set the timer inside PLAY or via the IRQ vector fall back to the default).
   firmware (scale-down + slower timebase). The proper fix is 4 `Resample` blocks,
   but the design is at ~92% LUTs / failing 60 MHz timing — likely needs dropping
   MIX back to 3 channels to fit.
-- **PSRAM RMW writes** (tune storing above `$07FF`): the bridge now implements the
-  sub-FSM (`RD-FOR-RMW → WRITE → psram_done_r`, replacing the old WRITE→IDLE wedge),
-  but this path is not yet exercised by a cosim case or validated on hardware
-  (Gyroscope_3 never writes PSRAM). Add a cosim tune that stores above `$07FF`.
+- **PSRAM RMW writes** (tune storing above `$07FF`): the bridge implements the
+  sub-FSM (`RD-FOR-RMW → WRITE → psram_done_r`, replacing the old WRITE→IDLE wedge).
+  Correctness is cosim-tested (`test_psram_rmw_preserves_adjacent_byte`: byte-merge
+  + read-back) and now exercised on hardware by *Commando* (85 RMW/frame) — it does
+  not wedge or corrupt obviously, so the RMW problem is **cost, not correctness**
+  (each RMW = serialized read+write ≈ 2× latency, feeding the throughput issue
+  above). Still worth a dedicated cosim *tune* that stores above `$07FF`.
 - **Debug CSRs** (`sid_writes`, `nmi_count`, `state`, `cpu_ab`, `psram_acks`,
   `ab_changes`) — **removed** once audio + USB were confirmed on hardware (commit
   `ad14d3b`), to reclaim LUTs on the ~95%-full 25F. `PlayTimerPeripheral` now
