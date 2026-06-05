@@ -131,7 +131,7 @@ fn main() -> ! {
     // fixed 640x480 — read it and lay everything out relative to it.
     let h_active = display.size().width  as i16;
     let v_active = display.size().height as i16;
-    const HEADER_H: i16 = 104; // title + author + 3 menu rows
+    const HEADER_H: i16 = 140; // title + author + 3 menu rows
 
     // --- Voice scope: fixed config, always on -----------------------------
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
@@ -362,20 +362,21 @@ fn main() -> ! {
         let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
         let author_str = trim_ascii(&tune_buf[0x36..0x56]);
 
-        // Title + author at top.
+        // Title + author at top, centered horizontally.
+        let cx = h_active as i32 / 2;
         let mut line1: String<80> = String::new();
         write!(line1, "SID PLAYER  {}", name_str).ok();
-        Text::new(line1.as_str(), Point::new(20, 18), style)
+        Text::with_alignment(line1.as_str(), Point::new(cx, 34), style, Alignment::Center)
             .draw(&mut display).ok();
-        Text::new(author_str, Point::new(20, 36), style_dim)
+        Text::with_alignment(author_str, Point::new(cx, 54), style_dim, Alignment::Center)
             .draw(&mut display).ok();
 
-        // Three-item menu: label left, value right, `<` modify marker.
-        let label_x  = 20i32;
-        let value_x  = 220i32;
-        let marker_x = 226i32;
-        let vy0      = 58i32;
-        let vspace   = 18i32;
+        // Three-item menu centered around cx: label left, value right, `<` marker.
+        let label_x  = cx - 100;
+        let value_x  = cx + 100;
+        let marker_x = cx + 110;
+        let vy0      = 78i32;
+        let vspace   = 20i32;
 
         for n in 0..3usize {
             let font = if selected == n { style } else { style_dim };
