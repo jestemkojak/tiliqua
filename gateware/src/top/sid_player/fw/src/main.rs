@@ -68,6 +68,42 @@ fn trim_ascii(s: &[u8]) -> &str {
     core::str::from_utf8(&s[..end]).unwrap_or("?")
 }
 
+fn load_and_start(
+    tune_buf: &[u8],
+    len: usize,
+    hdr: &mut psid::PsidHeader,
+    subtune: u16,
+    play_timer: &pac::PLAY_TIMER,
+    paused: bool,
+) {
+    *hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
+
+    let payload_raw = &tune_buf[hdr.data_offset as usize..len];
+    let load_addr   = hdr.effective_load_addr(payload_raw);
+    let payload     = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+    write_6502_mem(CPU6502_PSRAM_BASE, load_addr, payload);
+    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::INIT_STUB_ADDR,
+                   &bootstrap::init_stub((subtune.saturating_sub(1)) as u8, hdr.init_addr));
+    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
+                   &bootstrap::nmi_stub(hdr.play_addr));
+    write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &bootstrap::vectors());
+    flush_6502_image();
+
+    let ntsc = hdr.is_ntsc(subtune);
+    play_timer.control().write(|w| {
+        w.reset().set_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
+    });
+    play_timer.control().write(|w| {
+        w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
+    });
+    for _ in 0..2_000_000u32 { unsafe { core::arch::asm!("nop"); } }
+    if !paused {
+        play_timer.control().write(|w| {
+            w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().set_bit()
+        });
+    }
+}
+
 #[entry]
 fn main() -> ! {
     let peripherals = pac::Peripherals::take().unwrap();
@@ -184,48 +220,13 @@ fn main() -> ! {
     info!("PSID v{}: songs={} start={} init={:#x} play={:#x} speed={:#010x}",
           hdr.version, hdr.songs, hdr.start_song, hdr.init_addr, hdr.play_addr, hdr.speed);
 
-    // -----------------------------------------------------------------
-    // Step 2: Write tune payload to the 6502 PSRAM region.
-    // -----------------------------------------------------------------
-    let payload_raw = &tune_buf[hdr.data_offset as usize..len];
-    let load_addr   = hdr.effective_load_addr(payload_raw);
-    // If load_addr was embedded in payload (hdr.load_addr == 0), skip the 2 addr bytes.
-    let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
-    write_6502_mem(CPU6502_PSRAM_BASE, load_addr, payload);
-
     let mut current_subtune: u16 = hdr.start_song; // 1-based
-    let sub0 = (current_subtune.saturating_sub(1)) as u8;
-
-    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::INIT_STUB_ADDR,
-                   &bootstrap::init_stub(sub0, hdr.init_addr));
-    write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
-                   &bootstrap::nmi_stub(hdr.play_addr));
-    write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &bootstrap::vectors());
-
-    // Evict the 6502 image from the RISC-V L1 D-cache to physical PSRAM, else
-    // the 6502 (a separate bus master) fetches stale/zero bytes.
-    flush_6502_image();
 
     // -----------------------------------------------------------------
-    // Step 3: Start playback.
+    // Step 2+3: Write the tune image and start playback.
     // -----------------------------------------------------------------
     let play_timer = peripherals.PLAY_TIMER;
-    let ntsc = hdr.is_ntsc(current_subtune);
-
-    // Hold 6502 in reset, set play rate, disable irq.
-    play_timer.control().write(|w| {
-        w.reset().set_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
-    });
-    // Release reset.
-    play_timer.control().write(|w| {
-        w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().clear_bit()
-    });
-    // Allow init stub to run (~2M nops at 60 MHz ≈ 33 ms).
-    for _ in 0..2_000_000u32 { unsafe { core::arch::asm!("nop"); } }
-    // Enable NMI play ticks.
-    play_timer.control().write(|w| {
-        w.reset().clear_bit().play_rate().bit(ntsc).irq_enable().set_bit()
-    });
+    load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
     info!("playback started");
 
     // -----------------------------------------------------------------
@@ -247,30 +248,7 @@ fn main() -> ! {
                 current_subtune = hdr.start_song;
                 paused = false;
                 playing_fallback = false;
-
-                let pr = &tune_buf[hdr.data_offset as usize..len];
-                let la = hdr.effective_load_addr(pr);
-                let p  = if hdr.load_addr == 0 { &pr[2..] } else { pr };
-                write_6502_mem(CPU6502_PSRAM_BASE, la, p);
-                write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::INIT_STUB_ADDR,
-                               &bootstrap::init_stub((current_subtune - 1) as u8, hdr.init_addr));
-                write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
-                               &bootstrap::nmi_stub(hdr.play_addr));
-                write_6502_mem(CPU6502_PSRAM_BASE, 0xFFFA, &bootstrap::vectors());
-                flush_6502_image();
-
-                let rate = hdr.is_ntsc(current_subtune);
-                play_timer.control().write(|w| {
-                    w.reset().set_bit().play_rate().bit(rate).irq_enable().clear_bit()
-                });
-                play_timer.control().write(|w| {
-                    w.reset().clear_bit().play_rate().bit(rate).irq_enable().clear_bit()
-                });
-                for _ in 0..2_000_000u32 { unsafe { core::arch::asm!("nop"); } }
-                play_timer.control().write(|w| {
-                    w.reset().clear_bit().play_rate().bit(rate).irq_enable().set_bit()
-                });
-
+                load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
                 redraw = true;
             }
         }
@@ -297,34 +275,7 @@ fn main() -> ! {
             current_subtune = (current_subtune as i16 + ticks as i16)
                 .max(1)
                 .min(hdr.songs as i16) as u16;
-
-            let rate = hdr.is_ntsc(current_subtune);
-            let s0   = (current_subtune - 1) as u8;
-
-            // Rewrite init stub for new subtune.
-            write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::INIT_STUB_ADDR,
-                           &bootstrap::init_stub(s0, hdr.init_addr));
-            write_6502_mem(CPU6502_PSRAM_BASE, bootstrap::NMI_STUB_ADDR,
-                           &bootstrap::nmi_stub(hdr.play_addr));
-            flush_6502_image();
-
-            // Hold 6502 in reset, switch rate.
-            play_timer.control().write(|w| {
-                w.reset().set_bit().play_rate().bit(rate).irq_enable().clear_bit()
-            });
-            for _ in 0..500_000u32 { unsafe { core::arch::asm!("nop"); } }
-            // Release reset (init runs).
-            play_timer.control().write(|w| {
-                w.reset().clear_bit().play_rate().bit(rate).irq_enable().clear_bit()
-            });
-            for _ in 0..2_000_000u32 { unsafe { core::arch::asm!("nop"); } }
-            // Re-enable play ticks unless paused.
-            if !paused {
-                play_timer.control().write(|w| {
-                    w.reset().clear_bit().play_rate().bit(rate).irq_enable().set_bit()
-                });
-            }
-
+            load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, paused);
             redraw = true;
         }
 
