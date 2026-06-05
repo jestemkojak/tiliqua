@@ -200,14 +200,27 @@ fn main() -> ! {
         core::slice::from_raw_parts_mut((PSRAM_BASE + 0x700000) as *mut u8, 65536)
     };
 
+    // Enumerate root *.SID filenames once (load payloads only on commit).
+    let mut file_list: sid_scan::SidList = sid_scan::SidList::new();
+    let mut current_file: usize = 0;
+
     let (mut len, mut playing_fallback) = if usb_ready {
-        match fat::load_first_sid(&msc, tune_buf) {
-            Ok(n)  => { info!("USB: loaded {} bytes", n); (n, false) },
-            Err(_) => {
-                info!("No .SID on USB — using built-in tune");
-                tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
-                (FALLBACK_SID.len(), true)
+        fat::list_sids(&msc, &mut file_list);
+        info!("USB: {} .SID files in root", file_list.len());
+        if !file_list.is_empty() {
+            match fat::load_sid(&msc, 0, tune_buf) {
+                Ok(n)  => { info!("USB: loaded {} bytes", n); (n, false) },
+                Err(_) => {
+                    info!("USB load failed — using built-in tune");
+                    file_list.clear();
+                    tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
+                    (FALLBACK_SID.len(), true)
+                }
             }
+        } else {
+            info!("No .SID on USB — using built-in tune");
+            tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
+            (FALLBACK_SID.len(), true)
         }
     } else {
         info!("No USB drive — using built-in tune");
@@ -233,49 +246,104 @@ fn main() -> ! {
     // Step 4: Main loop — controls + display.
     // -----------------------------------------------------------------
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
-    let mut paused  = false;
-    let mut redraw  = true; // draw immediately on first iteration
+    let mut paused   = false;
+    let mut redraw   = true; // draw immediately on first iteration
+    let mut selected: usize = 0;     // 0=File, 1=Song, 2=State
+    let mut modify   = false;        // "modifying" the focused item
+    let mut browse_idx: usize = 0;   // highlighted file while modifying File
 
     loop {
         encoder.update();
 
-        // -- Hot-plug: if playing fallback and USB drive appears, reload from it --
+        // -- Hot-plug: if playing fallback and USB drive appears, enumerate + load index 0 --
         if playing_fallback && msc.ready() {
-            if let Ok(n) = fat::load_first_sid(&msc, tune_buf) {
-                info!("Hot-plug: loaded {} bytes from USB", n);
-                len = n;
-                hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
-                current_subtune = hdr.start_song;
-                paused = false;
-                playing_fallback = false;
-                load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
-                redraw = true;
+            file_list.clear();
+            fat::list_sids(&msc, &mut file_list);
+            if !file_list.is_empty() {
+                if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
+                    info!("Hot-plug: loaded {} bytes from USB", n);
+                    len = n;
+                    current_file = 0;
+                    current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
+                        .map(|h| h.start_song).unwrap_or(1);
+                    paused = false;
+                    playing_fallback = false;
+                    load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, false);
+                    redraw = true;
+                }
             }
         }
 
-        // -- Button: toggle pause --
-        if encoder.poke_btn() {
-            paused = !paused;
-            let rate = hdr.is_ntsc(current_subtune);
-            if paused {
-                play_timer.control().write(|w| {
-                    w.reset().clear_bit().play_rate().bit(rate).irq_enable().clear_bit()
-                });
+        // -- Encoder rotation --
+        let ticks = encoder.poke_ticks();
+        if ticks != 0 {
+            if !modify {
+                selected = (selected as i16 + ticks as i16).clamp(0, 2) as usize;
             } else {
-                play_timer.control().write(|w| {
-                    w.reset().clear_bit().play_rate().bit(rate).irq_enable().set_bit()
-                });
+                match selected {
+                    0 => { // File: move browse cursor only — NO load
+                        if !file_list.is_empty() {
+                            browse_idx = (browse_idx as i16 + ticks as i16)
+                                .clamp(0, file_list.len() as i16 - 1) as usize;
+                        }
+                    }
+                    1 => { // Song: change subtune live
+                        if hdr.songs > 1 {
+                            current_subtune = (current_subtune as i16 + ticks as i16)
+                                .clamp(1, hdr.songs as i16) as u16;
+                            load_and_start(tune_buf, len, &mut hdr,
+                                           current_subtune, &play_timer, paused);
+                        }
+                    }
+                    _ => {}
+                }
             }
             redraw = true;
         }
 
-        // -- Encoder rotation: change subtune --
-        let ticks = encoder.poke_ticks();
-        if ticks != 0 && hdr.songs > 1 {
-            current_subtune = (current_subtune as i16 + ticks as i16)
-                .max(1)
-                .min(hdr.songs as i16) as u16;
-            load_and_start(tune_buf, len, &mut hdr, current_subtune, &play_timer, paused);
+        // -- Encoder button --
+        if encoder.poke_btn() {
+            match selected {
+                0 => { // File
+                    if !file_list.is_empty() {
+                        if !modify {
+                            modify = true;
+                            browse_idx = current_file; // start browse at playing file
+                        } else {
+                            // Commit. Same file = cancel (no-op).
+                            if browse_idx != current_file {
+                                if let Ok(n) = fat::load_sid(&msc, browse_idx, tune_buf) {
+                                    len = n;
+                                    current_file = browse_idx;
+                                    current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
+                                        .map(|h| h.start_song).unwrap_or(1);
+                                    paused = false;
+                                    load_and_start(tune_buf, len, &mut hdr,
+                                                   current_subtune, &play_timer, paused);
+                                }
+                            }
+                            modify = false;
+                        }
+                    }
+                }
+                1 => { // Song
+                    modify = !modify;
+                }
+                2 => { // State: toggle pause
+                    paused = !paused;
+                    let rate = hdr.is_ntsc(current_subtune);
+                    if paused {
+                        play_timer.control().write(|w| {
+                            w.reset().clear_bit().play_rate().bit(rate).irq_enable().clear_bit()
+                        });
+                    } else {
+                        play_timer.control().write(|w| {
+                            w.reset().clear_bit().play_rate().bit(rate).irq_enable().set_bit()
+                        });
+                    }
+                }
+                _ => {}
+            }
             redraw = true;
         }
 
