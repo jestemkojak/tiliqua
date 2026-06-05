@@ -1,11 +1,12 @@
 # SID Player — status & root-cause record
 
-**Status (2026-06-05): playing PSID tunes from USB on hardware.** ✓
+**Status (2026-06-05): USB file browser with File/Song/State menu.** ✓
 
 A dedicated bitstream that plays PSID files. The arlet verilog-6502 (`cpu.v`) runs
 the tune's init/play routines in gateware feeding the reDIP-SID core; VexiiRiscv
-handles USB MSC, FAT32, PSID parsing, and the display. Design spec:
-`docs/superpowers/specs/2026-06-03-sid-player-design.md`.
+handles USB MSC, FAT32, PSID parsing, and the display. Design specs:
+`docs/superpowers/specs/2026-06-03-sid-player-design.md`,
+`docs/superpowers/specs/2026-06-05-sid-player-usb-file-browser-design.md`.
 
 Durable implementation gotchas live in the two `CLAUDE.md` files
 (`gateware/src/top/sid_player/CLAUDE.md` and repo root). This file is the
@@ -98,10 +99,31 @@ produced a garbage/flickering display. Fixed (firmware-only, `main.rs`):
 
 ---
 
+## USB file browser / menu
+
+Encoder-driven three-item menu rendered in the header band:
+
+| Row | Rotate | Press |
+|-----|--------|-------|
+| **File** | browse filenames (no load) | enter/commit/cancel — loads on commit only |
+| **Song** | — | enter modify mode, then rotate changes subtune live |
+| **State** | — | toggle PLAYING ↔ PAUSED |
+
+**File row detail:** pressing enters *browse* mode; rotating moves the cursor through all `.SID` short names found at startup (up to 64, `heapless::Vec`). The currently-playing file is marked `*`. Pressing again on the same file cancels (no reload). Pressing on a different file loads it and restarts playback.
+
+**Implementation layers:**
+- `sid_scan.rs` — pure, host-testable: `list_root_sids`, `load_sid_by_index`, type aliases `SidName`/`SidList`. Tested via in-memory GPT+FAT images.
+- `fat.rs` — hardware wrappers: `list_sids`, `load_sid`; `load_first_sid` is now a thin shim to `load_sid(_, 0, _)`.
+- `main.rs` — `load_and_start` helper (init/hot-plug/file-commit share one path); startup enumerates file list; hot-plug re-enumerates on USB plug-in.
+
+**Hot-plug:** if the fallback tune is playing and a USB drive appears, the file list is re-enumerated and index 0 loaded automatically.
+
+---
+
 ## Open items
 
-- **`flush_6502_image()` (firmware, `main.rs:54`) is still present** and called after
-  writing the 6502 image (lines 244/326/375). Unlike the no-audio symptom, write
+- **`flush_6502_image()` (firmware, `main.rs`) is still present** and called inside
+  `load_and_start` after writing the 6502 image. Unlike the no-audio symptom, write
   coherency *is* a genuine concern: the RISC-V writes the image through its write-back
   L1, while the 6502 reads PSRAM via a separate wishbone master. The current 64 KiB
   cache-thrash works but is crude — prefer replacing it with a real cache-clean, or
