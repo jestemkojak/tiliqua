@@ -14,3 +14,4 @@
 ## Gotchas
 - arlet 6502 (`cpu.v`): `RDY` combinationally selects `DIMUX` (`DIMUX = ~RDY ? DIHOLD : DI`) which feeds `AB`. A peripheral driving `cpu_RDY` combinationally from `cpu_AB` forms an unsynthesizable comb loop — drive `RDY` from registered FSM state instead.
 - VexiiRiscv (`src/vendor/vexiiriscv/vexiiriscv.py`) is built without a performance-counter plugin: reading the `mcycle`/`cycle` CSR (e.g. `riscv::register::mcycle`) traps and freezes the SoC. Use the gateware `Timer0` for firmware timing instead.
+- Firmware menu/options reference impl is `src/top/macro_osc/` (the `opts` derive crate + `tiliqua_lib::ui`/`draw`, pages=cards; real-time work in the TIMER0 ISR via `irq::scope`+`handler!`+`critical_section`). Copy from it for new option-driven UIs.

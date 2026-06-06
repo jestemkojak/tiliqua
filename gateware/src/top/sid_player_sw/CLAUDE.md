@@ -24,6 +24,19 @@ tunes use them); revisit if a future tune requires them.
   reset the TIMER0 reload. This is the `macro_osc` ISR pattern (`irq::scope` +
   `handler!` + `critical_section`).
 
+## Menu / UI (`main.rs`)
+- Hand-rolled menu (NOT the `opts` derive framework — macro_osc's `opts`/`tiliqua_lib::ui`
+  doesn't fit the dynamic USB File browser). Card/page model: `enum Page`, row 0 of every
+  card is the "Page" selector; `rows_in(page)` gives the row count. Cards: Player
+  (File/Song/State) and Scope (Decay/Timebase/Y-Scale/Intensity/Hue).
+- Navigation: rotate moves `selected`; press toggles `modify`; modify+rotate edits the value.
+- Scope params are set live from the UI loop via `Scope0`/`Persist0` HAL (`set_timebase`,
+  `set_yscale`, `set_intensity`, `set_hue`, `persist.set_persistence`) — independent CSRs, so
+  NO critical section vs the SID ISR is needed. `tiliqua_lib::scope::{Timebase,VScale}` are
+  `Copy`+`IntoStaticStr` (`.into()` → "10ms/d"/"2V/d"); step them via the `TIMEBASES`/`VSCALES`
+  const arrays. Scope settings are not persisted across reboots.
+- `HEADER_H` bounds the menu region; rows past it overlap the waveform — grow it if you add rows.
+
 ## Play rate (VBlank / CIA multispeed)
 - Rate computed by `psid::play_period_cycles` from `hdr.clock()` / `hdr.is_cia(subtune)`.
   PSID `speed` (offset $12) is VBI(0) vs CIA(1) — **not** PAL/NTSC.
