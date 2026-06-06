@@ -110,6 +110,28 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
     (period as u32, (CLOCK_SYNC_HZ as u64 / period) as u32)
 }
 
+/// Top-level menu card. Row 0 of every card is the "Page" selector.
+#[derive(Clone, Copy, PartialEq)]
+enum Page { Player, Scope }
+
+/// Row count per card, including the "Page" row at index 0.
+fn rows_in(page: Page) -> usize {
+    match page { Page::Player => 4, Page::Scope => 6 }
+}
+
+/// Selectable scope timebases / vertical scales (display label via IntoStaticStr).
+const TIMEBASES: [Timebase; 13] = [
+    Timebase::Timebase500ms, Timebase::Timebase200ms, Timebase::Timebase100ms,
+    Timebase::Timebase50ms,  Timebase::Timebase20ms,  Timebase::Timebase10ms,
+    Timebase::Timebase5ms,   Timebase::Timebase2ms,   Timebase::Timebase1ms,
+    Timebase::Timebase500us, Timebase::Timebase200us, Timebase::Timebase100us,
+    Timebase::Timebase50us,
+];
+const VSCALES: [VScale; 8] = [
+    VScale::Scale8V,    VScale::Scale4V,   VScale::Scale2V,   VScale::Scale1V,
+    VScale::Scale500mV, VScale::Scale250mV, VScale::Scale125mV, VScale::Scale64mV,
+];
+
 #[entry]
 fn main() -> ! {
     let peripherals = pac::Peripherals::take().unwrap();
@@ -139,7 +161,7 @@ fn main() -> ! {
 
     let h_active = display.size().width  as i16;
     let v_active = display.size().height as i16;
-    const HEADER_H: i16 = 160;
+    const HEADER_H: i16 = 190; // room for the 6-row Scope card above the waveform
 
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
@@ -261,9 +283,17 @@ fn main() -> ! {
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
     let mut redraw   = true;
+    let mut page     = Page::Player;
     let mut selected: usize = 0;
     let mut modify   = false;
     let mut browse_idx: usize = 0;
+
+    // Scope-card state (mirrors the initial scope/persist config above).
+    let mut decay: u8     = 1;   // persistence 1..80
+    let mut tb_idx: usize = 5;   // TIMEBASES index -> 10ms/d
+    let mut ys_idx: usize = 2;   // VSCALES index   -> 2V/d
+    let mut intensity: u8 = 8;   // 0..15
+    let mut hue: u8       = 0;   // 0..15
 
     handler!(timer0 = || play_tick());
     irq::scope(|s| {
@@ -300,16 +330,27 @@ fn main() -> ! {
             let ticks = encoder.poke_ticks();
             if ticks != 0 {
                 if !modify {
-                    selected = (selected as i16 + ticks as i16).clamp(0, 2) as usize;
+                    selected = (selected as i16 + ticks as i16)
+                        .clamp(0, rows_in(page) as i16 - 1) as usize;
                 } else {
-                    match selected {
-                        0 => {
+                    match (page, selected) {
+                        // Page row: switch card (2-value), then point at the Page row.
+                        (_, 0) => {
+                            let cur = if page == Page::Player { 0i16 } else { 1i16 };
+                            page = if (cur + ticks as i16).clamp(0, 1) == 0 {
+                                Page::Player
+                            } else {
+                                Page::Scope
+                            };
+                            selected = 0;
+                        }
+                        (Page::Player, 1) => {
                             if !file_list.is_empty() {
                                 browse_idx = (browse_idx as i16 + ticks as i16)
                                     .clamp(0, file_list.len() as i16 - 1) as usize;
                             }
                         }
-                        1 => {
+                        (Page::Player, 2) => {
                             if hdr.songs > 1 {
                                 current_subtune = (current_subtune as i16 + ticks as i16)
                                     .clamp(1, hdr.songs as i16) as u16;
@@ -319,6 +360,28 @@ fn main() -> ! {
                                 timer.set_timeout_ticks(play_period);
                             }
                         }
+                        (Page::Scope, 1) => {
+                            decay = (decay as i16 + ticks as i16).clamp(1, 80) as u8;
+                            persist.set_persistence(decay);
+                        }
+                        (Page::Scope, 2) => {
+                            tb_idx = (tb_idx as i16 + ticks as i16)
+                                .clamp(0, TIMEBASES.len() as i16 - 1) as usize;
+                            scope.set_timebase(TIMEBASES[tb_idx]);
+                        }
+                        (Page::Scope, 3) => {
+                            ys_idx = (ys_idx as i16 + ticks as i16)
+                                .clamp(0, VSCALES.len() as i16 - 1) as usize;
+                            scope.set_yscale(VSCALES[ys_idx]);
+                        }
+                        (Page::Scope, 4) => {
+                            intensity = (intensity as i16 + ticks as i16).clamp(0, 15) as u8;
+                            scope.set_intensity(intensity);
+                        }
+                        (Page::Scope, 5) => {
+                            hue = (hue as i16 + ticks as i16).clamp(0, 15) as u8;
+                            scope.set_hue(hue);
+                        }
                         _ => {}
                     }
                 }
@@ -326,8 +389,10 @@ fn main() -> ! {
             }
 
             if encoder.poke_btn() {
-                match selected {
-                    0 => {
+                match (page, selected) {
+                    // Page row: enter/exit modify so rotation switches the card.
+                    (_, 0) => { modify = !modify; }
+                    (Page::Player, 1) => {
                         if !file_list.is_empty() {
                             if !modify {
                                 modify = true;
@@ -349,8 +414,8 @@ fn main() -> ! {
                             }
                         }
                     }
-                    1 => { modify = !modify; }
-                    2 => {
+                    (Page::Player, 2) => { modify = !modify; }
+                    (Page::Player, 3) => {
                         paused = !paused;
                         critical_section::with(|cs| {
                             if let Some(pb) = PLAYBACK.borrow_ref_mut(cs).as_mut() {
@@ -358,6 +423,8 @@ fn main() -> ! {
                             }
                         });
                     }
+                    // All Scope param rows: press toggles modify, then rotate adjusts.
+                    (Page::Scope, _) => { modify = !modify; }
                     _ => {}
                 }
                 redraw = true;
@@ -387,23 +454,39 @@ fn main() -> ! {
             let label_x  = cx - 100;
             let value_x  = cx + 100;
             let marker_x = cx + 110;
-            let vy0      = 78i32;
-            let vspace   = 20i32;
+            let vy0      = 72i32;
+            let vspace   = 18i32;
 
-            for n in 0..3usize {
+            for n in 0..rows_in(page) {
                 let font = if selected == n { style } else { style_dim };
                 let y = vy0 + vspace * n as i32;
-                let label = match n { 0 => "File", 1 => "Song", _ => "State" };
+                let label = match (page, n) {
+                    (_, 0)            => "Page",
+                    (Page::Player, 1) => "File",
+                    (Page::Player, 2) => "Song",
+                    (Page::Player, _) => "State",
+                    (Page::Scope, 1)  => "Decay",
+                    (Page::Scope, 2)  => "Timebase",
+                    (Page::Scope, 3)  => "Y-Scale",
+                    (Page::Scope, 4)  => "Intensity",
+                    (Page::Scope, _)  => "Hue",
+                };
                 let mut value: String<24> = String::new();
-                match n {
-                    0 => {
-                        let shown = if modify && selected == 0 { browse_idx } else { current_file };
+                match (page, n) {
+                    (_, 0) => { write!(value, "{}", if page == Page::Player { "Player" } else { "Scope" }).ok(); }
+                    (Page::Player, 1) => {
+                        let shown = if modify && selected == 1 { browse_idx } else { current_file };
                         let mark  = if !file_list.is_empty() && shown == current_file { "*" } else { "" };
                         let fname = file_list.get(shown).map(|s| s.as_str()).unwrap_or("<builtin>");
                         write!(value, "{}{}", mark, fname).ok();
                     }
-                    1 => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
-                    _ => { write!(value, "{}", if paused { "PAUSED" } else { "PLAYING" }).ok(); }
+                    (Page::Player, 2) => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
+                    (Page::Player, _) => { write!(value, "{}", if paused { "PAUSED" } else { "PLAYING" }).ok(); }
+                    (Page::Scope, 1)  => { write!(value, "{}", decay).ok(); }
+                    (Page::Scope, 2)  => { let s: &str = TIMEBASES[tb_idx].into(); write!(value, "{}", s).ok(); }
+                    (Page::Scope, 3)  => { let s: &str = VSCALES[ys_idx].into(); write!(value, "{}", s).ok(); }
+                    (Page::Scope, 4)  => { write!(value, "{}", intensity).ok(); }
+                    (Page::Scope, _)  => { write!(value, "{}", hue).ok(); }
                 }
                 Text::new(label, Point::new(label_x, y), font)
                     .draw(&mut display).ok();
@@ -415,13 +498,16 @@ fn main() -> ! {
                 }
             }
 
-            let clock_str = match hdr.clock() { psid::Clock::Ntsc => "NTSC", psid::Clock::Pal => "PAL" };
-            let speed_str = if hdr.is_cia(current_subtune) { "CIA" } else { "VBI" };
-            let mut meta: String<40> = String::new();
-            write!(meta, "{}  {}  {} Hz", clock_str, speed_str, play_hz).ok();
-            Text::with_alignment(meta.as_str(), Point::new(cx, 140),
-                                 style_dim, Alignment::Center)
-                .draw(&mut display).ok();
+            // Tune metadata line — only relevant on the Player card.
+            if page == Page::Player {
+                let clock_str = match hdr.clock() { psid::Clock::Ntsc => "NTSC", psid::Clock::Pal => "PAL" };
+                let speed_str = if hdr.is_cia(current_subtune) { "CIA" } else { "VBI" };
+                let mut meta: String<40> = String::new();
+                write!(meta, "{}  {}  {} Hz", clock_str, speed_str, play_hz).ok();
+                Text::with_alignment(meta.as_str(), Point::new(cx, 150),
+                                     style_dim, Alignment::Center)
+                    .draw(&mut display).ok();
+            }
         }
     })
 }
