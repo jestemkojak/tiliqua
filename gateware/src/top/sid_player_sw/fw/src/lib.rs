@@ -19,6 +19,7 @@ pub mod handlers;
 
 // Host-testable pure modules (no pac dependency)
 pub mod partition;
+pub mod player;
 pub mod psid;
 pub mod sid_scan;
 
