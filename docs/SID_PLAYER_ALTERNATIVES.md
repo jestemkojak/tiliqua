@@ -124,5 +124,10 @@ raster IRQ, SID) as in C64_MiSTer/reDIP-64, and run the PSID environment on it.
 - Re-fetch misterfpga.org t=2693 (403'd) via `gh`/authenticated fetch if its
   content matters.
 - Confirm libsidplayfp licensing (LGPL/GPL) before shipping `.sidraw` tooling.
-- For Alt B, pick the 6502 emulator (license + size): `fake6502` (public-domain,
-  illegal opcodes), `chips` 6502 (cycle-stepped), or libsidplayfp's core.
+- For Alt B, 6502 emulator **decided (2026-06-06): the `mos6502` crate**
+  (mre/mos6502 v0.9, BSD-3, no_std, NMOS variant, `Bus` trait for SID-write
+  intercept, decimal mode, passes Klaus2m5 upstream). Only gap is illegal opcodes
+  — none of the test tunes use them (per `sid_analyze.py`), so no regression.
+  Rejected `soft65c02` (std + GPLv3 + 65C02-only). See the Alt B plan
+  `docs/superpowers/plans/2026-06-06-sid-player-sw-6502-altB.md`. Branch
+  `sid-player-sw-cpu`, scaffold `gateware/src/top/sid_player_sw/`.
