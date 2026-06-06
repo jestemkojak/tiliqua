@@ -32,6 +32,10 @@ use tiliqua_hal::embedded_graphics::{
 
 use heapless::String;
 
+use core::cell::RefCell;
+use critical_section::Mutex;
+use irq::handler;
+
 /// Extract a null-terminated ASCII string from a fixed-width byte slice.
 fn trim_ascii(s: &[u8]) -> &str {
     let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
@@ -49,6 +53,61 @@ fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
     // Zero CIA #1 Timer A so we can detect if INIT programs it (multispeed).
     mem[0xDC04] = 0;
     mem[0xDC05] = 0;
+}
+
+/// 6502 with a concrete (non-capturing) SID-write hook, so the whole CPU is a
+/// nameable type and can live in a `static` shared with the timer ISR.
+type PlayerCpu = CPU<player::PsidBus<fn(u8, u8)>, Nmos6502>;
+
+/// Write one SID register via the SIDPeripheral CSR. Non-capturing so it works
+/// as a plain `fn` pointer; steals SID_PERIPH (effectively a single owner).
+fn sid_write(reg: u8, val: u8) {
+    let p = unsafe { pac::Peripherals::steal() };
+    p.SID_PERIPH.transaction_data().write(|w| unsafe {
+        w.transaction_data().bits(player::sid_txn(reg, val))
+    });
+}
+
+/// Playback state driven by the TIMER0 interrupt at the tune's play rate.
+struct Playback {
+    cpu: PlayerCpu,
+    play_addr: u16,
+    paused: bool,
+}
+
+static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
+
+/// TIMER0 ISR body: run one PLAY frame on the software 6502. Real-time work
+/// lives here (not the UI loop) so menu redraws can never starve the audio.
+fn play_tick() {
+    critical_section::with(|cs| {
+        let mut g = PLAYBACK.borrow_ref_mut(cs);
+        if let Some(pb) = g.as_mut() {
+            if !pb.paused && pb.play_addr != 0 {
+                player::call(&mut pb.cpu, pb.play_addr, 2_000_000);
+            }
+        }
+    });
+}
+
+/// Load a tune+subtune into the shared CPU and run INIT, under a critical
+/// section so it can't race the timer ISR. Returns (play_period_cycles,
+/// play_hz); the caller must update the TIMER0 reload to the new period.
+fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
+               subtune: u16) -> (u32, u32) {
+    let mut period: u64 = 1;
+    critical_section::with(|cs| {
+        let mut g = PLAYBACK.borrow_ref_mut(cs);
+        let pb = g.as_mut().unwrap();
+        load_psid_to_mem(tune_buf, len, hdr, pb.cpu.memory.mem);
+        pb.cpu.registers.stack_pointer.0 = 0xFD;
+        player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000);
+        let cia = (pb.cpu.memory.mem[0xDC04] as u16) | ((pb.cpu.memory.mem[0xDC05] as u16) << 8);
+        period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(subtune), cia) as u64;
+        pb.play_addr = hdr.play_addr;
+        pb.paused = false;
+    });
+    (period as u32, (CLOCK_SYNC_HZ as u64 / period) as u32)
 }
 
 #[entry]
@@ -85,7 +144,11 @@ fn main() -> ! {
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
 
-    persist.set_persistence(10);
+    // Minimum persistence: fastest decay (decay=15, holdoff=32, no skip) so the
+    // waveform is crisp with a negligible phosphor trail. Persist is still the
+    // framebuffer's clear mechanism for the additive-blended scope, so it can't
+    // be disabled outright without the traces smearing to white.
+    persist.set_persistence(1);
     scope.set_intensity(8);
     scope.set_yscale(VScale::Scale2V);
     scope.set_xscale(7);
@@ -163,40 +226,38 @@ fn main() -> ! {
     let mut current_subtune: u16 = hdr.start_song; // 1-based
 
     // --- Construct software 6502 CPU over the 64KB PSRAM image -----------
-    // The RISC-V is the only master of this PSRAM window, so no cache
-    // thrashing or coherency hacks are needed.
+    // The RISC-V is the only master of this PSRAM window, so no cache thrashing
+    // or coherency hacks are needed. The SID-write hook is a plain fn pointer
+    // (not a capturing closure) so the CPU is a nameable type shareable with
+    // the timer ISR.
     let image: &'static mut [u8; 0x10000] =
         unsafe { &mut *(0x2080_0000 as *mut [u8; 0x10000]) };
-    let sid_periph = peripherals.SID_PERIPH;
-    let on_sid = move |reg: u8, val: u8| {
-        sid_periph.transaction_data().write(|w| unsafe {
-            w.transaction_data().bits(player::sid_txn(reg, val))
-        });
-    };
-    let mut cpu = CPU::new(player::PsidBus { mem: image, on_sid_write: on_sid }, Nmos6502);
+    let mut cpu: PlayerCpu =
+        CPU::new(player::PsidBus { mem: image, on_sid_write: sid_write as fn(u8, u8) }, Nmos6502);
     cpu.registers.stack_pointer.0 = 0xFD;
 
     // Load initial tune and run INIT.
     load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
     player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
-    let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
+    let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia);
     info!("play rate: clock={:?} cia={} timer={:#x} period={} ({} Hz)",
-          hdr.clock(), hdr.is_cia(current_subtune), cia, period, CLOCK_SYNC_HZ as u64 / period);
-    let mut play_hz = (CLOCK_SYNC_HZ as u64 / period) as u32;
+          hdr.clock(), hdr.is_cia(current_subtune), cia, period, CLOCK_SYNC_HZ / period);
+    let mut play_hz = CLOCK_SYNC_HZ / period;
     let mut play_period = period;
 
-    // Playback clock: the gateware Timer0 free-running as a down-counter (this
-    // SoC's VexiiRiscv has no `mcycle`/perf-counter CSR — reading it traps).
-    // reload = u32::MAX so successive `last - now` deltas are exact modulo 2^32;
-    // `acc` accumulates elapsed sys-clk cycles, firing play() every play_period.
-    let mut timer = Timer0::new(peripherals.TIMER0, CLOCK_SYNC_HZ);
-    timer.set_mode(tiliqua_hal::timer::Mode::Periodic);
-    timer.set_timeout_ticks(u32::MAX);
-    timer.enable();
-    let mut last = timer.counter();
-    let mut acc: u64 = 0;
+    // Hand the initialised CPU to the shared, ISR-visible playback state.
+    critical_section::with(|cs| {
+        PLAYBACK.borrow_ref_mut(cs).replace(Playback {
+            cpu, play_addr: hdr.play_addr, paused: false,
+        });
+    });
 
+    // Real-time playback runs in the TIMER0 interrupt at the tune's exact rate
+    // (reload = play_period sys-clk cycles). The UI loop below is best-effort:
+    // it must repaint the menu every frame (the persist/scope effect decays the
+    // framebuffer), which is too slow to also host play() — hence the ISR.
+    let mut timer = Timer0::new(peripherals.TIMER0, CLOCK_SYNC_HZ);
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
     let mut redraw   = true;
@@ -204,168 +265,163 @@ fn main() -> ! {
     let mut modify   = false;
     let mut browse_idx: usize = 0;
 
-    loop {
-        // --- Play tick: call play() once per period -----------------------
-        // Accumulate elapsed sys-clk cycles from the free-running down-counter.
-        let now = timer.counter();
-        acc = acc.wrapping_add(last.wrapping_sub(now) as u64);
-        last = now;
-        if !paused && acc >= play_period {
-            acc -= play_period;
-            if hdr.play_addr != 0 {
-                player::call(&mut cpu, hdr.play_addr, 2_000_000);
-            }
-        }
+    handler!(timer0 = || play_tick());
+    irq::scope(|s| {
+        s.register(tiliqua_fw::handlers::Interrupt::TIMER0, timer0);
+        // enable_tick_isr sets periodic mode + listen + enables interrupts;
+        // then override the reload with the cycle-accurate play period.
+        timer.enable_tick_isr(20, pac::Interrupt::TIMER0);
+        timer.set_timeout_ticks(play_period);
 
-        encoder.update();
+        loop {
+            encoder.update();
 
-        // -- Hot-plug --
-        if playing_fallback && msc.ready() {
-            file_list.clear();
-            fat::list_sids(&msc, &mut file_list);
-            if !file_list.is_empty() {
-                if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
-                    info!("Hot-plug: loaded {} bytes from USB", n);
-                    len = n;
-                    current_file = 0;
-                    current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
-                        .map(|h| h.start_song).unwrap_or(1);
-                    paused = false;
-                    playing_fallback = false;
-                    load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
-                    cpu.registers.stack_pointer.0 = 0xFD;
-                    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
-                    let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
-                    play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
-                    play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
-                    acc = 0; last = timer.counter();
-                    redraw = true;
+            // -- Hot-plug --
+            if playing_fallback && msc.ready() {
+                file_list.clear();
+                fat::list_sids(&msc, &mut file_list);
+                if !file_list.is_empty() {
+                    if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
+                        info!("Hot-plug: loaded {} bytes from USB", n);
+                        len = n;
+                        current_file = 0;
+                        current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
+                            .map(|h| h.start_song).unwrap_or(1);
+                        paused = false;
+                        playing_fallback = false;
+                        let (p, hz) = reload_tune(tune_buf, len, &mut hdr, current_subtune);
+                        play_period = p; play_hz = hz;
+                        timer.set_timeout_ticks(play_period);
+                        redraw = true;
+                    }
                 }
             }
-        }
 
-        let ticks = encoder.poke_ticks();
-        if ticks != 0 {
-            if !modify {
-                selected = (selected as i16 + ticks as i16).clamp(0, 2) as usize;
-            } else {
+            let ticks = encoder.poke_ticks();
+            if ticks != 0 {
+                if !modify {
+                    selected = (selected as i16 + ticks as i16).clamp(0, 2) as usize;
+                } else {
+                    match selected {
+                        0 => {
+                            if !file_list.is_empty() {
+                                browse_idx = (browse_idx as i16 + ticks as i16)
+                                    .clamp(0, file_list.len() as i16 - 1) as usize;
+                            }
+                        }
+                        1 => {
+                            if hdr.songs > 1 {
+                                current_subtune = (current_subtune as i16 + ticks as i16)
+                                    .clamp(1, hdr.songs as i16) as u16;
+                                paused = false;
+                                let (p, hz) = reload_tune(tune_buf, len, &mut hdr, current_subtune);
+                                play_period = p; play_hz = hz;
+                                timer.set_timeout_ticks(play_period);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                redraw = true;
+            }
+
+            if encoder.poke_btn() {
                 match selected {
                     0 => {
                         if !file_list.is_empty() {
-                            browse_idx = (browse_idx as i16 + ticks as i16)
-                                .clamp(0, file_list.len() as i16 - 1) as usize;
+                            if !modify {
+                                modify = true;
+                                browse_idx = current_file;
+                            } else {
+                                if browse_idx != current_file {
+                                    if let Ok(n) = fat::load_sid(&msc, browse_idx, tune_buf) {
+                                        len = n;
+                                        current_file = browse_idx;
+                                        current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
+                                            .map(|h| h.start_song).unwrap_or(1);
+                                        paused = false;
+                                        let (p, hz) = reload_tune(tune_buf, len, &mut hdr, current_subtune);
+                                        play_period = p; play_hz = hz;
+                                        timer.set_timeout_ticks(play_period);
+                                    }
+                                }
+                                modify = false;
+                            }
                         }
                     }
-                    1 => {
-                        if hdr.songs > 1 {
-                            current_subtune = (current_subtune as i16 + ticks as i16)
-                                .clamp(1, hdr.songs as i16) as u16;
-                            load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
-                            cpu.registers.stack_pointer.0 = 0xFD;
-                            player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
-                            let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
-                            play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
-                            play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
-                            acc = 0; last = timer.counter();
-                        }
+                    1 => { modify = !modify; }
+                    2 => {
+                        paused = !paused;
+                        critical_section::with(|cs| {
+                            if let Some(pb) = PLAYBACK.borrow_ref_mut(cs).as_mut() {
+                                pb.paused = paused;
+                            }
+                        });
                     }
                     _ => {}
                 }
+                redraw = true;
             }
-            redraw = true;
-        }
 
-        if encoder.poke_btn() {
-            match selected {
-                0 => {
-                    if !file_list.is_empty() {
-                        if !modify {
-                            modify = true;
-                            browse_idx = current_file;
-                        } else {
-                            if browse_idx != current_file {
-                                if let Ok(n) = fat::load_sid(&msc, browse_idx, tune_buf) {
-                                    len = n;
-                                    current_file = browse_idx;
-                                    current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
-                                        .map(|h| h.start_song).unwrap_or(1);
-                                    paused = false;
-                                    load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
-                                    cpu.registers.stack_pointer.0 = 0xFD;
-                                    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
-                                    let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
-                                    play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
-                                    play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
-                                    acc = 0; last = timer.counter();
-                                }
-                            }
-                            modify = false;
-                        }
+            // The menu must be repainted every frame: the persist/scope effect
+            // continuously decays the framebuffer, so static text would fade.
+            if redraw {
+                redraw = false;
+                Rectangle::new(Point::new(0, 0), Size::new(h_active as u32, HEADER_H as u32))
+                    .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
+                    .draw(&mut display)
+                    .ok();
+            }
+
+            let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
+            let author_str = trim_ascii(&tune_buf[0x36..0x56]);
+
+            let cx = h_active as i32 / 2;
+            let mut line1: String<80> = String::new();
+            write!(line1, "SID PLAYER  {}", name_str).ok();
+            Text::with_alignment(line1.as_str(), Point::new(cx, 34), style, Alignment::Center)
+                .draw(&mut display).ok();
+            Text::with_alignment(author_str, Point::new(cx, 54), style_dim, Alignment::Center)
+                .draw(&mut display).ok();
+
+            let label_x  = cx - 100;
+            let value_x  = cx + 100;
+            let marker_x = cx + 110;
+            let vy0      = 78i32;
+            let vspace   = 20i32;
+
+            for n in 0..3usize {
+                let font = if selected == n { style } else { style_dim };
+                let y = vy0 + vspace * n as i32;
+                let label = match n { 0 => "File", 1 => "Song", _ => "State" };
+                let mut value: String<24> = String::new();
+                match n {
+                    0 => {
+                        let shown = if modify && selected == 0 { browse_idx } else { current_file };
+                        let mark  = if !file_list.is_empty() && shown == current_file { "*" } else { "" };
+                        let fname = file_list.get(shown).map(|s| s.as_str()).unwrap_or("<builtin>");
+                        write!(value, "{}{}", mark, fname).ok();
                     }
+                    1 => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
+                    _ => { write!(value, "{}", if paused { "PAUSED" } else { "PLAYING" }).ok(); }
                 }
-                1 => { modify = !modify; }
-                2 => { paused = !paused; }
-                _ => {}
-            }
-            redraw = true;
-        }
-
-        if redraw {
-            redraw = false;
-            Rectangle::new(Point::new(0, 0), Size::new(h_active as u32, HEADER_H as u32))
-                .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
-                .draw(&mut display)
-                .ok();
-        }
-
-        let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
-        let author_str = trim_ascii(&tune_buf[0x36..0x56]);
-
-        let cx = h_active as i32 / 2;
-        let mut line1: String<80> = String::new();
-        write!(line1, "SID PLAYER  {}", name_str).ok();
-        Text::with_alignment(line1.as_str(), Point::new(cx, 34), style, Alignment::Center)
-            .draw(&mut display).ok();
-        Text::with_alignment(author_str, Point::new(cx, 54), style_dim, Alignment::Center)
-            .draw(&mut display).ok();
-
-        let label_x  = cx - 100;
-        let value_x  = cx + 100;
-        let marker_x = cx + 110;
-        let vy0      = 78i32;
-        let vspace   = 20i32;
-
-        for n in 0..3usize {
-            let font = if selected == n { style } else { style_dim };
-            let y = vy0 + vspace * n as i32;
-            let label = match n { 0 => "File", 1 => "Song", _ => "State" };
-            let mut value: String<24> = String::new();
-            match n {
-                0 => {
-                    let shown = if modify && selected == 0 { browse_idx } else { current_file };
-                    let mark  = if !file_list.is_empty() && shown == current_file { "*" } else { "" };
-                    let fname = file_list.get(shown).map(|s| s.as_str()).unwrap_or("<builtin>");
-                    write!(value, "{}{}", mark, fname).ok();
-                }
-                1 => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
-                _ => { write!(value, "{}", if paused { "PAUSED" } else { "PLAYING" }).ok(); }
-            }
-            Text::new(label, Point::new(label_x, y), font)
-                .draw(&mut display).ok();
-            Text::with_alignment(value.as_str(), Point::new(value_x, y), font, Alignment::Right)
-                .draw(&mut display).ok();
-            if modify && selected == n {
-                Text::new("<", Point::new(marker_x, y), font)
+                Text::new(label, Point::new(label_x, y), font)
                     .draw(&mut display).ok();
+                Text::with_alignment(value.as_str(), Point::new(value_x, y), font, Alignment::Right)
+                    .draw(&mut display).ok();
+                if modify && selected == n {
+                    Text::new("<", Point::new(marker_x, y), font)
+                        .draw(&mut display).ok();
+                }
             }
-        }
 
-        let clock_str = match hdr.clock() { psid::Clock::Ntsc => "NTSC", psid::Clock::Pal => "PAL" };
-        let speed_str = if hdr.is_cia(current_subtune) { "CIA" } else { "VBI" };
-        let mut meta: String<40> = String::new();
-        write!(meta, "{}  {}  {} Hz", clock_str, speed_str, play_hz).ok();
-        Text::with_alignment(meta.as_str(), Point::new(cx, 140),
-                             style_dim, Alignment::Center)
-            .draw(&mut display).ok();
-    }
+            let clock_str = match hdr.clock() { psid::Clock::Ntsc => "NTSC", psid::Clock::Pal => "PAL" };
+            let speed_str = if hdr.is_cia(current_subtune) { "CIA" } else { "VBI" };
+            let mut meta: String<40> = String::new();
+            write!(meta, "{}  {}  {} Hz", clock_str, speed_str, play_hz).ok();
+            Text::with_alignment(meta.as_str(), Point::new(cx, 140),
+                                 style_dim, Alignment::Center)
+                .draw(&mut display).ok();
+        }
+    })
 }
