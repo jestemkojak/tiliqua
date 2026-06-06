@@ -24,6 +24,26 @@ tunes use them); revisit if a future tune requires them.
   reset the TIMER0 reload. This is the `macro_osc` ISR pattern (`irq::scope` +
   `handler!` + `critical_section`).
 
+## Audio output / anti-aliasing
+- The reSID core emits one sample per phi2 cycle (~1MHz; phi2 = sync/60 in
+  `src/top/sid/top.py`). The codec runs at 48kHz. **Do NOT** point-sample the 1MHz
+  mix straight into `pmod0.i_cal.payload` — that's a zero-order-hold ~21x downsample
+  with no anti-alias filter, so all SID content >24kHz folds into the audible band as
+  broadband "grit" (the audible difference vs a software-reSID reference, which
+  resamples with a FIR). Confirmed by WAV analysis: spectral flatness 0.43 vs reSID
+  0.34, elevated >10kHz energy, stair-stepped waveform.
+- Fix: `top/sid/audio.py` `AudioDecimator` = polyphase FIR (`dsp.Resample`,
+  n_up/m_down from fs_out/fs_in → 6/125, ~19kHz cutoff) + small input FIFO (absorbs the
+  single-MAC FIR's per-output backpressure burst). Fed by `SIDPeripheral.audio_strobe`
+  (1MHz, pulses the cycle after each `last_audio_*` latch so it sees the fresh sample).
+  Costs ~570 LUTs + 1 multiplier; runs at phi2 cadence so it does NOT join the critical
+  path (sync Fmax unchanged ~55MHz). Host-tested in `tests/test_sid_audio.py` (1kHz
+  passes, 100kHz alias-tone rejected).
+- **Still 8580, not 6581:** `sid/top.py:99` hardcodes `define SID2` (MOS8580); most
+  tunes (e.g. Commando, header flags bit4-5) are 6581. Different filter curve +
+  combined-waveform tables → wrong tonal character. Not yet fixed (would need a
+  header-driven SID1/SID2 build select).
+
 ## Menu / UI (`main.rs`)
 - Hand-rolled menu (NOT the `opts` derive framework — macro_osc's `opts`/`tiliqua_lib::ui`
   doesn't fit the dynamic USB File browser). Card/page model: `enum Page`, row 0 of every

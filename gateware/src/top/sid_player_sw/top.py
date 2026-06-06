@@ -171,6 +171,18 @@ class SIDPlayerSwSoc(TiliquaSoc):
         spec.loader.exec_module(mod)
         return mod
 
+    @staticmethod
+    def _import_sid_audio():
+        """Load src/top/sid/audio.py by path (same 'top' collision avoidance as
+        _import_sid_top)."""
+        import importlib.util
+        _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../sid/audio.py")
+        spec = importlib.util.spec_from_file_location("_sid_audio", os.path.realpath(_p))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_sid_audio"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
     def __init__(self, **kwargs):
         _sid = self._import_sid_top()
         SIDPeripheral = _sid.SIDPeripheral
@@ -230,13 +242,25 @@ class SIDPlayerSwSoc(TiliquaSoc):
                 platform.request("usb_vbus_en").o.eq(1),
             ]
 
+        # Anti-alias the ~1MHz SID mix down to the codec rate. Point-sampling the
+        # 1MHz stream at 48kHz (as a bare assignment would) folds all SID content
+        # above 24kHz into the audible band as broadband grit; the polyphase FIR
+        # band-limits it first. See top/sid/audio.py.
+        AudioDecimator = self._import_sid_audio().AudioDecimator
+        m.submodules.audio_decim = audio_decim = AudioDecimator(
+            fs_in=1_000_000, fs_out=self.clock_settings.audio_clock.fs())
+        m.d.comb += [
+            audio_decim.i.valid.eq(self.sid_periph.audio_strobe),
+            audio_decim.i.payload.as_value().eq(self.sid_periph.last_audio_left >> 8),
+        ]
+
         pmod0 = self.pmod0_periph.pmod
         m.d.comb += [
             pmod0.i_cal.valid.eq(1),
             pmod0.i_cal.payload[0].as_value().eq(sid.voice0_dca),
             pmod0.i_cal.payload[1].as_value().eq(sid.voice1_dca),
             pmod0.i_cal.payload[2].as_value().eq(sid.voice2_dca),
-            pmod0.i_cal.payload[3].as_value().eq(self.sid_periph.last_audio_left >> 8),
+            pmod0.i_cal.payload[3].as_value().eq(audio_decim.o.as_value()),
         ]
 
         # --- Voice scope ---------------------------------------------------

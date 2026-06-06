@@ -208,6 +208,9 @@ class SIDPeripheral(wiring.Component):
         # audio
         self.last_audio_left  = Signal(signed(24))
         self.last_audio_right = Signal(signed(24))
+        # Pulses for one sync cycle each time last_audio_* is refreshed with a new
+        # SID output sample (~1MHz). Consumers anti-alias/decimate from this rate.
+        self.audio_strobe     = Signal()
 
         super().__init__({
             "bus":           In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -254,6 +257,10 @@ class SIDPeripheral(wiring.Component):
             self.sid.bus_i.phi2  .eq(phi2),
             self.sid.cs          .eq(0b0100), # cs_n = 0, cs_io1_n = 1
         ]
+
+        # last_audio_* is latched on phi2_edge (m.d.sync below), so it holds the
+        # fresh sample on the *next* cycle: pulse the strobe then to align.
+        m.d.sync += self.audio_strobe.eq(phi2_edge)
 
         startup = Signal(8)
 
