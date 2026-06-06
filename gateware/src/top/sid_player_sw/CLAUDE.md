@@ -1,52 +1,35 @@
-# SID Player
+# SID Player SW
 
-6502 (arlet `cpu.v`) running a PSID tune from PSRAM via `Cpu6502Bridge`, feeding
-a SID peripheral. The bridge (`top.py`) is a windowed clock-enable interface:
-a free-running `phase` counter pulses `advance`/`cpu_RDY` once per N-cycle window;
-the CPU bus is frozen and decode latched into `*_r` registers each window, so
-`cpu_RDY` is never a combinational function of live `cpu_AB` (avoids the
-arlet `cpu_AB→RDY→DIMUX→cpu_AB` comb loop — see root CLAUDE.md).
+Software 6502 (`mos6502` crate, NMOS variant) runs the PSID tune on the VexiiRiscv;
+memory is the 64 KB image in PSRAM at `0x20800000` via the RISC-V D-cache
+(`fw/src/player.rs` `PsidBus`); `$D400-$D41F` writes are redirected to the
+`SIDPeripheral` CSR (`(val<<5)|reg` → `transaction_data` register); `play()` is
+called by polling `mcycle` against `psid::play_period_cycles`. No gateware
+6502/bridge/play-timer. The bus/driver logic is host-tested
+(`cargo test --target x86_64-unknown-linux-gnu --lib`).
 
-## Timing / clocks (OPEN BUG — suspect for audio glitches)
-- Design **fails timing**: `sync` is clocked 60 MHz but places only ~50.6 MHz
-  (~18% over Fmax) — see `build/sid-player-r5/top.tim` (`Max frequency for clock
-  '$glbnet$clk'`). Likely cause of intermittent "missing notes"/distortion; treat
-  audio-correctness debugging as unreliable until timing is closed.
-- Can't fix by lowering `sync` (USB/PSRAM depend on it — see root CLAUDE.md).
-  Design is ~90% LUT; close timing by freeing LUTs (e.g. drop the scope/plotter)
-  or moving the 6502/SID to a slower domain. Full ranked analysis +
-  implementation plans: `docs/SID_PLAYER.md` and `docs/superpowers/plans/2026-06-06-*`.
+**Limitation:** `mos6502` has no illegal/undocumented opcodes (none of the test
+tunes use them); revisit if a future tune requires them.
+
+## Architecture
+
+- `fw/src/player.rs` — `PsidBus` (`Bus` impl), `call()` (run-until-RTS sentinel),
+  `init()`, `sid_txn()`. Host-testable.
+- `fw/src/main.rs` — CPU constructed over `&'static mut [u8; 0x10000]` at
+  `0x20800000`; INIT called once after load; main loop polls `mcycle` and calls
+  `player::call(play_addr)` at the tune's rate. File/subtune changes re-fill
+  `cpu.memory.mem` and re-run INIT.
 
 ## Play rate (VBlank / CIA multispeed)
-- The play routine is driven by `PlayTimerPeripheral`'s NMI; its rate is a
-  firmware-computed 32-bit `period` CSR (sys-clk cycles), **not** a PAL/NTSC bit.
-  `psid::play_period_cycles` computes it. PSID `speed` (offset $12) is VBI(0) vs
-  CIA(1) timing — **not** PAL/NTSC (that's the v2 `flags` field, offset $76).
-- CIA/multispeed rate is read back from PSRAM at `$DC04/$DC05` (CIA Timer A) *after*
-  INIT runs: zero it first, `thrash_l1_cache()` to evict, then read. Only timers set
-  during INIT are seen (not those set in PLAY / via the IRQ vector).
-
-## Gotchas (arlet in simulation)
-- arlet's `S`/regs are X at reset, so during reset/BRK stack pushes `AB={STACKPAGE,S}=$01xx` with an X low byte. Decode addresses with bit-slice **equality** (`AB[11:]==0`, `AB[5:]==(0xD400>>5)`), not magnitude `<`/`>=` — Verilog comparisons against X yield X, poison `cpu_RDY`, and wedge the core in a BRK loop.
-- arlet never initializes `S`: a 6502 program/test tune must `LDX #$FF; TXS` before any IRQ/NMI, or `RTI` pulls garbage off the stack and the PC goes to `xxxx`.
+- Rate computed by `psid::play_period_cycles` from `hdr.clock()` / `hdr.is_cia(subtune)`.
+  PSID `speed` (offset $12) is VBI(0) vs CIA(1) — **not** PAL/NTSC.
+- CIA timer value is read from `cpu.memory.mem[0xDC04/0xDC05]` directly after INIT
+  (the RISC-V is the only PSRAM master of the image, so no cache-thrash needed).
 
 ## Firmware host tests (`fw/`)
-- Run: `cd fw && cargo test --target x86_64-unknown-linux-gnu --lib` (the crate's
-  default target is `riscv32im`, so the host triple must be explicit).
-- Host-testable modules are gated `#![cfg_attr(not(test), no_std)]` and listed in
-  `fw/src/lib.rs` *without* `#[cfg(not(test))]`: `bootstrap`, `psid`, `partition`,
-  `sid_scan` (pure / `fatfs`-only, no `tiliqua_pac`). `usb_msc`/`fat` are
-  `#[cfg(not(test))]` (hardware-bound) — keep new testable logic out of them.
-- The pac CSR asm (`pac/src/macros.rs`) is `target_arch`-gated so the crate
-  compiles on the host; that file is regenerated from `src/rs/template/pac/` on
-  build, so fix it **in the template**, not just the generated copy.
-- `sid_scan` builds a real GPT+FAT image in memory (`fatfs`) so the USB
-  `.SID`-loading path is tested without hardware. USB sticks are partitioned
-  (GPT/MBR): the FAT volume is **not** at LBA 0 — `partition::first_partition_lba`
-  finds its start LBA and `MscStorage` offsets every read by it.
-
-## Testing the bridge
-- `tests/test_cpu6502_cosim.py` is the authoritative bridge test: it exports the Amaranth bridge to Verilog and runs the *real* arlet under iverilog (`SAW_SPIN`/`SID_WRITES`/`NMI_ENTERS`). Its REF harness (registered memory, `RDY=1` always) isolates core/image soundness from the bridge's bus timing — if REF passes but the bridge cosim fails, it's the bridge.
-- `tests/data/tiny_tune.bin` is a hand-built 64KB fixture (reset=$0800 init, NMI=$0820 `INC $D400;RTI`, spin at $0808). Regenerate via a small Python script writing the image; keep the test interpreters / cosim spin-address checks in sync.
-- Windowed-bridge timing for unit tests (`tests/test_cpu6502_bridge.py`): an access is *latched* on the 1st `cpu_RDY` pulse and its effect (committed write, `sid_w_en`, settled `cpu_DI`) appears on the *2nd* — sample on the 2nd pulse.
-- `cpu_DI` is driven combinationally from the window's registered address (one-window lag), not via a registered `di_r`.
+- Run: `cd fw && cargo test --target x86_64-unknown-linux-gnu --lib` (default
+  target is `riscv32im`, so the host triple must be explicit).
+- Host-testable modules listed in `fw/src/lib.rs` without `#[cfg(not(test))]`:
+  `partition`, `psid`, `sid_scan`, `player`. `usb_msc`/`fat` are hardware-bound.
+- The pac CSR asm (`pac/src/macros.rs`) is `target_arch`-gated; fix it in the
+  template (`src/rs/template/pac/`), not just the generated copy.
