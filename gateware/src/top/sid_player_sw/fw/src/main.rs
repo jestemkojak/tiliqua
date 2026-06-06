@@ -5,7 +5,6 @@ use core::fmt::Write as FmtWrite;
 
 use log::info;
 use riscv_rt::entry;
-use riscv::register::mcycle;
 
 use mos6502::cpu::CPU;
 use mos6502::instruction::Nmos6502;
@@ -175,14 +174,29 @@ fn main() -> ! {
 
     // Load initial tune and run INIT.
     load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
-    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+    info!("INIT: calling init={:#x} subtune={} (if no further log, INIT panicked/hung)",
+          hdr.init_addr, current_subtune.saturating_sub(1));
+    let init_ok = player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+    info!("INIT: {} pc={:#x} sp={:#x}",
+          if init_ok { "returned (RTS)" } else { "OVERRAN max_steps" },
+          cpu.registers.program_counter, cpu.registers.stack_pointer.0);
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
     let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
     info!("play rate: clock={:?} cia={} timer={:#x} period={} ({} Hz)",
           hdr.clock(), hdr.is_cia(current_subtune), cia, period, CLOCK_SYNC_HZ as u64 / period);
     let mut play_hz = (CLOCK_SYNC_HZ as u64 / period) as u32;
     let mut play_period = period;
-    let mut next = mcycle::read64();
+
+    // Playback clock: the gateware Timer0 free-running as a down-counter (this
+    // SoC's VexiiRiscv has no `mcycle`/perf-counter CSR — reading it traps).
+    // reload = u32::MAX so successive `last - now` deltas are exact modulo 2^32;
+    // `acc` accumulates elapsed sys-clk cycles, firing play() every play_period.
+    let mut timer = Timer0::new(peripherals.TIMER0, CLOCK_SYNC_HZ);
+    timer.set_mode(tiliqua_hal::timer::Mode::Periodic);
+    timer.set_timeout_ticks(u32::MAX);
+    timer.enable();
+    let mut last = timer.counter();
+    let mut acc: u64 = 0;
 
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
@@ -191,12 +205,29 @@ fn main() -> ! {
     let mut modify   = false;
     let mut browse_idx: usize = 0;
 
+    info!("entering main loop (menu should now be drawn)");
+    let mut play_count: u32 = 0;
+
     loop {
         // --- Play tick: call play() once per period -----------------------
-        if !paused && mcycle::read64().wrapping_sub(next) >= play_period {
-            next = next.wrapping_add(play_period);
+        // Accumulate elapsed sys-clk cycles from the free-running down-counter.
+        let now = timer.counter();
+        acc = acc.wrapping_add(last.wrapping_sub(now) as u64);
+        last = now;
+        if !paused && acc >= play_period {
+            acc -= play_period;
             if hdr.play_addr != 0 {
-                player::call(&mut cpu, hdr.play_addr, 2_000_000);
+                let t0 = timer.counter();
+                let play_ok = player::call(&mut cpu, hdr.play_addr, 2_000_000);
+                // Log the first few frames, then only overruns, to avoid flooding.
+                if play_count < 3 || !play_ok {
+                    info!("PLAY[{}]: {} cycles={} pc={:#x} sp={:#x}",
+                          play_count,
+                          if play_ok { "ok" } else { "OVERRAN" },
+                          t0.wrapping_sub(timer.counter()),
+                          cpu.registers.program_counter, cpu.registers.stack_pointer.0);
+                }
+                play_count = play_count.wrapping_add(1);
             }
         }
 
@@ -221,7 +252,7 @@ fn main() -> ! {
                     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
                     play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
                     play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
-                    next = mcycle::read64();
+                    acc = 0; last = timer.counter();
                     redraw = true;
                 }
             }
@@ -249,7 +280,7 @@ fn main() -> ! {
                             let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
                             play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
                             play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
-                            next = mcycle::read64();
+                            acc = 0; last = timer.counter();
                         }
                     }
                     _ => {}
@@ -279,7 +310,7 @@ fn main() -> ! {
                                     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
                                     play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
                                     play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
-                                    next = mcycle::read64();
+                                    acc = 0; last = timer.counter();
                                 }
                             }
                             modify = false;

@@ -55,6 +55,36 @@ mod tests {
         Box::leak(Box::new([0u8; 0x10000]))
     }
 
+    /// Repro of the hardware bring-up path on the host: parse the bundled
+    /// fallback tune, load it into the image, run INIT then a few PLAY frames.
+    /// If `mos6502` lacks an opcode the tune uses, this either panics
+    /// ("unimplemented or invalid instruction") or reports OVERRAN — the same
+    /// failure that freezes the firmware (panic handler loops → dead UI).
+    #[test]
+    fn fallback_tune_init_and_play_complete() {
+        use crate::psid::PsidHeader;
+        static SID: &[u8] = include_bytes!("../Gyroscope_3.sid");
+
+        let mem = boxed_mem();
+        let hdr = PsidHeader::parse(SID).expect("parse");
+        let payload_raw = &SID[hdr.data_offset as usize..];
+        let load = hdr.effective_load_addr(payload_raw) as usize;
+        let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+        mem[load..load + payload.len()].copy_from_slice(payload);
+
+        let bus = PsidBus { mem, on_sid_write: |_r, _v| {} };
+        let mut cpu = CPU::new(bus, Nmos6502);
+        cpu.registers.stack_pointer.0 = 0xFD;
+
+        let init_ok = init(&mut cpu, hdr.init_addr, hdr.start_song.saturating_sub(1) as u8, 2_000_000);
+        assert!(init_ok, "INIT overran max_steps (PC stuck on an unsupported opcode?)");
+
+        for frame in 0..3 {
+            let ok = call(&mut cpu, hdr.play_addr, 2_000_000);
+            assert!(ok, "PLAY frame {frame} overran max_steps");
+        }
+    }
+
     #[test]
     fn init_writes_sid_via_hook() {
         let mem = boxed_mem();
