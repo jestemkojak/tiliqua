@@ -289,8 +289,8 @@ fn main() -> ! {
     let mut browse_idx: usize = 0;
 
     // Scope-card state (mirrors the initial scope/persist config above).
-    let mut decay: u8     = 1;   // persistence 1..80
-    let mut tb_idx: usize = 5;   // TIMEBASES index -> 10ms/d
+    let mut decay: u8     = 10;   // persistence 1..80
+    let mut tb_idx: usize = 7;   // TIMEBASES index -> 2ms/d
     let mut ys_idx: usize = 2;   // VSCALES index   -> 2V/d
     let mut intensity: u8 = 8;   // 0..15
     let mut hue: u8       = 0;   // 0..15
@@ -461,7 +461,7 @@ fn main() -> ! {
                 let font = if selected == n { style } else { style_dim };
                 let y = vy0 + vspace * n as i32;
                 let label = match (page, n) {
-                    (_, 0)            => "Page",
+                    (_, 0)            => "Menu",
                     (Page::Player, 1) => "File",
                     (Page::Player, 2) => "Song",
                     (Page::Player, _) => "State",
@@ -503,7 +503,8 @@ fn main() -> ! {
                 let clock_str = match hdr.clock() { psid::Clock::Ntsc => "NTSC", psid::Clock::Pal => "PAL" };
                 let speed_str = if hdr.is_cia(current_subtune) { "CIA" } else { "VBI" };
                 let mut meta: String<40> = String::new();
-                write!(meta, "{}  {}  {} Hz", clock_str, speed_str, play_hz).ok();
+                write!(meta, "{}  {}  {}  {} Hz",
+                       hdr.model().as_str(), clock_str, speed_str, play_hz).ok();
                 Text::with_alignment(meta.as_str(), Point::new(cx, 150),
                                      style_dim, Alignment::Center)
                     .draw(&mut display).ok();

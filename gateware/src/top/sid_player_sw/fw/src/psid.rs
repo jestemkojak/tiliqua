@@ -21,6 +21,22 @@ pub enum PsidError { TooShort, BadMagic, UnsupportedVersion }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Clock { Pal, Ntsc }
 
+/// SID chip model the tune declares for the first SID (PSID `flags` bits 4-5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SidModel { Unknown, Mos6581, Mos8580, Both }
+
+impl SidModel {
+    /// Short label for the UI metadata line.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SidModel::Mos6581 => "6581",
+            SidModel::Mos8580 => "8580",
+            SidModel::Both    => "6581/8580",
+            SidModel::Unknown => "SID?",
+        }
+    }
+}
+
 /// C64 system (φ2) clock in Hz for each video standard.
 const PHI2_PAL:  u64 = 985_248;
 const PHI2_NTSC: u64 = 1_022_727;
@@ -88,6 +104,18 @@ impl PsidHeader {
         }
     }
 
+    /// SID chip model declared for the first SID (PSID `flags` bits 4-5):
+    /// 00 = unknown, 01 = 6581, 10 = 8580, 11 = both. v1 tunes (flags == 0)
+    /// report `Unknown`.
+    pub fn model(&self) -> SidModel {
+        match (self.flags >> 4) & 0b11 {
+            0b01 => SidModel::Mos6581,
+            0b10 => SidModel::Mos8580,
+            0b11 => SidModel::Both,
+            _    => SidModel::Unknown,
+        }
+    }
+
     /// True if subtune `song_1based` is CIA-timed (PSID `speed` bit set);
     /// false means VBlank timing. CIA tunes are often multispeed.
     pub fn is_cia(&self, song_1based: u16) -> bool {
@@ -151,6 +179,19 @@ mod tests {
         assert_eq!(PsidHeader::parse(&h).unwrap().clock(), Clock::Pal);
         h[0x76..0x78].copy_from_slice(&be16(0x08)); // 10 << 2 = NTSC
         assert_eq!(PsidHeader::parse(&h).unwrap().clock(), Clock::Ntsc);
+    }
+
+    #[test]
+    fn model_from_flags() {
+        let mut h = make_header();
+        h[0x76..0x78].copy_from_slice(&be16(0x10)); // 01 << 4 = 6581
+        assert_eq!(PsidHeader::parse(&h).unwrap().model(), SidModel::Mos6581);
+        h[0x76..0x78].copy_from_slice(&be16(0x20)); // 10 << 4 = 8580
+        assert_eq!(PsidHeader::parse(&h).unwrap().model(), SidModel::Mos8580);
+        h[0x76..0x78].copy_from_slice(&be16(0x30)); // 11 << 4 = both
+        assert_eq!(PsidHeader::parse(&h).unwrap().model(), SidModel::Both);
+        h[0x76..0x78].copy_from_slice(&be16(0x00)); // 00 = unknown
+        assert_eq!(PsidHeader::parse(&h).unwrap().model(), SidModel::Unknown);
     }
 
     #[test]
