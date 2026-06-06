@@ -5,9 +5,13 @@ use core::fmt::Write as FmtWrite;
 
 use log::info;
 use riscv_rt::entry;
+use riscv::register::mcycle;
+
+use mos6502::cpu::CPU;
+use mos6502::instruction::Nmos6502;
 
 use tiliqua_pac as pac;
-use tiliqua_fw::{fat, psid, usb_msc::UsbMsc};
+use tiliqua_fw::{fat, player, psid, usb_msc::UsbMsc};
 use tiliqua_fw::*;
 
 use tiliqua_lib::*;
@@ -29,35 +33,23 @@ use tiliqua_hal::embedded_graphics::{
 
 use heapless::String;
 
-/// PSRAM base address of the 6502's 64KB view.
-const CPU6502_PSRAM_BASE: usize = 0x20800000;
-
-/// Write bytes into the 6502's view of PSRAM (volatile, byte-by-byte).
-fn write_6502_mem(base: usize, addr: u16, data: &[u8]) {
-    let ptr = (base + addr as usize) as *mut u8;
-    for (i, &b) in data.iter().enumerate() {
-        unsafe { core::ptr::write_volatile(ptr.add(i), b); }
-    }
-}
-
 /// Extract a null-terminated ASCII string from a fixed-width byte slice.
 fn trim_ascii(s: &[u8]) -> &str {
     let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
     core::str::from_utf8(&s[..end]).unwrap_or("?")
 }
 
-/// Load the tune image into PSRAM and parse the header. Returns the parsed header.
-fn load_tune(
-    tune_buf: &[u8],
-    len: usize,
-    hdr: &mut psid::PsidHeader,
-) {
+/// Write the tune payload into the 6502 memory image and zero CIA Timer A.
+fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
+                    mem: &mut [u8; 0x10000]) {
     *hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
-
     let payload_raw = &tune_buf[hdr.data_offset as usize..len];
-    let load_addr   = hdr.effective_load_addr(payload_raw);
-    let payload     = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
-    write_6502_mem(CPU6502_PSRAM_BASE, load_addr, payload);
+    let load_addr = hdr.effective_load_addr(payload_raw) as usize;
+    let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+    mem[load_addr..load_addr + payload.len()].copy_from_slice(payload);
+    // Zero CIA #1 Timer A so we can detect if INIT programs it (multispeed).
+    mem[0xDC04] = 0;
+    mem[0xDC05] = 0;
 }
 
 #[entry]
@@ -83,18 +75,14 @@ fn main() -> ! {
 
     palette::ColorPalette::default().write_to_hardware(&mut display);
 
-    // Framebuffer geometry comes from the bootloader-detected modeline, not a
-    // fixed 640x480 — read it and lay everything out relative to it.
     let h_active = display.size().width  as i16;
     let v_active = display.size().height as i16;
-    const HEADER_H: i16 = 160; // title + author + 3 menu rows + metadata
+    const HEADER_H: i16 = 160;
 
-    // --- Voice scope: fixed config, always on -----------------------------
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
 
     persist.set_persistence(10);
-
     scope.set_intensity(8);
     scope.set_yscale(VScale::Scale2V);
     scope.set_xscale(7);
@@ -108,21 +96,17 @@ fn main() -> ! {
         let row = HEADER_H + ((ch * 2 + 1) * (v_active - HEADER_H)) / 8;
         scope.set_ypos_px(ch as usize, row - centre);
     }
-
     scope.set_enabled(true, true);
 
-    // Fallback tune embedded at build time — plays if no USB drive is present.
     static FALLBACK_SID: &[u8] = include_bytes!("../Gyroscope_3.sid");
 
     let style     = MonoTextStyle::new(&FONT_9X15_BOLD, HI8::new(0, 0xB));
     let style_dim = MonoTextStyle::new(&FONT_9X15_BOLD, HI8::new(0, 0x7));
 
     Text::new("SID PLAYER", Point::new(20, 20), style)
-        .draw(&mut display)
-        .ok();
+        .draw(&mut display).ok();
     Text::new("Insert USB drive, or plays built-in tune...", Point::new(20, 50), style_dim)
-        .draw(&mut display)
-        .ok();
+        .draw(&mut display).ok();
 
     let msc = UsbMsc::new(peripherals.USB_MSC);
 
@@ -136,7 +120,7 @@ fn main() -> ! {
         ready
     };
 
-    // Scratch buffer in PSRAM at +7 MB (well away from framebuffer at 0x20000000).
+    // Scratch buffer in PSRAM at +7 MB.
     let tune_buf: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut((PSRAM_BASE + 0x700000) as *mut u8, 65536)
     };
@@ -175,10 +159,30 @@ fn main() -> ! {
 
     let mut current_subtune: u16 = hdr.start_song; // 1-based
 
-    load_tune(tune_buf, len, &mut hdr);
+    // --- Construct software 6502 CPU over the 64KB PSRAM image -----------
+    // The RISC-V is the only master of this PSRAM window, so no cache
+    // thrashing or coherency hacks are needed.
+    let image: &'static mut [u8; 0x10000] =
+        unsafe { &mut *(0x2080_0000 as *mut [u8; 0x10000]) };
+    let sid_periph = peripherals.SID_PERIPH;
+    let on_sid = move |reg: u8, val: u8| {
+        sid_periph.transaction_data().write(|w| unsafe {
+            w.transaction_data().bits(player::sid_txn(reg, val))
+        });
+    };
+    let mut cpu = CPU::new(player::PsidBus { mem: image, on_sid_write: on_sid }, Nmos6502);
+    cpu.registers.stack_pointer.0 = 0xFD;
 
-    // TODO(player): start software 6502 (Phase 3)
-    let mut play_hz: u32 = 0;
+    // Load initial tune and run INIT.
+    load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+    let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
+    let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
+    info!("play rate: clock={:?} cia={} timer={:#x} period={} ({} Hz)",
+          hdr.clock(), hdr.is_cia(current_subtune), cia, period, CLOCK_SYNC_HZ as u64 / period);
+    let mut play_hz = (CLOCK_SYNC_HZ as u64 / period) as u32;
+    let mut play_period = period;
+    let mut next = mcycle::read64();
 
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
@@ -188,9 +192,17 @@ fn main() -> ! {
     let mut browse_idx: usize = 0;
 
     loop {
+        // --- Play tick: call play() once per period -----------------------
+        if !paused && mcycle::read64().wrapping_sub(next) >= play_period {
+            next = next.wrapping_add(play_period);
+            if hdr.play_addr != 0 {
+                player::call(&mut cpu, hdr.play_addr, 2_000_000);
+            }
+        }
+
         encoder.update();
 
-        // -- Hot-plug: if playing fallback and USB drive appears, enumerate + load index 0 --
+        // -- Hot-plug --
         if playing_fallback && msc.ready() {
             file_list.clear();
             fat::list_sids(&msc, &mut file_list);
@@ -203,7 +215,13 @@ fn main() -> ! {
                         .map(|h| h.start_song).unwrap_or(1);
                     paused = false;
                     playing_fallback = false;
-                    load_tune(tune_buf, len, &mut hdr);
+                    load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+                    cpu.registers.stack_pointer.0 = 0xFD;
+                    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+                    let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
+                    play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
+                    play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
+                    next = mcycle::read64();
                     redraw = true;
                 }
             }
@@ -225,7 +243,13 @@ fn main() -> ! {
                         if hdr.songs > 1 {
                             current_subtune = (current_subtune as i16 + ticks as i16)
                                 .clamp(1, hdr.songs as i16) as u16;
-                            load_tune(tune_buf, len, &mut hdr);
+                            load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+                            cpu.registers.stack_pointer.0 = 0xFD;
+                            player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+                            let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
+                            play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
+                            play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
+                            next = mcycle::read64();
                         }
                     }
                     _ => {}
@@ -249,7 +273,13 @@ fn main() -> ! {
                                     current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
                                         .map(|h| h.start_song).unwrap_or(1);
                                     paused = false;
-                                    load_tune(tune_buf, len, &mut hdr);
+                                    load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+                                    cpu.registers.stack_pointer.0 = 0xFD;
+                                    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+                                    let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
+                                    play_period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
+                                    play_hz = (CLOCK_SYNC_HZ as u64 / play_period) as u32;
+                                    next = mcycle::read64();
                                 }
                             }
                             modify = false;
@@ -291,7 +321,6 @@ fn main() -> ! {
         for n in 0..3usize {
             let font = if selected == n { style } else { style_dim };
             let y = vy0 + vspace * n as i32;
-
             let label = match n { 0 => "File", 1 => "Song", _ => "State" };
             let mut value: String<24> = String::new();
             match n {
@@ -304,7 +333,6 @@ fn main() -> ! {
                 1 => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
                 _ => { write!(value, "{}", if paused { "PAUSED" } else { "PLAYING" }).ok(); }
             }
-
             Text::new(label, Point::new(label_x, y), font)
                 .draw(&mut display).ok();
             Text::with_alignment(value.as_str(), Point::new(value_x, y), font, Alignment::Right)
