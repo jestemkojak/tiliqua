@@ -160,6 +160,123 @@ execute the play routine fast enough; see **6502 playback throughput** below.
 
 ---
 
+## Root-cause re-investigation (2026-06-06) — distorted/“off” playback
+
+Fresh deep static analysis of *why* tunes still sound wrong (Postcard fully
+distorted; Commando “off” — missing notes/effects/ADSR). Goal was to rank
+**all** plausible causes by probability, not just continue the throughput
+thread. Tooling written for this pass: `gateware/src/top/sid_player/tools/sid_analyze.py`
+(recursive-descent + flat 6502 disassembler over the `.sid` images — reports
+SID-register reads, illegal opcodes, write targets per tune).
+
+**Frame for the whole problem:** the SID *sound model* is **reDIP-SID**
+(`deps/sid`, vk2seb) — a cycle-accurate, reSID-class 6581/8580 core with proper
+DAC tables. It is **not** the suspect. Every credible cause is in the
+*integration*: clocking, the 6502’s memory throughput, register-write/read
+plumbing, and FPGA timing closure. (Web cross-check: normal tunes write ~25
+registers at 50/60 Hz, so per-frame register updates — not cycle-exact intra-
+frame timing — is what matters for non-digi tunes.)
+
+### Ranked causes (most→least likely to explain the reported symptoms)
+
+1. **FPGA timing NOT closed — `sync` runs at 60 MHz but places at 50.6 MHz
+   (~18 % over Fmax).** CONFIRMED in `build/sid-player-r5/top.tim`:
+   `Max frequency for clock '$glbnet$clk': 50.61 MHz (FAIL at 60.00 MHz)`
+   (LUTs 21790/24288 = 89 %; `dvi_clk` also fails 69.4/74.25). Running ~18 % over
+   Fmax means **intermittent setup violations on critical paths** anywhere — 6502
+   fetch/ALU, the bridge, SID register writes, PSRAM. Errors are *data-dependent*,
+   so they can look **consistent per-tune** (a given tune replays the same
+   values/paths each frame). This is the prime suspect for the *general*
+   “feels off / occasional missing notes” class (Commando), and it undermines
+   every other measurement — **the design must meet timing before any other
+   fix can be trusted.** Fixes: (a) cheapest test — drop `sync` to ≤50 MHz
+   (must also retune SID `DIVIDE_BY` and `PlayTimerPeripheral(clk_hz=…)`; costs
+   ~16 % 6502 throughput); (b) free LUTs to improve routing/Fmax (scope 4→3
+   channels, trim plotter/persist); (c) pipeline the worst paths.
+
+2. **6502 throughput — ALL tune code executes from PSRAM; every fetch pays
+   HyperRAM latency; no instruction cache.** CONFIRMED: BRAM is only
+   `$0000–$07FF` (2 KB, zeropage+stack); the analysed tunes load at `$0800`
+   (My_Day), `$0A00` (Gyroscope), `$1000` (8-Bits, LEK, Postcard), `$5000`
+   (Commando) — i.e. **100 % of opcode/operand/data fetches are PSRAM reads**
+   at ~tens of cycles each. The NMI is **edge-triggered and single-latched**
+   (arlet `cpu.v:1215`; one pending NMI survives, but a 2nd timer pulse during
+   one `play()` is **lost** — `top.py` `nmi_l` only toggles 0→1 once). So when
+   `play()` overruns its budget, play calls are **silently dropped**, not merely
+   delayed → at 300 Hz (Postcard, 3.33 ms budget) this is catastrophic =
+   “completely distorted.” At 50 Hz (Commando, 20 ms budget) a normal `play()`
+   (~2–3 ms estimated) fits comfortably, so throughput is **not** Commando’s
+   main problem. Fix: `WishboneL2Cache` (already in `src/tiliqua/cache.py`,
+   burst-fill, direct-mapped) on the 6502’s `psram_bus` master → amortise
+   latency across the sequential instruction stream. **Caveat (coherency):**
+   that cache is *write-back*; the firmware reads `$DC04/$DC05` (CIA timer) back
+   from PSRAM after INIT, so a 6502 write sitting dirty in the cache would be
+   invisible → CIA-rate detection breaks. Needs a flush-before-readback (or a
+   write-through/uncached store path). **Caveat (resources):** design is 89 %
+   LUTs and already failing timing — adding a cache may not fit / may worsen #1;
+   may require freeing LUTs first (couples to #1). Bigger win: enlarge BRAM or
+   run hot code from BRAM.
+   - **IMPLEMENTED + measured (2026-06-06):** `Cpu6502Bridge(icache_lines=…)`,
+     a small direct-mapped **write-through** read cache (default 8). Correctness:
+     cosim + bridge + tune tests all green. Throughput: `src/top/sid_player/tools/measure_cache.py`
+     (real arlet under iverilog) shows **2.5–4.3× more work per fixed time** on a
+     code-fetch-bound `play()` (SID writes/2M cyc: 5208→12971→16196→22261 for
+     cache 0/8/16/32). **HARDWARE BUILD VERDICT — net regression for now:** a
+     `cache=8` build *fits* (90 % LUT, +155 LUT/+352 FF over 89 %) **but drops
+     `sync` Fmax 50.6→44.8 MHz.** The cache is **not** on the critical path
+     (that’s `pmod0.calibrator`’s MULT18X18D + CCU2 carry chain); it congests the
+     already-90 %-full device and worsens routing of that path. On a 60 MHz part
+     that’s worse, not better. **So the hardware instance is wired
+     `icache_lines=0`** (`top.py`); tests keep the default 8 for coverage. This is
+     concrete proof that **#1 gates #2**: throughput logic cannot help while the
+     device is timing-bound and ~full. Close timing first (free LUTs / lower clk),
+     then flip the cache on.
+
+3. **SID clocked at fixed 1.000 MHz, not true φ2.** CONFIRMED:
+   `sid/top.py` `DIVIDE_BY = 60` @ 60 MHz → exactly 1.000 MHz vs PAL 985248 Hz
+   (1.5 % sharp) / NTSC 1022727 Hz (2.2 % flat). Audible as a slight detune
+   (“feels off”), **not** missing notes. Also a tempo/pitch mismatch: firmware
+   computes the CIA play period from *true* φ2 while the SID runs at 1 MHz. Fix:
+   make `DIVIDE_BY` track the tune’s PAL/NTSC clock via a CSR (firmware already
+   knows `clock()` from the v2 flags). Cheap, correctness-improving.
+
+4. **SID register *reads* return PSRAM garbage (latent).** CONFIRMED in code:
+   the bridge data mux (`sid_player/top.py:201`) returns the stale
+   `captured_word` for any `is_sid_r` read; the SID’s `data_o`/`o_data_o` is
+   never wired back to `cpu_DI`. Any tune reading `$D41B` (OSC3) / `$D41C`
+   (ENV3) — common for randomness/arpeggio/modulation — would get garbage.
+   **NOT triggered by the 6 current tunes:** a flat byte-scan found *zero*
+   `$D419–$D41C` read patterns in any of them. Real bug, fix opportunistically:
+   route SID `data_o` back through the bridge on SID reads.
+
+5. **Intra-frame SID write cycle-timing requantised by the 1 MHz FIFO drain.**
+   Only matters for digi/sample (`$D418` volume) tunes and tight cycle-exact
+   effects; web-confirmed irrelevant for normal 25-reg/frame tunes. Low priority
+   for the current symptoms.
+
+6. **arlet illegal/undocumented opcodes unimplemented.** arlet decodes them via
+   `casex` defaults (effectively wrong). **NOT found** in the reachable code of
+   any of the 6 tunes (recursive descent); flat-scan “hits” are data-byte noise.
+   Low probability here; if a future tune needs them, swap to an
+   illegal-opcode-capable 6502 core.
+
+7. **CIA timer set during PLAY/IRQ (not INIT) → wrong rate** (already a known
+   limitation): the readback only sees timers programmed during INIT. Possible
+   contributor to a Commando-class “off” if the tune retimes itself in play.
+
+8. **PSRAM contention** — scope plotter + `persist` full-framebuffer DMA steal
+   PSRAM bandwidth from the 6502, worsening #2. Plotter isn’t cleanly gated
+   (the firmware `scope.set_enabled(false)` experiment didn’t stop its writes).
+
+### Bottom line / recommended order
+- **Postcard “distorted”** ← #2 (throughput → dropped NMIs), with #1 contributing.
+- **Commando “off”** ← #1 (timing not closed) is the prime suspect; then #3/#7.
+- Do **#1 first** (it’s a correctness prerequisite and the cheapest decisive
+  test: lower `sync`, rebuild, listen). Then #2 (cache, mind the two caveats),
+  then the cheap correctness wins #3 and #4.
+
+---
+
 ## Open items
 
 - **6502 playback throughput** (next priority) — heavy or high-rate tunes play

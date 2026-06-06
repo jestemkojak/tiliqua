@@ -140,8 +140,26 @@ class Cpu6502Bridge(wiring.Component):
     sid_w_en:   Out(1)
     sid_w_data: Out(16)
 
-    def __init__(self, *, psram_base_bytes):
+    def __init__(self, *, psram_base_bytes, icache_lines=8):
         self._psram_base_bytes = psram_base_bytes
+        # Small direct-mapped *read* cache of 32-bit PSRAM words, sitting inside
+        # the bridge.  The 6502 runs its entire tune (code+data above $07FF) from
+        # PSRAM with no read cache, so every opcode/operand byte pays full
+        # HyperRAM single-word latency — the dominant playback-throughput cap
+        # (see docs/SID_PLAYER.md root-cause #2).  The bridge already fetches a
+        # whole 32-bit word per access but used one byte and refetched for the
+        # next three; this caches recent words so sequential code fetch (and
+        # re-read RMW data) is served without a PSRAM transaction.
+        #
+        # Deliberately *read-only / write-through*: RMW writes still go straight
+        # to PSRAM (and update the matching line), so the RISC-V firmware reading
+        # PSRAM back (e.g. the post-INIT CIA-timer readback at $DC04/$DC05) never
+        # sees stale data — unlike a write-back WishboneL2Cache.  Coherent by
+        # construction; no flush needed.  icache_lines must be a power of two
+        # (0 disables the cache → identical to the pre-cache behaviour).
+        assert icache_lines == 0 or (icache_lines & (icache_lines - 1)) == 0, \
+            "icache_lines must be 0 or a power of two"
+        self._icache_lines = icache_lines
         super().__init__()
 
     def elaborate(self, platform):
@@ -186,15 +204,43 @@ class Cpu6502Bridge(wiring.Component):
         captured_word = Signal(32)
         rmw_word      = Signal(32)
 
+        # ---- Direct-mapped read cache of 32-bit PSRAM words -----------------
+        # All address operands here derive from cpu_AB_r (registered), so the
+        # hit signal — which gates `advance`/cpu_RDY below — is never a function
+        # of live cpu_AB; the arlet cpu_AB→RDY→DIMUX→cpu_AB comb loop stays
+        # broken (same invariant as the rest of the bridge).
+        NL = self._icache_lines
+        read_hit = Signal()
+        cache_word = Signal(32)
+        if NL:
+            idxbits = (NL - 1).bit_length()
+            tagbits = 22 - idxbits
+            c_idx = word_adr_r[0:idxbits]
+            c_tag = word_adr_r[idxbits:22]
+            c_data  = Array(Signal(32, name=f"c_data{i}")  for i in range(NL))
+            c_tagv  = Array(Signal(tagbits, name=f"c_tag{i}") for i in range(NL))
+            c_valid = Array(Signal(name=f"c_valid{i}")     for i in range(NL))
+            m.d.comb += read_hit.eq(
+                is_psram_r & ~cpu_WE_r & c_valid[c_idx] & (c_tagv[c_idx] == c_tag))
+            m.d.comb += cache_word.eq(c_data[c_idx])
+
+        # Byte extractor from the active 32-bit word: the cached line on a read
+        # hit, otherwise the word just captured from PSRAM.
+        read_word = Signal(32)
+        with m.If(read_hit):
+            m.d.comb += read_word.eq(cache_word)
+        with m.Else():
+            m.d.comb += read_word.eq(captured_word)
+
         # BRAM read: combinational read port addressed by registered AB.
         m.d.comb += rd.addr.eq(cpu_AB_r[0:11])
 
-        # Byte extractor from a captured 32-bit PSRAM word.
+        # Byte extractor from the active 32-bit PSRAM word.
         psram_byte = Signal(8)
         with m.Switch(byte_sel_r):
             for i in range(4):
                 with m.Case(i):
-                    m.d.comb += psram_byte.eq(captured_word[i*8:(i+1)*8])
+                    m.d.comb += psram_byte.eq(read_word[i*8:(i+1)*8])
 
         # Window data mux: BRAM (comb) or captured PSRAM byte.
         data_k = Signal(8)
@@ -218,7 +264,13 @@ class Cpu6502Bridge(wiring.Component):
         BRAM_MIN = 4
         advance = Signal()
         with m.If(is_psram_r):
-            m.d.comb += advance.eq(psram_done_r)
+            with m.If(read_hit):
+                # Served from the read cache — no PSRAM transaction.  A few
+                # cycles to let the registered-address comb byte read settle,
+                # same as BRAM.
+                m.d.comb += advance.eq(phase >= BRAM_MIN - 1)
+            with m.Else():
+                m.d.comb += advance.eq(psram_done_r)
         with m.Elif(is_sid_r):
             m.d.comb += advance.eq(phase == N - 1)
         with m.Else():  # BRAM (incl. the reset/BRK $01xx case)
@@ -279,7 +331,9 @@ class Cpu6502Bridge(wiring.Component):
         # the access completes so the advance pulse can fire at phase==N-1.
         with m.FSM(name="psram_fsm"):
             with m.State("IDLE"):
-                with m.If((phase == 1) & is_psram_r):
+                # On a read hit there is no transaction (advance handles it);
+                # only start the FSM for writes (RMW) and read misses.
+                with m.If((phase == 1) & is_psram_r & (cpu_WE_r | ~read_hit)):
                     with m.If(cpu_WE_r):
                         m.next = "RD-FOR-RMW"
                     with m.Else():
@@ -293,6 +347,12 @@ class Cpu6502Bridge(wiring.Component):
                 ]
                 with m.If(bus.ack):
                     m.d.sync += [captured_word.eq(bus.dat_r), psram_done_r.eq(1)]
+                    if NL:  # fill the cache line with the fetched word
+                        m.d.sync += [
+                            c_data[c_idx].eq(bus.dat_r),
+                            c_tagv[c_idx].eq(c_tag),
+                            c_valid[c_idx].eq(1),
+                        ]
                     m.next = "IDLE"
 
             with m.State("RD-FOR-RMW"):
@@ -320,6 +380,12 @@ class Cpu6502Bridge(wiring.Component):
                 ]
                 with m.If(bus.ack):
                     m.d.sync += psram_done_r.eq(1)
+                    if NL:  # write-through: keep the cached copy coherent
+                        m.d.sync += [
+                            c_data[c_idx].eq(rmw_word),
+                            c_tagv[c_idx].eq(c_tag),
+                            c_valid[c_idx].eq(1),
+                        ]
                     m.next = "IDLE"
 
         return m
@@ -577,9 +643,21 @@ class SIDPlayerSoc(TiliquaSoc):
         m.submodules.play_timer = self.play_timer
 
         # 6502 + bridge
+        #
+        # icache_lines: in-bridge read cache that amortises HyperRAM per-fetch
+        # latency (the dominant playback-throughput cap — docs/SID_PLAYER.md
+        # root-cause #2).  Cosim-proven correct and ~2.5–4x faster on a
+        # code-fetch-bound play() (zfilter/measure_cache.py).  **Kept OFF on
+        # hardware for now (=0):** a cache=8 build fits (90% LUT) but drops the
+        # `sync` Fmax 50.6→44.8 MHz by congesting the already-90%-full, already-
+        # over-clocked (60 MHz) device — a net loss until timing is closed
+        # (free LUTs: scope 4→3 channels, and/or lower sync clock — root-cause
+        # #1).  Flip to 8 once timing has headroom.  Unit/cosim tests use the
+        # Cpu6502Bridge default (8) so the cache path stays covered.
         m.submodules.cpu = cpu = Cpu6502()
         m.submodules.bridge = bridge = Cpu6502Bridge(
             psram_base_bytes=self.CPU6502_PSRAM_BASE_BYTES,
+            icache_lines=0,
         )
         self.psram_periph.add_master(bridge.psram_bus)
         m.d.comb += [

@@ -8,5 +8,8 @@
 - A failed build surfaces only as `CalledProcessError: 'build_top.sh' returned non-zero`; the real cause (e.g. yosys `found logic loop` / abc9 `no_loops`) is in stdout — grep for it.
 - Generated synthesis artifacts (`cpu.v`, `top.ys`, `top.rpt`, `top.il`) land in `gateware/build/<target>-r5/`.
 
+## Clocks (`src/tiliqua/pll.py`)
+- `sync` (60 MHz) is the **Main clock**: CPU, SoC, **and USB** (ULPI requires 60 MHz). `fast` = **2×sync** (120 MHz) drives the PSRAM/HyperRAM controller. So `sync` **cannot** be lowered to close timing without breaking USB and the PSRAM controller — free LUTs or move logic to a separate slower domain instead. Video (`dvi`/`dvi5x`) is a separate, bootloader/modeline-driven PLL.
+
 ## Gotchas
 - arlet 6502 (`cpu.v`): `RDY` combinationally selects `DIMUX` (`DIMUX = ~RDY ? DIHOLD : DI`) which feeds `AB`. A peripheral driving `cpu_RDY` combinationally from `cpu_AB` forms an unsynthesizable comb loop — drive `RDY` from registered FSM state instead.

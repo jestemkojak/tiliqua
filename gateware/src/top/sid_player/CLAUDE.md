@@ -7,6 +7,16 @@ the CPU bus is frozen and decode latched into `*_r` registers each window, so
 `cpu_RDY` is never a combinational function of live `cpu_AB` (avoids the
 arlet `cpu_AB→RDY→DIMUX→cpu_AB` comb loop — see root CLAUDE.md).
 
+## Timing / clocks (OPEN BUG — suspect for audio glitches)
+- Design **fails timing**: `sync` is clocked 60 MHz but places only ~50.6 MHz
+  (~18% over Fmax) — see `build/sid-player-r5/top.tim` (`Max frequency for clock
+  '$glbnet$clk'`). Likely cause of intermittent "missing notes"/distortion; treat
+  audio-correctness debugging as unreliable until timing is closed.
+- Can't fix by lowering `sync` (USB/PSRAM depend on it — see root CLAUDE.md).
+  Design is ~90% LUT; close timing by freeing LUTs (e.g. drop the scope/plotter)
+  or moving the 6502/SID to a slower domain. Full ranked analysis +
+  implementation plans: `docs/SID_PLAYER.md` and `docs/superpowers/plans/2026-06-06-*`.
+
 ## Play rate (VBlank / CIA multispeed)
 - The play routine is driven by `PlayTimerPeripheral`'s NMI; its rate is a
   firmware-computed 32-bit `period` CSR (sys-clk cycles), **not** a PAL/NTSC bit.
