@@ -57,6 +57,10 @@ fn main() -> ! {
     let serial = Serial0::new(peripherals.UART0);
 
     tiliqua_fw::handlers::logger_init(serial);
+    // The mos6502 crate emits a `debug!` line per emulated instruction; at the
+    // logger's default Trace level that floods the UART and (because each line
+    // blocks on the slow UART) throttles playback to a crawl. Cap at Info.
+    unsafe { log::set_max_level_racy(log::LevelFilter::Info); }
     info!("Hello from SID Player SW!");
 
     let bootinfo = unsafe { bootinfo::BootInfo::from_addr(BOOTINFO_BASE) }.unwrap();
@@ -174,12 +178,7 @@ fn main() -> ! {
 
     // Load initial tune and run INIT.
     load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
-    info!("INIT: calling init={:#x} subtune={} (if no further log, INIT panicked/hung)",
-          hdr.init_addr, current_subtune.saturating_sub(1));
-    let init_ok = player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
-    info!("INIT: {} pc={:#x} sp={:#x}",
-          if init_ok { "returned (RTS)" } else { "OVERRAN max_steps" },
-          cpu.registers.program_counter, cpu.registers.stack_pointer.0);
+    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
     let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia) as u64;
     info!("play rate: clock={:?} cia={} timer={:#x} period={} ({} Hz)",
@@ -205,9 +204,6 @@ fn main() -> ! {
     let mut modify   = false;
     let mut browse_idx: usize = 0;
 
-    info!("entering main loop (menu should now be drawn)");
-    let mut play_count: u32 = 0;
-
     loop {
         // --- Play tick: call play() once per period -----------------------
         // Accumulate elapsed sys-clk cycles from the free-running down-counter.
@@ -217,17 +213,7 @@ fn main() -> ! {
         if !paused && acc >= play_period {
             acc -= play_period;
             if hdr.play_addr != 0 {
-                let t0 = timer.counter();
-                let play_ok = player::call(&mut cpu, hdr.play_addr, 2_000_000);
-                // Log the first few frames, then only overruns, to avoid flooding.
-                if play_count < 3 || !play_ok {
-                    info!("PLAY[{}]: {} cycles={} pc={:#x} sp={:#x}",
-                          play_count,
-                          if play_ok { "ok" } else { "OVERRAN" },
-                          t0.wrapping_sub(timer.counter()),
-                          cpu.registers.program_counter, cpu.registers.stack_pointer.0);
-                }
-                play_count = play_count.wrapping_add(1);
+                player::call(&mut cpu, hdr.play_addr, 2_000_000);
             }
         }
 
