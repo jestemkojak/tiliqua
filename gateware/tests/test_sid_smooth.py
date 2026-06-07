@@ -7,7 +7,10 @@ import unittest
 from amaranth import *
 from amaranth.sim import Simulator
 
-from top.sid_player_sw.smooth import VoiceSmoother
+from amaranth_future import fixed
+from tiliqua.raster import PSQ
+
+from top.sid_player_sw.smooth import VoiceSmoother, LinearUpsampler
 
 
 class VoiceSmootherTests(unittest.TestCase):
@@ -41,6 +44,45 @@ class VoiceSmootherTests(unittest.TestCase):
                     mn = min(mn, v)
             swing = mx - mn
             assert swing < amp // 2, f"high-freq not attenuated: swing {swing}"
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(tb)
+        sim.run()
+
+
+class LinearUpsamplerTests(unittest.TestCase):
+
+    def test_fills_a_step_with_a_ramp(self):
+        """A step input is emitted as ~n_up intermediate points (no big gaps)."""
+        n_up = 8
+        dut = LinearUpsampler(n_channels=1, n_up=n_up)  # PSQ
+        m = Module()
+        m.submodules.dut = dut
+
+        # Frame 0 then a big jump to 0.5: the jump is what must be filled with
+        # intermediate points rather than emitted as a single leap.
+        lo, hi = fixed.Const(0.0, shape=PSQ), fixed.Const(0.5, shape=PSQ)
+        frames = [lo, lo, hi, hi, hi, hi]
+
+        async def tb(ctx):
+            ctx.set(dut.o.ready, 1)
+            ctx.set(dut.i.valid, 1)
+            outs = []
+            fi = 0
+            for _ in range(n_up * 16):
+                ctx.set(dut.i.payload[0], frames[fi])
+                accepted = ctx.get(dut.i.valid & dut.i.ready)
+                if ctx.get(dut.o.valid & dut.o.ready):
+                    outs.append(ctx.get(dut.o.payload[0]).as_float())
+                await ctx.tick()
+                if accepted:
+                    fi = min(fi + 1, len(frames) - 1)
+            # The big 0->0.5 transition must appear as several rising steps,
+            # each far smaller than the 0.5 leap (gaps filled).
+            max_step = max((abs(b - a) for a, b in zip(outs, outs[1:])), default=0)
+            assert max_step <= 0.5 / (n_up - 1) + 0.02, f"gap too large: {max_step}"
+            assert max(outs) > 0.4, f"never reached target: {max(outs)}"
 
         sim = Simulator(m)
         sim.add_clock(1e-6)

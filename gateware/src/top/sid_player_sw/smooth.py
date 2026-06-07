@@ -20,8 +20,10 @@ reading the raw `voiceN_dca`, so sound is unaffected.
 """
 
 from amaranth import *
-from amaranth.lib import data, wiring
+from amaranth.lib import data, stream, wiring
 from amaranth.lib.wiring import In, Out
+
+from tiliqua.raster import PSQ
 
 
 class VoiceSmoother(wiring.Component):
@@ -59,4 +61,65 @@ class VoiceSmoother(wiring.Component):
                     m.d.sync += acc.eq(acc + (x - y))
                 x = y
             m.d.comb += self.o[ch].eq(x)
+        return m
+
+
+class LinearUpsampler(wiring.Component):
+    """Linearly interpolate `n_up` frames between consecutive input frames.
+
+    The scope rasterizer plots one point per sample and does not connect
+    consecutive points, so steep edges leave vertical gaps ("dotted on the
+    vertical axis") when fed at the raw 48kHz frame rate. This fills those gaps
+    by emitting `n_up` points stepping linearly from the previous frame to the
+    new one — i.e. it draws the connecting line.
+
+    Cheap on purpose (for a visualisation): with `n_up` a power of two the
+    per-step increment is `(new - prev) >> log2(n_up)`, so the datapath is just
+    subtract / shift / accumulate per channel — no multipliers, no BRAM. Output
+    rate is `fs_in * n_up`, so the consumer's timebase (`scope_periph.fs`) must
+    be scaled by `n_up` to match.
+    """
+
+    def __init__(self, *, n_channels=4, n_up=16, shape=PSQ):
+        assert n_up >= 1 and (n_up & (n_up - 1)) == 0, "n_up must be a power of two"
+        self.n_channels = n_channels
+        self.n_up       = n_up
+        self.shape      = shape
+        self.k          = (n_up - 1).bit_length()  # log2(n_up)
+        super().__init__({
+            "i": In(stream.Signature(data.ArrayLayout(shape, n_channels))),
+            "o": Out(stream.Signature(data.ArrayLayout(shape, n_channels))),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+        width = Shape.cast(self.shape).width
+        target = [Signal(signed(width), name=f"target{c}") for c in range(self.n_channels)]
+        delta  = [Signal(signed(width), name=f"delta{c}")  for c in range(self.n_channels)]
+        acc    = [Signal(signed(width), name=f"acc{c}")    for c in range(self.n_channels)]
+        cnt = Signal(range(self.n_up + 1))
+
+        with m.If(cnt == 0):
+            # Ready for a new frame: latch it, prime the interpolation from the
+            # previous frame (held in `target`) toward the new one.
+            m.d.comb += self.i.ready.eq(1)
+            with m.If(self.i.valid):
+                for c in range(self.n_channels):
+                    nv = self.i.payload[c].as_value()
+                    m.d.sync += [
+                        delta[c].eq((nv - target[c]) >> self.k),
+                        acc[c].eq(target[c]),
+                        target[c].eq(nv),
+                    ]
+                m.d.sync += cnt.eq(self.n_up)
+        with m.Else():
+            # Emit n_up interpolated points (acc += delta each accepted step).
+            m.d.comb += self.o.valid.eq(1)
+            for c in range(self.n_channels):
+                m.d.comb += self.o.payload[c].as_value().eq(acc[c])
+            with m.If(self.o.ready):
+                for c in range(self.n_channels):
+                    m.d.sync += acc[c].eq(acc[c] + delta[c])
+                m.d.sync += cnt.eq(cnt - 1)
+
         return m

@@ -37,6 +37,7 @@ def _import_smooth():
 
 _smooth = _import_smooth()
 VoiceSmoother = _smooth.VoiceSmoother
+LinearUpsampler = _smooth.LinearUpsampler
 
 
 _USB_STATUS_LAYOUT = data.StructLayout({
@@ -216,9 +217,13 @@ class SIDPlayerSwSoc(TiliquaSoc):
             bus_signature=self.psram_periph.bus.signature.flip(), n_ports=4)
         self.psram_periph.add_master(self.scope_plotter.bus)
 
-        # 4-channel oscilloscope: V1, V2, V3, mix.
+        # 4-channel oscilloscope: V1, V2, V3, mix. fs is scaled by the display
+        # interpolation factor so the firmware's timebase matches the upsampled
+        # stream fed to the scope (see LinearUpsampler).
+        self.scope_n_upsample = 16
         self.scope_periph = scope.ScopePeripheral(
-            n_channels=4, fs=self.clock_settings.audio_clock.fs())
+            n_channels=4,
+            fs=self.clock_settings.audio_clock.fs() * self.scope_n_upsample)
         self.csr_decoder.add(self.scope_periph.bus, addr=0x1300, name="scope_periph")
 
         self.finalize_csr_bridge()
@@ -319,7 +324,13 @@ class SIDPlayerSwSoc(TiliquaSoc):
             plot_fifo.i.payload[2].as_value().eq(voice_smooth.o[2]),
             plot_fifo.i.payload[3].eq(pmod0.i_cal.payload[3]),
         ]
-        wiring.connect(m, plot_fifo.o, self.scope_periph.i)
+        # Linearly interpolate between the 48kHz frames so steep edges render as
+        # connected lines instead of vertical dot-columns (the scope rasterizer
+        # plots points, not lines). Cheap: adders/shifts only, no DSP/BRAM.
+        m.submodules.scope_upsample = scope_upsample = LinearUpsampler(
+            n_channels=4, n_up=self.scope_n_upsample)
+        wiring.connect(m, plot_fifo.o, scope_upsample.i)
+        wiring.connect(m, scope_upsample.o, self.scope_periph.i)
 
         return m
 
