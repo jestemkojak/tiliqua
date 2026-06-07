@@ -33,13 +33,23 @@ class VoiceSmoother(wiring.Component):
     series. Inputs/outputs are plain (combinational) values, not streams — the
     scope point-samples the held output whenever it likes, which is harmless now
     that the high-frequency content is gone.
+
+    When `dc_block` is set, a final very-slow leaky integrator estimates the DC
+    bias and subtracts it (AC-couple). The SID voice DCA taps carry a large
+    constant offset (e.g. 6581 `VOICE_DC` = 1/2 the dynamic range), which would
+    otherwise sit the trace at half-scale and wrap the AC peaks. `k_dc` sets the
+    DC-tracking cutoff (~ f_strobe / (2*pi*2^k_dc)); it must be well below the
+    audio band so only the constant bias is removed, not the waveform.
     """
 
-    def __init__(self, *, n_channels=3, shape=signed(16), k=5, poles=2):
+    def __init__(self, *, n_channels=3, shape=signed(16), k=5, poles=2,
+                 dc_block=True, k_dc=14):
         self.n_channels = n_channels
         self.shape      = shape
         self.k          = k
         self.poles      = poles
+        self.dc_block   = dc_block
+        self.k_dc       = k_dc
         super().__init__({
             "strobe": In(1),
             "i":      In(data.ArrayLayout(shape, n_channels)),
@@ -60,6 +70,16 @@ class VoiceSmoother(wiring.Component):
                 with m.If(self.strobe):
                     m.d.sync += acc.eq(acc + (x - y))
                 x = y
+            if self.dc_block:
+                # Slow leaky integrator = DC estimate; subtract it to AC-couple.
+                dc_acc = Signal(signed(width + self.k_dc), name=f"dcacc{ch}")
+                dc     = Signal(self.shape,                 name=f"dc{ch}")
+                m.d.comb += dc.eq(dc_acc >> self.k_dc)
+                with m.If(self.strobe):
+                    m.d.sync += dc_acc.eq(dc_acc + (x - dc))
+                ac = Signal(self.shape, name=f"ac{ch}")
+                m.d.comb += ac.eq(x - dc)
+                x = ac
             m.d.comb += self.o[ch].eq(x)
         return m
 

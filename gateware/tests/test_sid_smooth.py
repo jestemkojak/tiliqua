@@ -16,8 +16,8 @@ from top.sid_player_sw.smooth import VoiceSmoother, LinearUpsampler
 class VoiceSmootherTests(unittest.TestCase):
 
     def test_passes_dc_and_attenuates_high_freq(self):
-        """Output tracks a DC input but heavily attenuates a Nyquist-rate swing."""
-        dut = VoiceSmoother(n_channels=1, k=4, poles=2)
+        """Low-pass core (dc_block off): tracks DC, attenuates a Nyquist swing."""
+        dut = VoiceSmoother(n_channels=1, k=4, poles=2, dc_block=False)
         m = Module()
         m.submodules.dut = dut
 
@@ -44,6 +44,36 @@ class VoiceSmootherTests(unittest.TestCase):
                     mn = min(mn, v)
             swing = mx - mn
             assert swing < amp // 2, f"high-freq not attenuated: swing {swing}"
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(tb)
+        sim.run()
+
+    def test_dc_block_removes_bias_keeps_swing(self):
+        """dc_block on: a DC-biased square wave comes out centred on zero."""
+        # Small k_dc so the DC tracker settles within the sim; the audio swing
+        # is fast relative to it and survives.
+        dut = VoiceSmoother(n_channels=1, k=2, poles=1, dc_block=True, k_dc=8)
+        m = Module()
+        m.submodules.dut = dut
+
+        async def tb(ctx):
+            ctx.set(dut.strobe, 1)
+            bias, amp, period = 4000, 400, 16
+            # Let the DC tracker lock onto the bias first.
+            for n in range(30000):
+                ctx.set(dut.i[0], bias + (amp if (n // period) % 2 else -amp))
+                await ctx.tick()
+            mx, mn = -1 << 30, 1 << 30
+            for n in range(4000):
+                ctx.set(dut.i[0], bias + (amp if (n // period) % 2 else -amp))
+                await ctx.tick()
+                v = ctx.get(dut.o[0])
+                mx, mn = max(mx, v), min(mn, v)
+            mid = (mx + mn) // 2
+            assert abs(mid) < 60, f"DC bias not removed: midpoint {mid}"
+            assert (mx - mn) > amp, f"swing lost: {mx - mn}"
 
         sim = Simulator(m)
         sim.add_clock(1e-6)
