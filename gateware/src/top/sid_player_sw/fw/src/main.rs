@@ -43,9 +43,11 @@ fn trim_ascii(s: &[u8]) -> &str {
 }
 
 /// Write the tune payload into the 6502 memory image and zero CIA Timer A.
+/// Returns Err (without touching `mem`/`hdr`) for unsupported/corrupt files so
+/// callers can skip them gracefully instead of crashing.
 fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
-                    mem: &mut [u8; 0x10000]) {
-    *hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
+                    mem: &mut [u8; 0x10000]) -> Result<(), psid::PsidError> {
+    *hdr = psid::PsidHeader::parse(&tune_buf[..len])?;
     let payload_raw = &tune_buf[hdr.data_offset as usize..len];
     let load_addr = hdr.effective_load_addr(payload_raw) as usize;
     let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
@@ -53,6 +55,7 @@ fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
     // Zero CIA #1 Timer A so we can detect if INIT programs it (multispeed).
     mem[0xDC04] = 0;
     mem[0xDC05] = 0;
+    Ok(())
 }
 
 /// 6502 with a concrete (non-capturing) SID-write hook, so the whole CPU is a
@@ -66,6 +69,15 @@ fn sid_write(reg: u8, val: u8) {
     p.SID_PERIPH.transaction_data().write(|w| unsafe {
         w.transaction_data().bits(player::sid_txn(reg, val))
     });
+}
+
+/// Mute/unmute the codec output. Used on pause to mask the SID's held notes
+/// (the chip keeps oscillating its last state while play() is stopped) without
+/// touching the SID itself, so playback resumes cleanly. Plain write (mirrors
+/// the pmod HAL's `mute()`); other flag bits default to 0.
+fn output_mute(mute: bool) {
+    let p = unsafe { pac::Peripherals::steal() };
+    p.PMOD0_PERIPH.flags().write(|w| w.mute().bit(mute));
 }
 
 /// Playback state driven by the TIMER0 interrupt at the tune's play rate.
@@ -91,23 +103,27 @@ fn play_tick() {
 }
 
 /// Load a tune+subtune into the shared CPU and run INIT, under a critical
-/// section so it can't race the timer ISR. Returns (play_period_cycles,
-/// play_hz); the caller must update the TIMER0 reload to the new period.
+/// section so it can't race the timer ISR. Returns Some((play_period_cycles,
+/// play_hz)) on success; None (leaving the current tune untouched) if the file
+/// is unsupported/corrupt. The caller must update the TIMER0 reload on Some.
 fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
-               subtune: u16) -> (u32, u32) {
-    let mut period: u64 = 1;
+               subtune: u16) -> Option<(u32, u32)> {
+    let mut period: Option<u64> = None;
     critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
         let pb = g.as_mut().unwrap();
-        load_psid_to_mem(tune_buf, len, hdr, pb.cpu.memory.mem);
+        if load_psid_to_mem(tune_buf, len, hdr, pb.cpu.memory.mem).is_err() {
+            return; // leave `period` None -> caller treats as unsupported
+        }
         pb.cpu.registers.stack_pointer.0 = 0xFD;
         player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000);
         let cia = (pb.cpu.memory.mem[0xDC04] as u16) | ((pb.cpu.memory.mem[0xDC05] as u16) << 8);
-        period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(subtune), cia) as u64;
+        period = Some(psid::play_period_cycles(
+            CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(subtune), cia) as u64);
         pb.play_addr = hdr.play_addr;
         pb.paused = false;
     });
-    (period as u32, (CLOCK_SYNC_HZ as u64 / period) as u32)
+    period.map(|p| (p as u32, (CLOCK_SYNC_HZ as u64 / p) as u32))
 }
 
 /// Top-level menu card. Row 0 of every card is the "Page" selector.
@@ -172,11 +188,11 @@ fn main() -> ! {
     // waveform is crisp with a negligible phosphor trail. Persist is still the
     // framebuffer's clear mechanism for the additive-blended scope, so it can't
     // be disabled outright without the traces smearing to white.
-    persist.set_persistence(1);
+    persist.set_persistence(11);
     scope.set_intensity(8);
-    scope.set_yscale(VScale::Scale2V);
+    scope.set_yscale(VScale::Scale4V);
     scope.set_xscale(7);
-    scope.set_timebase(Timebase::Timebase10ms);
+    scope.set_timebase(Timebase::Timebase2ms);
     scope.set_trigger_level(0);
     scope.set_hue(0);
     scope.set_xpos_px(0);
@@ -243,7 +259,18 @@ fn main() -> ! {
     };
     info!("Loaded {} bytes", len);
 
-    let mut hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("bad PSID");
+    // If the first file is unsupported/corrupt, fall back to the built-in tune
+    // rather than panicking (the built-in is always valid).
+    let mut hdr = match psid::PsidHeader::parse(&tune_buf[..len]) {
+        Ok(h) => h,
+        Err(e) => {
+            info!("Unsupported PSID ({:?}) — using built-in tune", e);
+            tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
+            len = FALLBACK_SID.len();
+            playing_fallback = true;
+            psid::PsidHeader::parse(&tune_buf[..len]).expect("built-in PSID is valid")
+        }
+    };
     info!("PSID v{}: songs={} start={} init={:#x} play={:#x} speed={:#010x}",
           hdr.version, hdr.songs, hdr.start_song, hdr.init_addr, hdr.play_addr, hdr.speed);
 
@@ -260,8 +287,8 @@ fn main() -> ! {
         CPU::new(player::PsidBus { mem: image, on_sid_write: sid_write as fn(u8, u8) }, Nmos6502);
     cpu.registers.stack_pointer.0 = 0xFD;
 
-    // Load initial tune and run INIT.
-    load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+    // Load initial tune and run INIT (hdr already validated/parsed above).
+    let _ = load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
     player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
     let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia);
@@ -284,6 +311,7 @@ fn main() -> ! {
     let mut timer = Timer0::new(peripherals.TIMER0, CLOCK_SYNC_HZ);
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
+    let mut unsupported = false; // last file selection was an unsupported .SID
     let mut redraw   = true;
     let mut page     = Page::Player;
     let mut selected: usize = 0;
@@ -315,15 +343,17 @@ fn main() -> ! {
                 if !file_list.is_empty() {
                     if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
                         info!("Hot-plug: loaded {} bytes from USB", n);
-                        len = n;
-                        current_file = 0;
-                        current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
+                        let start = psid::PsidHeader::parse(&tune_buf[..n])
                             .map(|h| h.start_song).unwrap_or(1);
-                        paused = false;
-                        playing_fallback = false;
-                        let (p, hz) = reload_tune(tune_buf, len, &mut hdr, current_subtune);
-                        play_period = p; play_hz = hz;
-                        timer.set_timeout_ticks(play_period);
+                        if let Some((p, hz)) = reload_tune(tune_buf, n, &mut hdr, start) {
+                            len = n; current_file = 0; current_subtune = start;
+                            paused = false; playing_fallback = false; unsupported = false;
+                            output_mute(false);
+                            play_period = p; play_hz = hz;
+                            timer.set_timeout_ticks(play_period);
+                        } else {
+                            unsupported = true; // stay on the built-in tune
+                        }
                         redraw = true;
                     }
                 }
@@ -356,10 +386,13 @@ fn main() -> ! {
                             if hdr.songs > 1 {
                                 current_subtune = (current_subtune as i16 + ticks as i16)
                                     .clamp(1, hdr.songs as i16) as u16;
-                                paused = false;
-                                let (p, hz) = reload_tune(tune_buf, len, &mut hdr, current_subtune);
-                                play_period = p; play_hz = hz;
-                                timer.set_timeout_ticks(play_period);
+                                // Same (already-valid) tune, just a new subtune.
+                                if let Some((p, hz)) =
+                                    reload_tune(tune_buf, len, &mut hdr, current_subtune) {
+                                    paused = false; output_mute(false);
+                                    play_period = p; play_hz = hz;
+                                    timer.set_timeout_ticks(play_period);
+                                }
                             }
                         }
                         (Page::Scope, 1) => {
@@ -402,14 +435,21 @@ fn main() -> ! {
                             } else {
                                 if browse_idx != current_file {
                                     if let Ok(n) = fat::load_sid(&msc, browse_idx, tune_buf) {
-                                        len = n;
-                                        current_file = browse_idx;
-                                        current_subtune = psid::PsidHeader::parse(&tune_buf[..len])
+                                        let start = psid::PsidHeader::parse(&tune_buf[..n])
                                             .map(|h| h.start_song).unwrap_or(1);
-                                        paused = false;
-                                        let (p, hz) = reload_tune(tune_buf, len, &mut hdr, current_subtune);
-                                        play_period = p; play_hz = hz;
-                                        timer.set_timeout_ticks(play_period);
+                                        if let Some((p, hz)) =
+                                            reload_tune(tune_buf, n, &mut hdr, start) {
+                                            len = n; current_file = browse_idx;
+                                            current_subtune = start;
+                                            paused = false; unsupported = false;
+                                            output_mute(false);
+                                            play_period = p; play_hz = hz;
+                                            timer.set_timeout_ticks(play_period);
+                                        } else {
+                                            // Unsupported file: keep playing the
+                                            // current tune, flag it in the UI.
+                                            unsupported = true;
+                                        }
                                     }
                                 }
                                 modify = false;
@@ -424,6 +464,10 @@ fn main() -> ! {
                                 pb.paused = paused;
                             }
                         });
+                        // Mute the output while paused to mask the SID's held
+                        // notes; unmute on resume. The SID keeps its state, so
+                        // playback continues seamlessly.
+                        output_mute(paused);
                     }
                     // All Scope param rows: press toggles modify, then rotate adjusts.
                     (Page::Scope, _) => { modify = !modify; }
@@ -483,7 +527,11 @@ fn main() -> ! {
                         write!(value, "{}{}", mark, fname).ok();
                     }
                     (Page::Player, 2) => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
-                    (Page::Player, _) => { write!(value, "{}", if paused { "PAUSED" } else { "PLAYING" }).ok(); }
+                    (Page::Player, _) => {
+                        let state = if unsupported { "UNSUPPORTED!" }
+                                    else if paused { "PAUSED" } else { "PLAYING" };
+                        write!(value, "{}", state).ok();
+                    }
                     (Page::Scope, 1)  => { write!(value, "{}", decay).ok(); }
                     (Page::Scope, 2)  => { let s: &str = TIMEBASES[tb_idx].into(); write!(value, "{}", s).ok(); }
                     (Page::Scope, 3)  => { let s: &str = VSCALES[ys_idx].into(); write!(value, "{}", s).ok(); }

@@ -84,6 +84,47 @@ class VoiceSmoother(wiring.Component):
         return m
 
 
+class StreamThrottle(wiring.Component):
+    """Pass a stream through but allow at most one transfer per `period` cycles.
+
+    Used to rate-limit the scope plotter's PSRAM requests so a cosmetic consumer
+    can never monopolise the shared PSRAM bus — audio/SID timing always keeps
+    bandwidth headroom (audio > visuals, always). The scope feed is non-blocking
+    upstream, so the back-pressure this creates simply drops surplus plot points
+    rather than ever stalling the audio path.
+
+    It mainly *spreads* the upsampler's per-frame burst: at `n_up` points emitted
+    back-to-back per 48kHz frame, the burst would hit PSRAM as one contiguous run;
+    spacing it to one point per `period` cycles leaves the CPU the cycles in
+    between. As long as `period * n_up` < the sync-cycles-per-frame (~1250 at
+    48kHz/60MHz) no points are dropped — only spread.
+    """
+
+    def __init__(self, payload_shape, *, period):
+        assert period >= 1
+        self.payload_shape = payload_shape
+        self.period = period
+        super().__init__({
+            "i": In(stream.Signature(payload_shape)),
+            "o": Out(stream.Signature(payload_shape)),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+        cnt = Signal(range(self.period))
+        allow = cnt == 0
+        m.d.comb += [
+            self.o.payload.eq(self.i.payload),
+            self.o.valid.eq(self.i.valid & allow),
+            self.i.ready.eq(self.o.ready & allow),
+        ]
+        with m.If(~allow):
+            m.d.sync += cnt.eq(cnt - 1)
+        with m.Elif(self.o.valid & self.o.ready):
+            m.d.sync += cnt.eq(self.period - 1)
+        return m
+
+
 class LinearUpsampler(wiring.Component):
     """Linearly interpolate `n_up` frames between consecutive input frames.
 

@@ -17,7 +17,7 @@ from tiliqua.build import sim
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
 from tiliqua.raster import PSQ, scope
-from tiliqua.raster.plot import FramebufferPlotter
+from tiliqua.raster.plot import FramebufferPlotter, PlotRequest
 from tiliqua.tiliqua_soc import TiliquaSoc
 from amaranth_soc import csr
 
@@ -38,6 +38,7 @@ def _import_smooth():
 _smooth = _import_smooth()
 VoiceSmoother = _smooth.VoiceSmoother
 LinearUpsampler = _smooth.LinearUpsampler
+StreamThrottle = _smooth.StreamThrottle
 
 
 _USB_STATUS_LAYOUT = data.StructLayout({
@@ -221,6 +222,12 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # interpolation factor so the firmware's timebase matches the upsampled
         # stream fed to the scope (see LinearUpsampler).
         self.scope_n_upsample = 8
+        # Max one scope plot point per this many sync cycles, per channel, so the
+        # scope plotter never starves the 6502's PSRAM tune fetches (audio >
+        # visuals). scope_throttle*scope_n_upsample < ~1250 (sync cycles per
+        # 48kHz frame) keeps all points (spread, not dropped); higher = safer for
+        # audio / sparser traces.
+        self.scope_throttle = 64
         self.scope_periph = scope.ScopePeripheral(
             n_channels=4,
             fs=self.clock_settings.audio_clock.fs() * self.scope_n_upsample)
@@ -290,9 +297,17 @@ class SIDPlayerSwSoc(TiliquaSoc):
         m.submodules.scope_plotter = self.scope_plotter
         m.submodules.scope_periph  = self.scope_periph
 
-        # Each scope channel drives one plotter port.
+        # Each scope channel drives one plotter port, via a throttle so the
+        # scope plotter can never monopolise the PSRAM bus the 6502 reads its
+        # tune from: audio/SID timing must always keep bandwidth headroom
+        # (audio > visuals, always). The throttle spreads the upsampler's
+        # per-frame burst across many cycles; at scope_throttle*n_up < ~1250
+        # sync-cycles-per-frame no plot points are dropped, only spread.
         for n in range(4):
-            wiring.connect(m, self.scope_periph.o[n], self.scope_plotter.i[n])
+            thr = StreamThrottle(PlotRequest, period=self.scope_throttle)
+            setattr(m.submodules, f"scope_throttle{n}", thr)
+            wiring.connect(m, self.scope_periph.o[n], thr.i)
+            wiring.connect(m, thr.o, self.scope_plotter.i[n])
 
         # Plotter writes into the live framebuffer (fan-out from fb.fbp,
         # same pattern as the base plotter/persist consumers).

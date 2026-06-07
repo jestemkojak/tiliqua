@@ -10,7 +10,7 @@ from amaranth.sim import Simulator
 from amaranth_future import fixed
 from tiliqua.raster import PSQ
 
-from top.sid_player_sw.smooth import VoiceSmoother, LinearUpsampler
+from top.sid_player_sw.smooth import VoiceSmoother, LinearUpsampler, StreamThrottle
 
 
 class VoiceSmootherTests(unittest.TestCase):
@@ -113,6 +113,36 @@ class LinearUpsamplerTests(unittest.TestCase):
             max_step = max((abs(b - a) for a, b in zip(outs, outs[1:])), default=0)
             assert max_step <= 0.5 / (n_up - 1) + 0.02, f"gap too large: {max_step}"
             assert max(outs) > 0.4, f"never reached target: {max(outs)}"
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(tb)
+        sim.run()
+
+
+class StreamThrottleTests(unittest.TestCase):
+
+    def test_limits_transfer_rate(self):
+        """With a saturated source/sink, ~1 transfer passes per `period` cycles."""
+        period = 8
+        dut = StreamThrottle(signed(16), period=period)
+        m = Module()
+        m.submodules.dut = dut
+
+        async def tb(ctx):
+            ctx.set(dut.i.valid, 1)
+            ctx.set(dut.i.payload, 123)
+            ctx.set(dut.o.ready, 1)
+            xfers = 0
+            cycles = period * 50
+            for _ in range(cycles):
+                if ctx.get(dut.o.valid & dut.o.ready):
+                    xfers += 1
+                    assert ctx.get(dut.o.payload) == 123
+                await ctx.tick()
+            # Expect ~cycles/period transfers (allow +/-1 for edges).
+            expect = cycles // period
+            assert abs(xfers - expect) <= 1, f"got {xfers}, expected ~{expect}"
 
         sim = Simulator(m)
         sim.add_clock(1e-6)

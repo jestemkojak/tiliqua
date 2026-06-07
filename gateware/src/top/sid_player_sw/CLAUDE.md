@@ -39,6 +39,23 @@ tunes use them); revisit if a future tune requires them.
   Costs ~570 LUTs + 1 multiplier; runs at phi2 cadence so it does NOT join the critical
   path (sync Fmax unchanged ~55MHz). Host-tested in `tests/test_sid_audio.py` (1kHz
   passes, 100kHz alias-tone rejected).
+## Voice scope signal path (audio ALWAYS wins over visuals)
+- The 3 voice taps (`sid.voiceN_dca`) are ~1MHz reSID outputs (ASQ Q1.15) with a
+  model-dependent DC bias (6581 `VOICE_DC` = ½ dynamic range; 8580 = 0). Point-sampling
+  them at 48kHz aliases (dot scatter); the bias offsets/wraps the trace once scaled right.
+- Scope-branch conditioning (`smooth.py`, scope branch only — audio out untouched):
+  `VoiceSmoother` (anti-alias leaky-LP + DC-block AC-couple) → `>>2` ASQ→PSQ →
+  `LinearUpsampler` (fills vertical gaps; scale `scope_periph.fs` ×`scope_n_upsample`) →
+  `StreamThrottle` → scope. The mix channel is already band-limited via `AudioDecimator`.
+- The scope plotter is a PSRAM master sharing the round-robin bus with the 6502's tune
+  fetches (each pixel = a read-modify-write). Heavy scope work starves playback → music
+  lags. **Never sacrifice audio/SID timing for visuals**: throttle/deprioritise the scope
+  (`scope_throttle`, `scope_n_upsample`); the plot FIFO is intentionally non-blocking (drops points).
+- Pause masks held notes via codec mute (`output_mute`, pmod `flags.mute`), not by touching
+  the SID — so playback resumes cleanly. Unsupported/corrupt `.SID` files (e.g. multi-SID v4)
+  must skip gracefully (`load_psid_to_mem`/`reload_tune` return `Result`/`Option`, show
+  `UNSUPPORTED!`) — never `.expect()`-panic the player on a bad header.
+
 ## Dual SID chip model (6581 vs 8580)
 - **Build-time selection:** `pdm sid_player_sw build --sid-model {6581,8580}` (default 8580).
   The flag threads `sid2_define` (True for 8580, False for 6581) through `top_level_cli` → `top.py`'s
