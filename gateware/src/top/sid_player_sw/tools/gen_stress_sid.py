@@ -322,6 +322,69 @@ def build_program_ensemble(cia_timer):
     return p
 
 
+# Easter egg: an original fast "runaway sequencer" line in the spirit of early-
+# 70s analog-sequencer intros (relentless 16th-note run, resonant filter sweep,
+# noise hats). This is our own note pattern, not a transcription of any song.
+RUN_SEQ = [
+    0x0AF7, 0x15ED, 0x0D0A, 0x15ED, 0x0EA3, 0x15ED, 0x106D, 0x15ED,   # E3 E4 G3..
+    0x1389, 0x15ED, 0x1A14, 0x15ED, 0x1D45, 0x15ED, 0x20DB, 0x15ED,   # D4..B4 (pedal E4)
+]
+
+
+def build_program_runaway(cia_timer):
+    """Easter egg — a single relentless sawtooth sequence (new note every call)
+    over a heavy resonant filter sweep, with noise hats. Original pattern."""
+    DIR, CUT, SIDX, PCNT = 0x03, 0x04, 0x05, 0x06
+    p = []
+    a = p.append
+
+    # ---- INIT ----
+    a(("init", "LDA#", 0))
+    for z in (DIR, SIDX, PCNT):
+        a((None, "STAZ", z))
+    a((None, "LDA#", 0x20)); a((None, "STAZ", CUT))      # start low, sweeps up
+    a((None, "LDA#", 0x00)); a((None, "STA", V(0, 5)))   # lead AD (instant)
+    a((None, "LDA#", 0xF0)); a((None, "STA", V(0, 6)))   # lead SR (full sustain)
+    a((None, "LDA#", 0x09)); a((None, "STA", V(2, 5)))   # hat AD
+    a((None, "LDA#", 0x03)); a((None, "STA", V(2, 6)))   # hat SR (short)
+    a((None, "LDA#", 0x00)); a((None, "STA", FCLO))
+    a((None, "LDA#", 0xF1)); a((None, "STA", RESF))      # resonance F, route lead
+    a((None, "LDA#", 0x1F)); a((None, "STA", MODEVOL))   # lowpass + vol F
+    if cia_timer is not None:
+        a((None, "LDA#", cia_timer & 0xFF));        a((None, "STA", 0xDC04))
+        a((None, "LDA#", (cia_timer >> 8) & 0xFF)); a((None, "STA", 0xDC05))
+    a((None, "RTS"))
+
+    # ---- PLAY ----
+    # Lead: next note in the 16-step run every call (the "runaway").
+    a(("play", "LDAZ", SIDX)); a((None, "AND#", 15)); a((None, "TAX"))
+    a((None, "LDAX", "run_lo")); a((None, "STA", V(0, 0)))
+    a((None, "LDAX", "run_hi")); a((None, "STA", V(0, 1)))
+    a((None, "LDA#", 0x21)); a((None, "STA", V(0, 4)))          # saw + gate
+    a((None, "INCZ", SIDX))
+    # Noise hat every 4 calls.
+    a((None, "INCZ", PCNT)); a((None, "LDAZ", PCNT)); a((None, "AND#", 3)); a((None, "BNE", "r_hatoff"))
+    a((None, "LDA#", 0x00)); a((None, "STA", V(2, 0)))
+    a((None, "LDA#", 0x30)); a((None, "STA", V(2, 1)))
+    a((None, "LDA#", 0x81)); a((None, "STA", V(2, 4)))         # noise + gate
+    a((None, "JMP", "r_hatdone"))
+    a(("r_hatoff", "LDA#", 0x80)); a((None, "STA", V(2, 4)))
+    a(("r_hatdone", "NOP"))
+    # Resonant cutoff sweep.
+    a((None, "LDAZ", DIR)); a((None, "BNE", "r_sw_dn"))
+    a((None, "INCZ", CUT)); a((None, "LDAZ", CUT)); a((None, "CMP#", 0xF0)); a((None, "BNE", "r_sw_wr"))
+    a((None, "LDA#", 1)); a((None, "STAZ", DIR)); a((None, "JMP", "r_sw_wr"))
+    a(("r_sw_dn", "DECZ", CUT)); a((None, "LDAZ", CUT)); a((None, "CMP#", 0x10)); a((None, "BNE", "r_sw_wr"))
+    a((None, "LDA#", 0)); a((None, "STAZ", DIR))
+    a(("r_sw_wr", "LDAZ", CUT)); a((None, "STA", FCHI))
+    a((None, "RTS"))
+
+    # ---- data ----
+    a(("run_lo", ".byte", [n & 0xFF for n in RUN_SEQ]))
+    a(("run_hi", ".byte", [(n >> 8) & 0xFF for n in RUN_SEQ]))
+    return p
+
+
 def build_program(cia_timer, arp_div=1, pwm=False):
     """cia_timer: None for VBlank, else 16-bit CIA Timer A value to set in INIT.
     arp_div: advance the arpeggio once every N PLAY calls (>=1; keeps fast/CIA
@@ -413,6 +476,8 @@ def build_program(cia_timer, arp_div=1, pwm=False):
 def make_sid(cia_timer, name, style="ensemble", arp_div=1, pwm=False):
     if style == "ensemble":
         program = build_program_ensemble(cia_timer)
+    elif style == "runaway":
+        program = build_program_runaway(cia_timer)
     else:
         program = build_program(cia_timer, arp_div=arp_div, pwm=pwm)
     code, labels = assemble(program, LOAD)
@@ -476,9 +541,10 @@ def main():
     ap.add_argument("--rates", type=int, nargs="+", default=[0, 200],
                     help="PLAY rates in Hz; 0 = 50Hz VBlank, >0 = CIA multispeed "
                          "(default: 0 200). One .sid per rate.")
-    ap.add_argument("--style", choices=["ensemble", "unison"], default="ensemble",
+    ap.add_argument("--style", choices=["ensemble", "unison", "runaway"], default="ensemble",
                     help="ensemble = independent bass/lead/noise voices (default); "
-                         "unison = 3 voices on one transposed arp.")
+                         "unison = 3 voices on one transposed arp; "
+                         "runaway = easter egg, an original fast analog-sequencer line.")
     ap.add_argument("--arp-div", type=int, default=1,
                     help="[unison] advance the arpeggio every N PLAY calls "
                          "(keeps high rates musical; default 1).")

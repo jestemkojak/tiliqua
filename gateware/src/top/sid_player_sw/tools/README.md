@@ -42,6 +42,10 @@ Each run prints bytes, code size, SID writes/frame, rate, and style.
   C-minor pentatonic arpeggio transposed a third apart (a moving chord), with a
   filter sweep and a global waveform rotation. Simpler; good for isolating raw
   call-rate effects.
+- **runaway** (easter egg): a single relentless sawtooth running through a 16-step
+  line over a heavy resonant filter sweep, with noise hats — in the spirit of
+  early-70s analog-sequencer intros. An original pattern (not a transcription of
+  any recording). Try `--style runaway --rates 0 200`.
 
 CIA multispeed tunes set PSID `speed` bit 0 and program CIA Timer A in INIT;
 `play_period_cycles` then derives the rate (`timer = round(phi2_PAL/rate) - 1`,
