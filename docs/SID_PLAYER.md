@@ -317,13 +317,21 @@ frame timing — is what matters for non-digi tunes.)
   wishbone master, so coherency is a genuine concern in both directions (image-out,
   CIA-timer read-back-in). The 64 KiB cache-thrash works but is crude — prefer a real
   cache-clean/invalidate if VexiiRiscv gains one. Needs a hardware re-test if changed.
-- **Scope upsampling** (continuous traces) — DONE for `sid_player_sw`: ported the
-  macro_osc Split→4×Resample(n_up=16)→Merge stage into `VoiceUpsampler`
-  (`src/top/sid_player_sw/upsample.py`) between the plot FIFO and the scope, and
-  scaled `scope_periph` `fs` by 16. Build fit: LUT 56.2% / sync 55.49 MHz (see commit
-  `105bd29`). Contingency levers if a future change breaks fit: lower `order_mult`,
-  drop `scope_n_upsample` 16→8, or scope 4→3 channels. The original `sid_player`
-  (arlet) top still feeds raw `fs` (dotted) — port the same stage there if needed.
+- **Scope voice scatter** (clean traces) — DONE for `sid_player_sw`. The earlier
+  `VoiceUpsampler` (macro_osc upsample port) was a **misdiagnosis**: it had no
+  effect because the dots aren't display-undersampling (macro_osc's problem) but
+  *aliasing*. The three `voiceN_dca` taps are raw ~1MHz reSID outputs that the
+  scope point-samples at 48kHz with no anti-alias filter, folding their >24kHz
+  content into broadband scatter (the mix channel renders cleanly because it
+  already goes through `AudioDecimator`). Since the scope is a visualisation, not
+  a measurement, the fix is a cheap multi-pole leaky integrator (`VoiceSmoother`,
+  `src/top/sid_player_sw/smooth.py`; adders/shifts only, no DSP/BRAM) on the three
+  voice taps **on the scope branch only** — audio outputs keep reading raw
+  `voiceN_dca`. The upsampler was removed and `scope_periph` `fs` restored. Build
+  fit: TRELLIS_COMB 82% / DSP 11/28 / sync 56.64 MHz post-route (still FAILs 60,
+  the pre-existing design-wide timing issue — but lighter than the upsampler it
+  replaced: 86%→82% LUT, 15→11 DSP). The original `sid_player` (arlet) top has the
+  same raw-voice-tap aliasing if a voice scope is added there.
 - **PSRAM RMW writes** (tune storing above `$07FF`): the bridge implements the
   sub-FSM (`RD-FOR-RMW → WRITE → psram_done_r`, replacing the old WRITE→IDLE wedge).
   Correctness is cosim-tested (`test_psram_rmw_preserves_adjacent_byte`: byte-merge

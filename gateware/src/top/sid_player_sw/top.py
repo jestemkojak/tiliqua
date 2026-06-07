@@ -22,21 +22,21 @@ from tiliqua.tiliqua_soc import TiliquaSoc
 from amaranth_soc import csr
 
 
-def _import_upsample():
-    """Load upsample.py by path to avoid 'top' namespace collision
+def _import_smooth():
+    """Load smooth.py by path to avoid 'top' namespace collision
     when running as a script (Python adds src/top/sid_player_sw/ to sys.path,
     shadowing the top package with the current top.py script)."""
     import importlib.util
-    _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "upsample.py")
-    spec = importlib.util.spec_from_file_location("_upsample", os.path.realpath(_p))
+    _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "smooth.py")
+    spec = importlib.util.spec_from_file_location("_smooth", os.path.realpath(_p))
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["_upsample"] = mod
+    sys.modules["_smooth"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-_upsample = _import_upsample()
-VoiceUpsampler = _upsample.VoiceUpsampler
+_smooth = _import_smooth()
+VoiceSmoother = _smooth.VoiceSmoother
 
 
 _USB_STATUS_LAYOUT = data.StructLayout({
@@ -217,12 +217,8 @@ class SIDPlayerSwSoc(TiliquaSoc):
         self.psram_periph.add_master(self.scope_plotter.bus)
 
         # 4-channel oscilloscope: V1, V2, V3, mix.
-        # fs is scaled by the upsample factor so the scope's timebase matches
-        # the upsampled stream (see VoiceUpsampler / macro_osc:212-213).
-        self.scope_n_upsample = 16
         self.scope_periph = scope.ScopePeripheral(
-            n_channels=4,
-            fs=self.clock_settings.audio_clock.fs() * self.scope_n_upsample)
+            n_channels=4, fs=self.clock_settings.audio_clock.fs())
         self.csr_decoder.add(self.scope_periph.bus, addr=0x1300, name="scope_periph")
 
         self.finalize_csr_bridge()
@@ -297,26 +293,33 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # same pattern as the base plotter/persist consumers).
         wiring.connect(m, wiring.flipped(self.fb.fbp), self.scope_plotter.fbp)
 
-        # Non-blocking tap of the 4 audio channels already on i_cal.
-        # We deliberately ignore plot_fifo.i.ready so the SID audio stream
-        # is never stalled by plotting (drops samples if the FIFO is full).
+        # Smooth the three raw voice taps (~1MHz reSID outputs) before the scope
+        # samples them at 48kHz: point-sampling them unfiltered aliases their
+        # >24kHz content into broadband scatter, so the voice traces render as
+        # dot-clouds. A cheap multi-pole leaky integrator (adders/shifts only)
+        # band-limits them enough to draw clean lines. This is on the SCOPE
+        # BRANCH ONLY — the audio outputs above keep reading raw voiceN_dca.
+        m.submodules.voice_smooth = voice_smooth = VoiceSmoother(n_channels=3)
+        m.d.comb += [
+            voice_smooth.strobe.eq(self.sid_periph.audio_strobe),
+            voice_smooth.i[0].eq(sid.voice0_dca),
+            voice_smooth.i[1].eq(sid.voice1_dca),
+            voice_smooth.i[2].eq(sid.voice2_dca),
+        ]
+
+        # Non-blocking tap into the scope: smoothed voices + the already
+        # band-limited mix (i_cal ch3). We deliberately ignore plot_fifo.i.ready
+        # so plotting never stalls the audio stream (drops if the FIFO is full).
         m.submodules.plot_fifo = plot_fifo = dsp.SyncFIFOBuffered(
             shape=data.ArrayLayout(PSQ, 4), depth=32)
         m.d.comb += [
             plot_fifo.i.valid.eq(pmod0.i_cal.valid & pmod0.i_cal.ready),
-            plot_fifo.i.payload[0].eq(pmod0.i_cal.payload[0]),
-            plot_fifo.i.payload[1].eq(pmod0.i_cal.payload[1]),
-            plot_fifo.i.payload[2].eq(pmod0.i_cal.payload[2]),
+            plot_fifo.i.payload[0].as_value().eq(voice_smooth.o[0]),
+            plot_fifo.i.payload[1].as_value().eq(voice_smooth.o[1]),
+            plot_fifo.i.payload[2].as_value().eq(voice_smooth.o[2]),
             plot_fifo.i.payload[3].eq(pmod0.i_cal.payload[3]),
         ]
-        # Upsample the 4 tapped channels before the scope so traces render
-        # continuously instead of dotted (port of macro_osc:270-284).
-        m.submodules.voice_upsample = voice_upsample = VoiceUpsampler(
-            n_channels=4,
-            n_up=self.scope_n_upsample,
-            fs_in=self.clock_settings.audio_clock.fs())
-        wiring.connect(m, plot_fifo.o, voice_upsample.i)
-        wiring.connect(m, voice_upsample.o, self.scope_periph.i)
+        wiring.connect(m, plot_fifo.o, self.scope_periph.i)
 
         return m
 

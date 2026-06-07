@@ -1,0 +1,62 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: CERN-OHL-S-2.0
+"""Cheap per-voice low-pass smoother for the SID voice scope.
+
+The three SID voice taps (`voiceN_dca`) are reSID outputs updated once per phi2
+(~1MHz). The scope point-samples them at the 48kHz codec rate with no anti-alias
+filter, so all voice content above 24kHz folds back as broadband scatter — the
+voice traces render as dot-clouds instead of lines (see docs/SID_PLAYER.md).
+
+The scope is a *visualisation*, not a measurement, so we don't need the accurate
+polyphase FIR the audio path uses (top/sid/audio.py). A multi-pole leaky
+integrator running at the ~1MHz strobe is enough to kill the >24kHz energy that
+causes the scatter, and it costs only adders + shifts (no multipliers, no BRAM):
+
+    acc += x - (acc >> k)      # per pole; output y = acc >> k -> x at DC
+
+`k` sets the cutoff (~ f_strobe / (2*pi*2^k)); cascading `poles` of them steepens
+the rolloff. This is applied ONLY on the scope branch — the audio outputs keep
+reading the raw `voiceN_dca`, so sound is unaffected.
+"""
+
+from amaranth import *
+from amaranth.lib import data, wiring
+from amaranth.lib.wiring import In, Out
+
+
+class VoiceSmoother(wiring.Component):
+    """N-channel cascaded leaky-integrator low-pass, stepped on `strobe`.
+
+    Pure adder/shift datapath: each channel is `poles` one-pole sections in
+    series. Inputs/outputs are plain (combinational) values, not streams — the
+    scope point-samples the held output whenever it likes, which is harmless now
+    that the high-frequency content is gone.
+    """
+
+    def __init__(self, *, n_channels=3, shape=signed(16), k=5, poles=2):
+        self.n_channels = n_channels
+        self.shape      = shape
+        self.k          = k
+        self.poles      = poles
+        super().__init__({
+            "strobe": In(1),
+            "i":      In(data.ArrayLayout(shape, n_channels)),
+            "o":      Out(data.ArrayLayout(shape, n_channels)),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+        width = Shape.cast(self.shape).width
+        for ch in range(self.n_channels):
+            x = self.i[ch]
+            for p in range(self.poles):
+                # acc holds the value scaled by 2^k so the output (acc>>k) has no
+                # steady-state dead zone: at DC acc settles to x<<k exactly.
+                acc = Signal(signed(width + self.k), name=f"acc{ch}_{p}")
+                y   = Signal(self.shape,             name=f"y{ch}_{p}")
+                m.d.comb += y.eq(acc >> self.k)
+                with m.If(self.strobe):
+                    m.d.sync += acc.eq(acc + (x - y))
+                x = y
+            m.d.comb += self.o[ch].eq(x)
+        return m
