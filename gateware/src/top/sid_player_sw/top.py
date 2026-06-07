@@ -220,7 +220,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # 4-channel oscilloscope: V1, V2, V3, mix. fs is scaled by the display
         # interpolation factor so the firmware's timebase matches the upsampled
         # stream fed to the scope (see LinearUpsampler).
-        self.scope_n_upsample = 32
+        self.scope_n_upsample = 8
         self.scope_periph = scope.ScopePeripheral(
             n_channels=4,
             fs=self.clock_settings.audio_clock.fs() * self.scope_n_upsample)
