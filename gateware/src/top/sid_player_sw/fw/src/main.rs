@@ -136,6 +136,8 @@ const VSCALES: [VScale; 8] = [
 fn main() -> ! {
     let peripherals = pac::Peripherals::take().unwrap();
     let serial = Serial0::new(peripherals.UART0);
+    let build_model_str = if unsafe { (*pac::SID_PERIPH::ptr()).build_model().read().model().bit() }
+        { "8580" } else { "6581" };
 
     tiliqua_fw::handlers::logger_init(serial);
     // The mos6502 crate emits a `debug!` line per emulated instruction; at the
@@ -445,7 +447,7 @@ fn main() -> ! {
 
             let cx = h_active as i32 / 2;
             let mut line1: String<80> = String::new();
-            write!(line1, "SID PLAYER  {}", name_str).ok();
+            write!(line1, "SID PLAYER ({})  {}", build_model_str, name_str).ok();
             Text::with_alignment(line1.as_str(), Point::new(cx, 34), style, Alignment::Center)
                 .draw(&mut display).ok();
             Text::with_alignment(author_str, Point::new(cx, 54), style_dim, Alignment::Center)

@@ -194,7 +194,11 @@ class SIDPeripheral(wiring.Component):
         """USB MIDI streaming endpoint config word (hardcoded to 1)."""
         value: csr.Field(csr.action.W, unsigned(4))
 
-    def __init__(self, *, transaction_depth=16):
+    class BuildModel(csr.Register, access="r"):
+        model: csr.Field(csr.action.R, unsigned(1))
+
+    def __init__(self, *, transaction_depth=16, sid2_define=True):
+        self._sid2_define = sid2_define
         self._transactions = SyncFIFO(width=16, depth=transaction_depth)
         self._midi_read_fifo = SyncFIFOBuffered(width=24, depth=8)
 
@@ -205,6 +209,7 @@ class SIDPeripheral(wiring.Component):
         self._midi_host   = regs.add("usb_midi_host", self.UsbMidiHost(), offset=0xC)
         self._midi_cfg    = regs.add("usb_midi_cfg",  self.UsbMidiCfg(),  offset=0x10)
         self._midi_endp   = regs.add("usb_midi_endp", self.UsbMidiCfg(),  offset=0x14)
+        self._build_model = regs.add("build_model",   self.BuildModel(),  offset=0x18)
         self._bridge = csr.Bridge(regs.as_memory_map())
 
         self.sid = None
@@ -311,6 +316,9 @@ class SIDPeripheral(wiring.Component):
             m.d.sync += self.usb_midi_host.eq(self._midi_host.f.host.w_data)
         with m.If(self._midi_cfg.f.value.w_stb):
             m.d.sync += self.usb_midi_cfg_id.eq(self._midi_cfg.f.value.w_data)
+
+        # Build-time SID model: drive as a constant read-only CSR.
+        m.d.comb += self._build_model.f.model.r_data.eq(int(self._sid2_define))
 
         return m
 

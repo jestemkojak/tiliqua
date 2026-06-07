@@ -188,7 +188,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         _sid = self._import_sid_top()
         SIDPeripheral = _sid.SIDPeripheral
         super().__init__(finalize_csr_bridge=False, mainram_size=0x4000, **kwargs)
-        self.sid_periph = SIDPeripheral()
+        self.sid_periph = SIDPeripheral(sid2_define=(self.sid_model == "8580"))
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
         self.usb_msc = USBMSCPeripheral()
         self.csr_decoder.add(self.usb_msc.bus, addr=0x1200, name="usb_msc")
