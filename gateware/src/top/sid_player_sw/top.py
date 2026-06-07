@@ -184,6 +184,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         return mod
 
     def __init__(self, **kwargs):
+        self.sid_model = kwargs.pop("sid_model", "8580")  # build-time SID chip
         _sid = self._import_sid_top()
         SIDPeripheral = _sid.SIDPeripheral
         super().__init__(finalize_csr_bridge=False, mainram_size=0x4000, **kwargs)
@@ -210,7 +211,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         SID = _sid.SID
         m = Module()
 
-        m.submodules.sid = sid = SID()
+        m.submodules.sid = sid = SID(sid2_define=(self.sid_model == "8580"))
         m.submodules.sid_periph = self.sid_periph
 
         # SID writes come exclusively from the RISC-V via the CSR transaction_data
@@ -295,4 +296,8 @@ class SIDPlayerSwSoc(TiliquaSoc):
 if __name__ == "__main__":
     this_path = os.path.dirname(os.path.realpath(__file__))
     top_level_cli(SIDPlayerSwSoc, path=this_path,
-                  archiver_callback=lambda a: a.with_option_storage())
+                  archiver_callback=lambda a: a.with_option_storage(),
+                  argparse_callback=lambda p: p.add_argument(
+                      "--sid-model", choices=["6581", "8580"], default="8580",
+                      help="SID chip model to synthesize (default 8580)."),
+                  argparse_fragment=lambda args: {"sid_model": args.sid_model})
