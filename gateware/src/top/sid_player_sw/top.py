@@ -220,7 +220,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # 4-channel oscilloscope: V1, V2, V3, mix. fs is scaled by the display
         # interpolation factor so the firmware's timebase matches the upsampled
         # stream fed to the scope (see LinearUpsampler).
-        self.scope_n_upsample = 16
+        self.scope_n_upsample = 32
         self.scope_periph = scope.ScopePeripheral(
             n_channels=4,
             fs=self.clock_settings.audio_clock.fs() * self.scope_n_upsample)
@@ -304,7 +304,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # dot-clouds. A cheap multi-pole leaky integrator (adders/shifts only)
         # band-limits them enough to draw clean lines. This is on the SCOPE
         # BRANCH ONLY — the audio outputs above keep reading raw voiceN_dca.
-        m.submodules.voice_smooth = voice_smooth = VoiceSmoother(n_channels=3)
+        m.submodules.voice_smooth = voice_smooth = VoiceSmoother(n_channels=4, k=7, poles=4)
         m.d.comb += [
             voice_smooth.strobe.eq(self.sid_periph.audio_strobe),
             voice_smooth.i[0].eq(sid.voice0_dca),
@@ -317,11 +317,17 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # so plotting never stalls the audio stream (drops if the FIFO is full).
         m.submodules.plot_fifo = plot_fifo = dsp.SyncFIFOBuffered(
             shape=data.ArrayLayout(PSQ, 4), depth=32)
+        # voiceN_dca are ASQ-scaled (Q1.15) samples but the scope frame type is
+        # PSQ (Q1.13). The original fed them via i_cal.payload (ASQ) and let the
+        # fixed-point .eq do the value-preserving ASQ->PSQ conversion (a >>2).
+        # The smoother works in the raw integer domain, so reproduce that shift
+        # here — otherwise the voice traces render 4x too tall.
+        _asq_to_psq = dsp.ASQ.f_bits - PSQ.f_bits  # = 2
         m.d.comb += [
             plot_fifo.i.valid.eq(pmod0.i_cal.valid & pmod0.i_cal.ready),
-            plot_fifo.i.payload[0].as_value().eq(voice_smooth.o[0]),
-            plot_fifo.i.payload[1].as_value().eq(voice_smooth.o[1]),
-            plot_fifo.i.payload[2].as_value().eq(voice_smooth.o[2]),
+            plot_fifo.i.payload[0].as_value().eq(voice_smooth.o[0] >> _asq_to_psq),
+            plot_fifo.i.payload[1].as_value().eq(voice_smooth.o[1] >> _asq_to_psq),
+            plot_fifo.i.payload[2].as_value().eq(voice_smooth.o[2] >> _asq_to_psq),
             plot_fifo.i.payload[3].eq(pmod0.i_cal.payload[3]),
         ]
         # Linearly interpolate between the 48kHz frames so steep edges render as
