@@ -39,10 +39,17 @@ tunes use them); revisit if a future tune requires them.
   Costs ~570 LUTs + 1 multiplier; runs at phi2 cadence so it does NOT join the critical
   path (sync Fmax unchanged ~55MHz). Host-tested in `tests/test_sid_audio.py` (1kHz
   passes, 100kHz alias-tone rejected).
-- **Still 8580, not 6581:** `sid/top.py:99` hardcodes `define SID2` (MOS8580); most
-  tunes (e.g. Commando, header flags bit4-5) are 6581. Different filter curve +
-  combined-waveform tables → wrong tonal character. Not yet fixed (would need a
-  header-driven SID1/SID2 build select).
+## Dual SID chip model (6581 vs 8580)
+- **Build-time selection:** `pdm sid_player_sw build --sid-model {6581,8580}` (default 8580).
+  The flag threads `sid2_define` (True for 8580, False for 6581) through `top_level_cli` → `top.py`'s
+  `argparse_callback`/`argparse_fragment` → the shared `SID` component (`src/top/sid/top.py`)
+  and the `SIDPeripheral` CSR. Different filter curves + combined-waveform tables between models.
+- **Runtime visibility:** firmware reads the baked-in `build_model` CSR (1=8580, 0=6581) at boot
+  and shows it in the title line: `SID PLAYER (6581)` or `SID PLAYER (8580)`. The **metadata line**
+  (row 2) shows the tune's declared model from the PSID header (bit4-5 of `flags` offset $76).
+  A mismatch is visible at a glance — flash the build that matches the tune for correct timbre.
+- Most tunes (e.g. Commando) declare 6581; pre-8580 builds played them with wrong filter character.
+  Now: select the model once and flash it matching your library.
 
 ## Menu / UI (`main.rs`)
 - Hand-rolled menu (NOT the `opts` derive framework — macro_osc's `opts`/`tiliqua_lib::ui`
