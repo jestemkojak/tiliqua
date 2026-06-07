@@ -317,13 +317,13 @@ frame timing — is what matters for non-digi tunes.)
   wishbone master, so coherency is a genuine concern in both directions (image-out,
   CIA-timer read-back-in). The 64 KiB cache-thrash works but is crude — prefer a real
   cache-clean/invalidate if VexiiRiscv gains one. Needs a hardware re-test if changed.
-- **Scope upsampling** (continuous traces at full size): sid_player feeds raw
-  audio-rate samples straight into `scope_periph.i` — the per-channel
-  `dsp.Resample` upsamplers the voice-scope spec called for (and `macro_osc` has,
-  `n_up=16`) were never added, so traces are dotted. Currently mitigated in
-  firmware (scale-down + slower timebase). The proper fix is 4 `Resample` blocks,
-  but the design is at ~92% LUTs / failing 60 MHz timing — likely needs dropping
-  MIX back to 3 channels to fit.
+- **Scope upsampling** (continuous traces) — DONE for `sid_player_sw`: ported the
+  macro_osc Split→4×Resample(n_up=16)→Merge stage into `VoiceUpsampler`
+  (`src/top/sid_player_sw/upsample.py`) between the plot FIFO and the scope, and
+  scaled `scope_periph` `fs` by 16. Build fit: LUT 56.2% / sync 55.49 MHz (see commit
+  `105bd29`). Contingency levers if a future change breaks fit: lower `order_mult`,
+  drop `scope_n_upsample` 16→8, or scope 4→3 channels. The original `sid_player`
+  (arlet) top still feeds raw `fs` (dotted) — port the same stage there if needed.
 - **PSRAM RMW writes** (tune storing above `$07FF`): the bridge implements the
   sub-FSM (`RD-FOR-RMW → WRITE → psram_done_r`, replacing the old WRITE→IDLE wedge).
   Correctness is cosim-tested (`test_psram_rmw_preserves_adjacent_byte`: byte-merge
