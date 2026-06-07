@@ -42,7 +42,7 @@ OPS = {
     "STAX": (0x9D, "absx"), "STAY": (0x99, "absy"),
     "INCZ": (0xE6, "zp"),   "DECZ": (0xC6, "zp"),
     "AND#": (0x29, "imm"),  "ORA#": (0x09, "imm"), "EOR#": (0x49, "imm"),
-    "ADC#": (0x69, "imm"),  "SBC#": (0xE9, "imm"),
+    "ADC#": (0x69, "imm"),  "SBC#": (0xE9, "imm"), "ADCZ": (0x65, "zp"),
     "CMP#": (0xC9, "imm"),  "CPX#": (0xE0, "imm"), "CPY#": (0xC0, "imm"),
     "TAX": (0xAA, "impl"),  "TAY": (0xA8, "impl"),
     "TXA": (0x8A, "impl"),  "TYA": (0x98, "impl"),
@@ -160,6 +160,9 @@ class Sim:
         elif op == 0x49: self.a ^= imm; self._set_nz(self.a); self.pc += 2
         elif op == 0x69:
             s = self.a + imm + self.c; self.c = 1 if s > 0xFF else 0
+            self.a = s & 0xFF; self._set_nz(self.a); self.pc += 2
+        elif op == 0x65:
+            s = self.a + m[imm] + self.c; self.c = 1 if s > 0xFF else 0
             self.a = s & 0xFF; self._set_nz(self.a); self.pc += 2
         elif op == 0xE9:
             s = self.a - imm - (1 - self.c); self.c = 0 if s < 0 else 1
@@ -385,6 +388,123 @@ def build_program_runaway(cia_timer):
     return p
 
 
+# --- Original cracktro tune: vi-IV-I-V loop (Am - F - C - G) ---------------
+# Bass roots (octave 2) and their octave-up bounce; chord-arp tones (root/3rd/
+# 5th, mid octave); and a lead melody over the 4-bar loop. All original.
+CRK_BASS_LO = [0x0751, 0x05CF, 0x08B4, 0x0685]               # A2 F2 C3 G2
+CRK_BASS_HI = [v * 2 for v in CRK_BASS_LO]                    # octave up
+CRK_ARP = [                                                   # 4 chords x 3 tones
+    0x0EA2, 0x1168, 0x15ED,   # Am: A3 C4 E4
+    0x173B, 0x1D45, 0x22CF,   # F : F4 A4 C5
+    0x1168, 0x15ED, 0x1A14,   # C : C4 E4 G4
+    0x1A14, 0x20DB, 0x2713,   # G : G4 B4 D5
+]
+CRK_LEAD = [
+    0x2BDB, 0x2713, 0x22CF, 0x1D45,   # E5 D5 C5 A4   (over Am)
+    0x1D45, 0x22CF, 0x173B, 0x1D45,   # A4 C5 F4 A4   (over F)
+    0x22CF, 0x2BDB, 0x1A14, 0x2BDB,   # C5 E5 G4 E5   (over C)
+    0x2713, 0x20DB, 0x1A14, 0x2713,   # D5 B4 G4 D5   (over G)
+]
+
+
+def build_program_cracktro(cia_timer):
+    """An original demoscene-cracktro loop: pumping octave bass, the classic
+    single-voice chord arpeggio, and a lead melody over a 4-bar vi-IV-I-V."""
+    # Zero-page state.
+    CHCNT, CHIDX = 0x10, 0x11        # chord step counter / index (0..3)
+    ACNT, ATONE = 0x12, 0x13         # arp step counter / tone (0..2)
+    BCNT, BHI = 0x14, 0x15           # bass step counter / octave flag
+    LCNT, LIDX = 0x16, 0x17          # lead step counter / index (0..15)
+    DIR, CUT = 0x18, 0x19            # filter sweep
+    p = []
+    a = p.append
+
+    # ---- INIT ----
+    a(("init", "LDA#", 0))
+    for z in (CHCNT, CHIDX, ACNT, ATONE, BCNT, BHI, LCNT, LIDX, DIR):
+        a((None, "STAZ", z))
+    a((None, "LDA#", 0xA0)); a((None, "STAZ", CUT))
+    # Bass (v0): pulse, plucky-ish; arp (v1): pulse, sustained; lead (v2): saw.
+    a((None, "LDA#", 0x08)); a((None, "STA", V(0, 5)))   # bass AD
+    a((None, "LDA#", 0xA8)); a((None, "STA", V(0, 6)))   # bass SR
+    a((None, "LDA#", 0x00)); a((None, "STA", V(0, 2)))
+    a((None, "LDA#", 0x08)); a((None, "STA", V(0, 3)))   # bass PW ~50%
+    a((None, "LDA#", 0x00)); a((None, "STA", V(1, 5)))   # arp AD (instant)
+    a((None, "LDA#", 0xC0)); a((None, "STA", V(1, 6)))   # arp SR (sustain)
+    a((None, "LDA#", 0x00)); a((None, "STA", V(1, 2)))
+    a((None, "LDA#", 0x04)); a((None, "STA", V(1, 3)))   # arp PW ~25%
+    a((None, "LDA#", 0x0A)); a((None, "STA", V(2, 5)))   # lead AD
+    a((None, "LDA#", 0xA9)); a((None, "STA", V(2, 6)))   # lead SR
+    # Gentle lowpass on the bass only; full volume.
+    a((None, "LDA#", 0x00)); a((None, "STA", FCLO))
+    a((None, "LDA#", 0x41)); a((None, "STA", RESF))      # res 4, route v0
+    a((None, "LDA#", 0x1F)); a((None, "STA", MODEVOL))
+    if cia_timer is not None:
+        a((None, "LDA#", cia_timer & 0xFF));        a((None, "STA", 0xDC04))
+        a((None, "LDA#", (cia_timer >> 8) & 0xFF)); a((None, "STA", 0xDC05))
+    a((None, "RTS"))
+
+    # ---- PLAY ----
+    # Chord changes every 32 calls (one bar).
+    a(("play", "INCZ", CHCNT)); a((None, "LDAZ", CHCNT)); a((None, "CMP#", 32)); a((None, "BNE", "c_chok"))
+    a((None, "LDA#", 0)); a((None, "STAZ", CHCNT))
+    a((None, "INCZ", CHIDX)); a((None, "LDAZ", CHIDX)); a((None, "AND#", 3)); a((None, "STAZ", CHIDX))
+    a(("c_chok", "NOP"))
+
+    # Bass: octave bounce every 8 calls.
+    a((None, "INCZ", BCNT)); a((None, "LDAZ", BCNT)); a((None, "CMP#", 8)); a((None, "BNE", "c_bok"))
+    a((None, "LDA#", 0)); a((None, "STAZ", BCNT))
+    a((None, "LDAZ", BHI)); a((None, "EOR#", 1)); a((None, "STAZ", BHI))
+    a(("c_bok", "LDAZ", CHIDX)); a((None, "TAX"))
+    a((None, "LDAZ", BHI)); a((None, "BNE", "c_bhi"))
+    a((None, "LDAX", "crk_blo_lo")); a((None, "STA", V(0, 0)))
+    a((None, "LDAX", "crk_blo_hi")); a((None, "STA", V(0, 1))); a((None, "JMP", "c_bwr"))
+    a(("c_bhi", "LDAX", "crk_bhi_lo")); a((None, "STA", V(0, 0)))
+    a((None, "LDAX", "crk_bhi_hi")); a((None, "STA", V(0, 1)))
+    a(("c_bwr", "LDA#", 0x41)); a((None, "STA", V(0, 4)))         # pulse + gate
+
+    # Arp: advance tone (mod 3) every 2 calls; note = CRK_ARP[CHIDX*3 + tone].
+    a((None, "INCZ", ACNT)); a((None, "LDAZ", ACNT)); a((None, "CMP#", 2)); a((None, "BNE", "c_aok"))
+    a((None, "LDA#", 0)); a((None, "STAZ", ACNT))
+    a((None, "LDAZ", ATONE)); a((None, "CLC")); a((None, "ADC#", 1)); a((None, "CMP#", 3)); a((None, "BNE", "c_ast"))
+    a((None, "LDA#", 0))
+    a(("c_ast", "STAZ", ATONE))
+    a(("c_aok", "LDAZ", CHIDX)); a((None, "CLC")); a((None, "ADCZ", CHIDX)); a((None, "CLC")); a((None, "ADCZ", CHIDX))
+    a((None, "CLC")); a((None, "ADCZ", ATONE)); a((None, "TAX"))
+    a((None, "LDAX", "crk_arp_lo")); a((None, "STA", V(1, 0)))
+    a((None, "LDAX", "crk_arp_hi")); a((None, "STA", V(1, 1)))
+    a((None, "LDA#", 0x41)); a((None, "STA", V(1, 4)))           # pulse + gate
+
+    # Lead: melody note every 8 calls.
+    a((None, "INCZ", LCNT)); a((None, "LDAZ", LCNT)); a((None, "CMP#", 8)); a((None, "BNE", "c_lok"))
+    a((None, "LDA#", 0)); a((None, "STAZ", LCNT))
+    a((None, "INCZ", LIDX)); a((None, "LDAZ", LIDX)); a((None, "AND#", 15)); a((None, "STAZ", LIDX))
+    a(("c_lok", "LDAZ", LIDX)); a((None, "TAX"))
+    a((None, "LDAX", "crk_lead_lo")); a((None, "STA", V(2, 0)))
+    a((None, "LDAX", "crk_lead_hi")); a((None, "STA", V(2, 1)))
+    a((None, "LDA#", 0x21)); a((None, "STA", V(2, 4)))           # saw + gate
+
+    # Gentle filter sweep on the bass.
+    a((None, "LDAZ", DIR)); a((None, "BNE", "c_sw_dn"))
+    a((None, "INCZ", CUT)); a((None, "LDAZ", CUT)); a((None, "CMP#", 0xE0)); a((None, "BNE", "c_sw_wr"))
+    a((None, "LDA#", 1)); a((None, "STAZ", DIR)); a((None, "JMP", "c_sw_wr"))
+    a(("c_sw_dn", "DECZ", CUT)); a((None, "LDAZ", CUT)); a((None, "CMP#", 0x40)); a((None, "BNE", "c_sw_wr"))
+    a((None, "LDA#", 0)); a((None, "STAZ", DIR))
+    a(("c_sw_wr", "LDAZ", CUT)); a((None, "STA", FCHI))
+    a((None, "RTS"))
+
+    # ---- data ----
+    a(("crk_blo_lo", ".byte", [v & 0xFF for v in CRK_BASS_LO]))
+    a(("crk_blo_hi", ".byte", [(v >> 8) & 0xFF for v in CRK_BASS_LO]))
+    a(("crk_bhi_lo", ".byte", [v & 0xFF for v in CRK_BASS_HI]))
+    a(("crk_bhi_hi", ".byte", [(v >> 8) & 0xFF for v in CRK_BASS_HI]))
+    a(("crk_arp_lo", ".byte", [v & 0xFF for v in CRK_ARP]))
+    a(("crk_arp_hi", ".byte", [(v >> 8) & 0xFF for v in CRK_ARP]))
+    a(("crk_lead_lo", ".byte", [v & 0xFF for v in CRK_LEAD]))
+    a(("crk_lead_hi", ".byte", [(v >> 8) & 0xFF for v in CRK_LEAD]))
+    return p
+
+
 def build_program(cia_timer, arp_div=1, pwm=False):
     """cia_timer: None for VBlank, else 16-bit CIA Timer A value to set in INIT.
     arp_div: advance the arpeggio once every N PLAY calls (>=1; keeps fast/CIA
@@ -478,6 +598,8 @@ def make_sid(cia_timer, name, style="ensemble", arp_div=1, pwm=False):
         program = build_program_ensemble(cia_timer)
     elif style == "runaway":
         program = build_program_runaway(cia_timer)
+    elif style == "cracktro":
+        program = build_program_cracktro(cia_timer)
     else:
         program = build_program(cia_timer, arp_div=arp_div, pwm=pwm)
     code, labels = assemble(program, LOAD)
@@ -541,10 +663,12 @@ def main():
     ap.add_argument("--rates", type=int, nargs="+", default=[0, 200],
                     help="PLAY rates in Hz; 0 = 50Hz VBlank, >0 = CIA multispeed "
                          "(default: 0 200). One .sid per rate.")
-    ap.add_argument("--style", choices=["ensemble", "unison", "runaway"], default="ensemble",
+    ap.add_argument("--style", choices=["ensemble", "unison", "runaway", "cracktro"],
+                    default="ensemble",
                     help="ensemble = independent bass/lead/noise voices (default); "
                          "unison = 3 voices on one transposed arp; "
-                         "runaway = easter egg, an original fast analog-sequencer line.")
+                         "runaway = easter egg, an original fast analog-sequencer line; "
+                         "cracktro = an original demoscene-style tune (bass+chord-arp+lead).")
     ap.add_argument("--arp-div", type=int, default=1,
                     help="[unison] advance the arpeggio every N PLAY calls "
                          "(keeps high rates musical; default 1).")

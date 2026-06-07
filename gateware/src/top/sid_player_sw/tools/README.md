@@ -46,6 +46,9 @@ Each run prints bytes, code size, SID writes/frame, rate, and style.
   line over a heavy resonant filter sweep, with noise hats — in the spirit of
   early-70s analog-sequencer intros. An original pattern (not a transcription of
   any recording). Try `--style runaway --rates 0 200`.
+- **cracktro**: an original demoscene-style tune — pumping octave bass, the
+  classic single-voice chord arpeggio, and a lead melody over a 4-bar vi-IV-I-V
+  loop. Made to be listened to; generate at VBlank: `--style cracktro --rates 0`.
 
 CIA multispeed tunes set PSID `speed` bit 0 and program CIA Timer A in INIT;
 `play_period_cycles` then derives the rate (`timer = round(phi2_PAL/rate) - 1`,
