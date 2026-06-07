@@ -91,12 +91,16 @@ class SID(wiring.Component):
     voice1_dca: Out(signed(16))
     voice2_dca: Out(signed(16))
 
+    def __init__(self, sid2_define=True):
+        self._sid2_define = sid2_define
+        super().__init__()
+
     def add_verilog_sources(self, platform):
         vroot = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                              "../../../deps/sid/gateware")
 
         # Use MOS8580 sim, it has no DC offset.
-        platform.add_file("sid_defines.sv", "`define SID2")
+        platform.add_file("sid_defines.sv", "`define SID2" if self._sid2_define else "")
 
         # Include all files necessary for top-level 'sid_api.sv' to be instantiated.
 
