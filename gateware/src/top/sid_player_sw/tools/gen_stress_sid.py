@@ -527,8 +527,9 @@ def build_program_burst(cia_timer, n_writes=24):
     `n_writes` (e.g. 160 = 10× FIFO depth) makes the loss unmistakable.
     """
     ARP, ACNT = 0x02, 0x03
-    ESSENTIAL = 9                      # 3 voices × (freq lo + freq hi + gate)
-    pad = max(0, n_writes - ESSENTIAL)
+    GATE_OFF = 3                        # gate-off writes: one per voice, always land
+    ESSENTIAL = 9                       # 3 voices × (freq lo + freq hi + gate on)
+    pad = max(0, n_writes - GATE_OFF - ESSENTIAL)
     p = []
     a = p.append
 
@@ -550,17 +551,21 @@ def build_program_burst(cia_timer, n_writes=24):
 
     # ---- PLAY ----
     a(("play", "LDAZ", ARP)); a((None, "AND#", 7)); a((None, "TAX"))  # X = arp index
-    # (1) padding burst: `pad` writes to cutoff-hi (harmless, just fills the FIFO).
+    # (0) gate OFF all voices — always lands (before the overflow zone).
+    # If the freq+gate writes below are dropped by FIFO overflow, voices stay
+    # silent instead of holding the previous note, making the gap clearly audible.
+    for v in range(3):
+        a((None, "LDA#", 0x40)); a((None, "STA", V(v, 4)))   # pulse, gate off
+    # (1) padding burst: `pad` writes to cutoff-hi (fills the FIFO to overflow point).
     for i in range(pad):
         a((None, "LDA#", 0x10 + (i & 0x0F))); a((None, "STA", FCHI))
     # (2) the REAL note, written LAST so overflow drops it. Unison on all voices.
     for v in range(3):
         a((None, "LDAX", "note_lo")); a((None, "STA", V(v, 0)))
         a((None, "LDAX", "note_hi")); a((None, "STA", V(v, 1)))
-        a((None, "LDA#", 0x41));      a((None, "STA", V(v, 4)))   # pulse + gate
+        a((None, "LDA#", 0x41));      a((None, "STA", V(v, 4)))   # pulse + gate ON
     # advance the arp every call: each note written exactly once, so a dropped
-    # write (FIFO overflow) produces an audible missing note rather than being
-    # silently retried across 8 frames.
+    # write (FIFO overflow) produces an audible gap rather than a stuck note.
     a((None, "INCZ", ACNT)); a((None, "LDAZ", ACNT)); a((None, "CMP#", 1)); a((None, "BNE", "burst_done"))
     a((None, "LDA#", 0)); a((None, "STAZ", ACNT)); a((None, "INCZ", ARP))
     a(("burst_done", "RTS"))
