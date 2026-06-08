@@ -312,7 +312,8 @@ fn main() -> ! {
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
     let mut unsupported = false; // last file selection was an unsupported .SID
-    let mut redraw   = true;
+    let mut redraw   = true;          // full-header clear (page switch / tune load)
+    let mut redraw_row: Option<usize> = None; // cheap single-row clear (one value edited)
     let mut page     = Page::Player;
     let mut selected: usize = 0;
     let mut modify   = false;
@@ -419,8 +420,16 @@ fn main() -> ! {
                         }
                         _ => {}
                     }
+                    // A value edit changes only its own row's text (the Song
+                    // row also drives the metadata line), so clear just that
+                    // band — a full per-pixel header clear visibly blanks the
+                    // screen under PSRAM contention. A page switch (row 0)
+                    // re-labels every row, so it still needs the full clear.
+                    // Pure navigation (the `!modify` branch) sets neither: the
+                    // every-frame text redraw handles the highlight change.
+                    if selected == 0 { redraw = true; }
+                    else { redraw_row = Some(selected); }
                 }
-                redraw = true;
             }
 
             if encoder.poke_btn() {
@@ -445,6 +454,9 @@ fn main() -> ! {
                                             output_mute(false);
                                             play_period = p; play_hz = hz;
                                             timer.set_timeout_ticks(play_period);
+                                            // New tune: name/author/meta + every
+                                            // row change at once -> full clear.
+                                            redraw = true;
                                         } else {
                                             // Unsupported file: keep playing the
                                             // current tune, flag it in the UI.
@@ -473,14 +485,40 @@ fn main() -> ! {
                     (Page::Scope, _) => { modify = !modify; }
                     _ => {}
                 }
-                redraw = true;
+                // Most button actions toggle a marker or one row's text; clear
+                // just that row. Loading a new tune (above) sets full `redraw`.
+                if !redraw { redraw_row = Some(selected); }
             }
 
-            // The menu must be repainted every frame: the persist/scope effect
-            // continuously decays the framebuffer, so static text would fade.
+            // Menu text is re-blitted every frame below (the persist/scope
+            // effect decays the framebuffer), so navigation needs no clear.
+            // Clears erase ghosts left when text shrinks (long filename ->
+            // short, "PLAYING" -> "PAUSED"). They are per-pixel `draw_iter`
+            // fills (no accelerated fill_solid in the HAL) that blank whatever
+            // they cover for the fill's duration under PSRAM contention, so we
+            // clear as little as possible:
+            //   `redraw`     -> whole header (page switch / tune load: every row
+            //                   plus name/author/meta change at once).
+            //   `redraw_row` -> one row's band (a single value was edited).
+            // Plain row navigation sets neither.
+            let vy0    = 72i32;
+            let vspace = 18i32;
             if redraw {
                 redraw = false;
+                redraw_row = None; // full clear supersedes any pending row clear
                 Rectangle::new(Point::new(0, 0), Size::new(h_active as u32, HEADER_H as u32))
+                    .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
+                    .draw(&mut display)
+                    .ok();
+            } else if let Some(row) = redraw_row.take() {
+                // Clear only the changed row's text band (full width: long
+                // filenames span the line). The Player "Song" row (2) also
+                // drives the metadata line at y=150, so extend the band to it.
+                let y   = vy0 + vspace * row as i32;
+                let top = y - 15;
+                let bot = if page == Page::Player && row == 2 { 155 } else { y + 5 };
+                Rectangle::new(Point::new(0, top),
+                               Size::new(h_active as u32, (bot - top) as u32))
                     .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
                     .draw(&mut display)
                     .ok();
@@ -500,8 +538,6 @@ fn main() -> ! {
             let label_x  = cx - 100;
             let value_x  = cx + 100;
             let marker_x = cx + 110;
-            let vy0      = 72i32;
-            let vspace   = 18i32;
 
             for n in 0..rows_in(page) {
                 let font = if selected == n { style } else { style_dim };
