@@ -325,25 +325,30 @@ def build_program_ensemble(cia_timer):
     return p
 
 
-# Easter egg: an original fast "runaway sequencer" line in the spirit of early-
-# 70s analog-sequencer intros (relentless 16th-note run, resonant filter sweep,
-# noise hats). This is our own note pattern, not a transcription of any song.
+# Easter egg: the famous 8-note sequencer loop from Pink Floyd's "On the Run"
+# (Dark Side of the Moon, 1973) — the line David Gilmour clocked out of the EMS
+# Synthi AKS. An E-minor run that rises across the octave with E4 as a recurring
+# lower anchor, looping every 8 sixteenth notes. PAL SID freq-register values.
 RUN_SEQ = [
-    0x0AF7, 0x15ED, 0x0D0A, 0x15ED, 0x0EA3, 0x15ED, 0x106D, 0x15ED,   # E3 E4 G3..
-    0x1389, 0x15ED, 0x1A14, 0x15ED, 0x1D45, 0x15ED, 0x20DB, 0x15ED,   # D4..B4 (pedal E4)
+    0x15ED, 0x1A14, 0x1D45, 0x15ED,   # E4 G4 A4 E4
+    0x1D45, 0x20DB, 0x2711, 0x2BDB,   # A4 B4 D5 E5
 ]
 
 
-def build_program_runaway(cia_timer):
-    """Easter egg — a single relentless sawtooth sequence (new note every call)
-    over a heavy resonant filter sweep, with noise hats. Original pattern."""
-    DIR, CUT, SIDX, PCNT = 0x03, 0x04, 0x05, 0x06
+def build_program_runaway(cia_timer, note_div=5):
+    """Easter egg — a transcription of Pink Floyd's "On the Run" intro: the
+    8-note Synthi sequencer loop as a relentless sawtooth over a heavy resonant
+    filter sweep. The note advances once every `note_div` PLAY calls so the run
+    sits at the original ~165 BPM sixteenths regardless of the build's PLAY rate;
+    the hi-hat retriggers on every step (the sequencer trigger pulse, as on the
+    record), decaying in between."""
+    DIR, CUT, SIDX, NCNT = 0x03, 0x04, 0x05, 0x06
     p = []
     a = p.append
 
     # ---- INIT ----
     a(("init", "LDA#", 0))
-    for z in (DIR, SIDX, PCNT):
+    for z in (DIR, SIDX, NCNT):
         a((None, "STAZ", z))
     a((None, "LDA#", 0x20)); a((None, "STAZ", CUT))      # start low, sweeps up
     a((None, "LDA#", 0x00)); a((None, "STA", V(0, 5)))   # lead AD (instant)
@@ -359,22 +364,23 @@ def build_program_runaway(cia_timer):
     a((None, "RTS"))
 
     # ---- PLAY ----
-    # Lead: next note in the 16-step run every call (the "runaway").
-    a(("play", "LDAZ", SIDX)); a((None, "AND#", 15)); a((None, "TAX"))
+    # Advance one step of the 8-note "On the Run" loop every `note_div` calls
+    # (~165 BPM sixteenths). Non-tick calls just let the filter sweep run.
+    a(("play", "INCZ", NCNT)); a((None, "LDAZ", NCNT)); a((None, "CMP#", note_div)); a((None, "BNE", "r_hold"))
+    a((None, "LDA#", 0)); a((None, "STAZ", NCNT))
+    # new-note tick: emit next step + retrigger the hi-hat (sequencer pulse).
+    a((None, "LDAZ", SIDX)); a((None, "AND#", 7)); a((None, "TAX"))
     a((None, "LDAX", "run_lo")); a((None, "STA", V(0, 0)))
     a((None, "LDAX", "run_hi")); a((None, "STA", V(0, 1)))
     a((None, "LDA#", 0x21)); a((None, "STA", V(0, 4)))          # saw + gate
     a((None, "INCZ", SIDX))
-    # Noise hat every 4 calls.
-    a((None, "INCZ", PCNT)); a((None, "LDAZ", PCNT)); a((None, "AND#", 3)); a((None, "BNE", "r_hatoff"))
     a((None, "LDA#", 0x00)); a((None, "STA", V(2, 0)))
     a((None, "LDA#", 0x30)); a((None, "STA", V(2, 1)))
-    a((None, "LDA#", 0x81)); a((None, "STA", V(2, 4)))         # noise + gate
-    a((None, "JMP", "r_hatdone"))
-    a(("r_hatoff", "LDA#", 0x80)); a((None, "STA", V(2, 4)))
-    a(("r_hatdone", "NOP"))
-    # Resonant cutoff sweep.
-    a((None, "LDAZ", DIR)); a((None, "BNE", "r_sw_dn"))
+    a((None, "LDA#", 0x81)); a((None, "STA", V(2, 4)))         # noise hat + gate
+    a((None, "JMP", "r_sw"))
+    a(("r_hold", "LDA#", 0x80)); a((None, "STA", V(2, 4)))      # hat gate off (decay)
+    # Resonant cutoff sweep (every call, smooth).
+    a(("r_sw", "LDAZ", DIR)); a((None, "BNE", "r_sw_dn"))
     a((None, "INCZ", CUT)); a((None, "LDAZ", CUT)); a((None, "CMP#", 0xF0)); a((None, "BNE", "r_sw_wr"))
     a((None, "LDA#", 1)); a((None, "STAZ", DIR)); a((None, "JMP", "r_sw_wr"))
     a(("r_sw_dn", "DECZ", CUT)); a((None, "LDAZ", CUT)); a((None, "CMP#", 0x10)); a((None, "BNE", "r_sw_wr"))
@@ -505,6 +511,64 @@ def build_program_cracktro(cia_timer):
     return p
 
 
+def build_program_burst(cia_timer, n_writes=24):
+    """FIFO-overflow exposer. Every PLAY call issues `n_writes` back-to-back SID
+    writes — more than the gateware transaction FIFO (depth 16, drained 1 entry
+    per phi2 ≈ 1MHz). Because the emulated 6502 runs faster than real-time, the
+    whole burst is dumped far quicker than the FIFO drains, so writes past the
+    FIFO's capacity are silently dropped (see SIDPeripheral in src/top/sid/top.py
+    and memory sid-player-sw-fifo-overflow-dropped-notes).
+
+    The burst is laid out **padding first, the actual note last**: a run of
+    harmless cutoff writes fills the FIFO, then the three voices' freq + gate are
+    written. On correct hardware (or after the backpressure fix) all writes land
+    and you hear a clean unison arpeggio; on the buggy path the *final* note
+    writes are exactly the ones dropped → silence / stuck pitch. Larger
+    `n_writes` (e.g. 160 = 10× FIFO depth) makes the loss unmistakable.
+    """
+    ARP, ACNT = 0x02, 0x03
+    ESSENTIAL = 9                      # 3 voices × (freq lo + freq hi + gate)
+    pad = max(0, n_writes - ESSENTIAL)
+    p = []
+    a = p.append
+
+    # ---- INIT ----
+    a(("init", "LDA#", 0)); a((None, "STAZ", ARP)); a((None, "STAZ", ACNT))
+    for v in range(3):
+        a((None, "LDA#", 0x00)); a((None, "STA", V(v, 5)))   # AD instant
+        a((None, "LDA#", 0xF0)); a((None, "STA", V(v, 6)))   # SR sustain
+        a((None, "LDA#", 0x00)); a((None, "STA", V(v, 2)))   # pw lo
+        a((None, "LDA#", 0x08)); a((None, "STA", V(v, 3)))   # pw hi ~50%
+    a((None, "LDA#", 0x00)); a((None, "STA", FCLO))
+    a((None, "LDA#", 0x80)); a((None, "STA", FCHI))
+    a((None, "LDA#", 0xF7)); a((None, "STA", RESF))
+    a((None, "LDA#", 0x1F)); a((None, "STA", MODEVOL))
+    if cia_timer is not None:
+        a((None, "LDA#", cia_timer & 0xFF));        a((None, "STA", 0xDC04))
+        a((None, "LDA#", (cia_timer >> 8) & 0xFF)); a((None, "STA", 0xDC05))
+    a((None, "RTS"))
+
+    # ---- PLAY ----
+    a(("play", "LDAZ", ARP)); a((None, "AND#", 7)); a((None, "TAX"))  # X = arp index
+    # (1) padding burst: `pad` writes to cutoff-hi (harmless, just fills the FIFO).
+    for i in range(pad):
+        a((None, "LDA#", 0x10 + (i & 0x0F))); a((None, "STA", FCHI))
+    # (2) the REAL note, written LAST so overflow drops it. Unison on all voices.
+    for v in range(3):
+        a((None, "LDAX", "note_lo")); a((None, "STA", V(v, 0)))
+        a((None, "LDAX", "note_hi")); a((None, "STA", V(v, 1)))
+        a((None, "LDA#", 0x41));      a((None, "STA", V(v, 4)))   # pulse + gate
+    # advance the arp every 8 calls (audible, slow enough to be musical).
+    a((None, "INCZ", ACNT)); a((None, "LDAZ", ACNT)); a((None, "CMP#", 8)); a((None, "BNE", "burst_done"))
+    a((None, "LDA#", 0)); a((None, "STAZ", ACNT)); a((None, "INCZ", ARP))
+    a(("burst_done", "RTS"))
+
+    # ---- data ----
+    a(("note_lo", ".byte", [n & 0xFF for n in NOTES]))
+    a(("note_hi", ".byte", [(n >> 8) & 0xFF for n in NOTES]))
+    return p
+
+
 def build_program(cia_timer, arp_div=1, pwm=False):
     """cia_timer: None for VBlank, else 16-bit CIA Timer A value to set in INIT.
     arp_div: advance the arpeggio once every N PLAY calls (>=1; keeps fast/CIA
@@ -593,13 +657,16 @@ def build_program(cia_timer, arp_div=1, pwm=False):
     return p
 
 
-def make_sid(cia_timer, name, style="ensemble", arp_div=1, pwm=False):
+def make_sid(cia_timer, name, style="ensemble", arp_div=1, pwm=False, note_div=5,
+             burst_writes=24):
     if style == "ensemble":
         program = build_program_ensemble(cia_timer)
     elif style == "runaway":
-        program = build_program_runaway(cia_timer)
+        program = build_program_runaway(cia_timer, note_div=note_div)
     elif style == "cracktro":
         program = build_program_cracktro(cia_timer)
+    elif style == "burst":
+        program = build_program_burst(cia_timer, n_writes=burst_writes)
     else:
         program = build_program(cia_timer, arp_div=arp_div, pwm=pwm)
     code, labels = assemble(program, LOAD)
@@ -663,12 +730,17 @@ def main():
     ap.add_argument("--rates", type=int, nargs="+", default=[0, 200],
                     help="PLAY rates in Hz; 0 = 50Hz VBlank, >0 = CIA multispeed "
                          "(default: 0 200). One .sid per rate.")
-    ap.add_argument("--style", choices=["ensemble", "unison", "runaway", "cracktro"],
+    ap.add_argument("--style", choices=["ensemble", "unison", "runaway", "cracktro", "burst"],
                     default="ensemble",
                     help="ensemble = independent bass/lead/noise voices (default); "
                          "unison = 3 voices on one transposed arp; "
-                         "runaway = easter egg, an original fast analog-sequencer line; "
-                         "cracktro = an original demoscene-style tune (bass+chord-arp+lead).")
+                         "runaway = easter egg, Pink Floyd's \"On the Run\" Synthi sequence; "
+                         "cracktro = an original demoscene-style tune (bass+chord-arp+lead); "
+                         "burst = FIFO-overflow exposer (see --burst-writes).")
+    ap.add_argument("--burst-writes", type=int, default=24,
+                    help="[burst] SID writes per PLAY call (note written last so "
+                         "FIFO overflow drops it). FIFO depth is 16; 24 = exposes "
+                         "the bug, 160 = 10x extreme (default 24).")
     ap.add_argument("--arp-div", type=int, default=1,
                     help="[unison] advance the arpeggio every N PLAY calls "
                          "(keeps high rates musical; default 1).")
@@ -687,8 +759,13 @@ def main():
             cia = cia_timer_for(rate)
             label, fname = f"~{rate} Hz CIA (timer={cia})", f"{args.prefix}_{rate}hz.sid"
         title = f"STRESS {args.style[:3].upper()} {rate or 50}HZ"
+        # "On the Run" runs at 165 BPM sixteenths = 11 notes/sec; advance the
+        # runaway step every Nth PLAY call to hold that tempo at any PLAY rate.
+        play_rate = 50 if rate == 0 else rate
+        note_div = max(1, round(play_rate / 11.0))
         data, wpf, codelen = make_sid(cia, title, style=args.style,
-                                      arp_div=args.arp_div, pwm=args.pwm)
+                                      arp_div=args.arp_div, pwm=args.pwm,
+                                      note_div=note_div, burst_writes=args.burst_writes)
         with open(os.path.join(args.out_dir, fname), "wb") as f:
             f.write(data)
         print(f"{fname}: {len(data)} bytes (code {codelen}B), "
