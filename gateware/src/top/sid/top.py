@@ -199,8 +199,8 @@ class SIDPeripheral(wiring.Component):
 
     class TxnStatus(csr.Register, access="r"):
         """Transaction-FIFO status for firmware backpressure."""
-        writable: csr.Field(csr.action.R, unsigned(1))   # FIFO can accept a write
-        level:    csr.Field(csr.action.R, unsigned(8))   # occupancy (debug/telemetry)
+        writable: csr.Field(csr.action.R, unsigned(1))
+        level:    csr.Field(csr.action.R, unsigned(5))   # occupancy (debug/telemetry)
 
     def __init__(self, *, transaction_depth=16, sid2_define=True):
         self._sid2_define = sid2_define
