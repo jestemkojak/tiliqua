@@ -85,6 +85,50 @@ mod tests {
         }
     }
 
+    /// EVIDENCE for the dropped-note bug: count SID register writes issued per
+    /// PLAY frame for Commando. The gateware transaction FIFO is depth-16 and
+    /// drains exactly one write per phi2 (~1MHz). The emulated 6502 is NOT
+    /// throttled to 1MHz, so any frame that bursts >16 writes faster than the
+    /// FIFO drains will silently overflow it -> dropped writes -> dropped notes.
+    #[test]
+    fn commando_writes_per_frame() {
+        use crate::psid::PsidHeader;
+        static SID: &[u8] = include_bytes!("../../../../../../docs/Commando.sid");
+
+        let mem = boxed_mem();
+        let hdr = PsidHeader::parse(SID).expect("parse");
+        let payload_raw = &SID[hdr.data_offset as usize..];
+        let load = hdr.effective_load_addr(payload_raw) as usize;
+        let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+        mem[load..load + payload.len()].copy_from_slice(payload);
+
+        let count = std::cell::Cell::new(0usize);
+        let bus = PsidBus { mem, on_sid_write: |_r, _v| count.set(count.get() + 1) };
+        let mut cpu = CPU::new(bus, Nmos6502);
+        cpu.registers.stack_pointer.0 = 0xFD;
+        assert!(init(&mut cpu, hdr.init_addr, hdr.start_song.saturating_sub(1) as u8, 2_000_000));
+
+        let mut per_frame = std::vec::Vec::new();
+        for _ in 0..3000 {
+            count.set(0);
+            assert!(call(&mut cpu, hdr.play_addr, 2_000_000));
+            per_frame.push(count.get());
+        }
+        let max = *per_frame.iter().max().unwrap();
+        let mean = per_frame.iter().sum::<usize>() as f64 / per_frame.len() as f64;
+        const FIFO_DEPTH: usize = 16; // SIDPeripheral._transactions (top/sid/top.py)
+        let over = per_frame.iter().filter(|&&w| w > FIFO_DEPTH).count();
+        eprintln!("Commando PLAY writes/frame: max={max} mean={mean:.1} | \
+                   frames>{FIFO_DEPTH}={over}/{}", per_frame.len());
+        // The gateware transaction FIFO is FIFO_DEPTH deep and drains 1 write per
+        // phi2 (~1MHz). The emulated 6502 runs faster than real-time (a frame's
+        // work completes in << the 20ms frame period), so a burst of writes is
+        // issued far faster than the FIFO drains. Any frame bursting > FIFO_DEPTH
+        // writes can overflow it -> writes silently dropped -> dropped notes.
+        assert!(max > FIFO_DEPTH,
+            "expected Commando to burst >{FIFO_DEPTH} writes/frame (overflow risk); got max={max}");
+    }
+
     #[test]
     fn init_writes_sid_via_hook() {
         let mem = boxed_mem();
