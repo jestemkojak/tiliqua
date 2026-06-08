@@ -66,6 +66,17 @@ type PlayerCpu = CPU<player::PsidBus<fn(u8, u8)>, Nmos6502>;
 /// as a plain `fn` pointer; steals SID_PERIPH (effectively a single owner).
 fn sid_write(reg: u8, val: u8) {
     let p = unsafe { pac::Peripherals::steal() };
+    // Backpressure: the gateware transaction FIFO drains ~1 entry per phi2
+    // (~1MHz). The emulated 6502 issues writes far faster, so without this the
+    // FIFO overflows and writes are silently dropped (dropped notes). Spin until
+    // it can accept; we are the only writer, so `writable`==1 guarantees the
+    // write lands. Bounded so a pathological stall can never freeze the SoC
+    // (CLAUDE.md: never let the player hang) — falling back to the old drop.
+    let mut spins = 0u32;
+    while p.SID_PERIPH.txn_status().read().writable().bit_is_clear() {
+        spins += 1;
+        if spins >= 100_000 { break; }
+    }
     p.SID_PERIPH.transaction_data().write(|w| unsafe {
         w.transaction_data().bits(player::sid_txn(reg, val))
     });
