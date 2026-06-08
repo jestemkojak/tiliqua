@@ -197,6 +197,11 @@ class SIDPeripheral(wiring.Component):
     class BuildModel(csr.Register, access="r"):
         model: csr.Field(csr.action.R, unsigned(1))
 
+    class TxnStatus(csr.Register, access="r"):
+        """Transaction-FIFO status for firmware backpressure."""
+        writable: csr.Field(csr.action.R, unsigned(1))   # FIFO can accept a write
+        level:    csr.Field(csr.action.R, unsigned(8))   # occupancy (debug/telemetry)
+
     def __init__(self, *, transaction_depth=16, sid2_define=True):
         self._sid2_define = sid2_define
         self._transactions = SyncFIFO(width=16, depth=transaction_depth)
@@ -210,6 +215,7 @@ class SIDPeripheral(wiring.Component):
         self._midi_cfg    = regs.add("usb_midi_cfg",  self.UsbMidiCfg(),  offset=0x10)
         self._midi_endp   = regs.add("usb_midi_endp", self.UsbMidiCfg(),  offset=0x14)
         self._build_model = regs.add("build_model",   self.BuildModel(),  offset=0x18)
+        self._txn_status  = regs.add("txn_status",    self.TxnStatus(),   offset=0x1C)
         self._bridge = csr.Bridge(regs.as_memory_map())
 
         self.sid = None
@@ -319,6 +325,12 @@ class SIDPeripheral(wiring.Component):
 
         # Build-time SID model: drive as a constant read-only CSR.
         m.d.comb += self._build_model.f.model.r_data.eq(int(self._sid2_define))
+
+        # Transaction FIFO status: firmware polls this for backpressure.
+        m.d.comb += [
+            self._txn_status.f.writable.r_data.eq(self._transactions.w_rdy),
+            self._txn_status.f.level.r_data.eq(self._transactions.level),
+        ]
 
         return m
 
