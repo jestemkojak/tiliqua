@@ -558,8 +558,10 @@ def build_program_burst(cia_timer, n_writes=24):
         a((None, "LDAX", "note_lo")); a((None, "STA", V(v, 0)))
         a((None, "LDAX", "note_hi")); a((None, "STA", V(v, 1)))
         a((None, "LDA#", 0x41));      a((None, "STA", V(v, 4)))   # pulse + gate
-    # advance the arp every 8 calls (audible, slow enough to be musical).
-    a((None, "INCZ", ACNT)); a((None, "LDAZ", ACNT)); a((None, "CMP#", 8)); a((None, "BNE", "burst_done"))
+    # advance the arp every call: each note written exactly once, so a dropped
+    # write (FIFO overflow) produces an audible missing note rather than being
+    # silently retried across 8 frames.
+    a((None, "INCZ", ACNT)); a((None, "LDAZ", ACNT)); a((None, "CMP#", 1)); a((None, "BNE", "burst_done"))
     a((None, "LDA#", 0)); a((None, "STAZ", ACNT)); a((None, "INCZ", ARP))
     a(("burst_done", "RTS"))
 
