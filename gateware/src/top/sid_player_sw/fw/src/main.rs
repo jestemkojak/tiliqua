@@ -70,12 +70,10 @@ fn sid_write(reg: u8, val: u8) {
     // (~1MHz). The emulated 6502 issues writes far faster, so without this the
     // FIFO overflows and writes are silently dropped (dropped notes). Spin until
     // it can accept; we are the only writer, so `writable`==1 guarantees the
-    // write lands. Bounded so a pathological stall can never freeze the SoC
-    // (CLAUDE.md: never let the player hang) — falling back to the old drop.
-    let mut spins = 0u32;
-    while p.SID_PERIPH.txn_status().read().writable().bit_is_clear() {
-        spins += 1;
-        if spins >= 100_000 { break; }
+    // write lands. Bounded so a pathological stall can never freeze the SoC —
+    // accepting a single dropped write rather than freezing the ISR.
+    for _ in 0..100_000u32 {
+        if p.SID_PERIPH.txn_status().read().writable().bit_is_set() { break; }
     }
     p.SID_PERIPH.transaction_data().write(|w| unsafe {
         w.transaction_data().bits(player::sid_txn(reg, val))
