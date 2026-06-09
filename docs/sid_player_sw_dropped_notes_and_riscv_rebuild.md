@@ -204,7 +204,50 @@ rebuild with `--sid-model 6581` before judging its audio. Some of the "problems 
 other parts" heard on the 8580 build may be filter-model mismatch, not timing.
 (`eff%` itself is model-independent, so the speed numbers stand.)
 
-### DECISION PENDING (pick tomorrow)
+## 7. UPDATE — 2026-06-09: 4 KB build measured; cache wall is Fmax, not BRAM
+
+Committed the 2 KB variant (`tiliqua_rv32im_bigcache`, commit `1f8f4a1`), then
+built+flashed a **4 KB** experiment (32 sets × 2 ways, `--sid-model 6581`).
+
+### Full cache-scaling table (all measured on hardware)
+| cache | `eff%` | `max_dur` (sync cyc) | sync Fmax (post-route) | BRAM (DP16KD) |
+|---|---|---|---|---|
+| 512 B (orig)        | 10%      | 716k | 49.3 MHz       | 44% (25/56) |
+| 2 KB (16 sets×2)    | 19%      | 377k | **57.1 MHz**   | 66% |
+| **4 KB (32 sets×2)**| **32–33%** | **227k** | **48.2 MHz (FAIL)** | **60% (34/56)** |
+
+### Two checkpoint assumptions OVERTURNED
+1. **Scaling is NOT "diminishing returns": ~1.7× speed per cache doubling**
+   (10→19→32%). Extrapolated: 8 KB≈54%, 16 KB≈90%, ~32 KB would cross eff>100%.
+2. **BRAM is NOT the wall.** Verified in the netlist: each cache data RAM is one
+   `*_mem_symbol*` of depth = sets×line/4 bytes; at 4 KB that's 512×8 = 4 Kbit,
+   which still fits a *single* 18 Kbit DP16KD — same block count as 2 KB. Caches
+   up to 16 KB (16 Kbit < 18 Kbit) cost no extra BRAM blocks. The earlier
+   "≫56 BRAM blocks" reasoning was wrong (BRAM even went 66%→60%).
+
+### The actual wall: sync Fmax
+4 KB drops sync to **48.2 MHz**, a hard FAIL vs the mandatory 60 MHz (USB +
+PSRAM). It emits UART but is overclocked ~25% past close → not reliable. Bigger
+caches (needed for eff>100%) make Fmax strictly *worse*. **We hit the timing
+wall well before the speed wall** — so cache alone cannot be the fix, and the
+2 KB build (57 MHz, best Fmax) is the base to keep. The 4 KB experiment is being
+reverted.
+
+### Netlist cache-size verification (how to re-check any build)
+The bitstream's actual cache is provable from the netlist `top.ys` read:
+```
+grep "read_verilog  VexiiRiscv_" build/sid-player-sw-r5/top.ys   # -> hash used
+grep "LsuL1Plugin_logic_ways_0_mem \["  verilog/VexiiRiscv_<hash>.v # tag depth = #sets
+grep "LsuL1Plugin_logic_banks_0_mem_symbol0 \[" verilog/VexiiRiscv_<hash>.v # data depth
+```
+4 KB (`71ac3b8…`): tag `[0:31]` (32 sets), data `[0:511]`; 2 KB (`bb993242…`):
+tag `[0:15]` (16 sets), data `[0:255]`. ways count = `grep -c ..._ways_[0-9]+_mem`.
+
+### DECISION (settled 2026-06-09): capture + replay
+Cache is confirmed insufficient (Fmax wall). Implement **capture+replay** next;
+it fixes timing at ANY eff so the 2 KB cache's 19% is plenty. Keep 2 KB, drop 4 KB.
+
+### (original options, for reference)
 How to actually eliminate the dropped notes, given cache can't reach 100%:
 1. **Capture + replay (recommended, firmware-only):** during the ~6 ms emulation,
    buffer each SID write stamped with `cpu.cycles`; replay into the SID at correct
