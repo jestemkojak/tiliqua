@@ -291,9 +291,14 @@ class SIDPeripheral(wiring.Component):
                 m.d.sync += self.sid.bus_i.res.eq(0)
 
             m.d.sync += [
-                # maybe consume 1 transaction, set as W instead of R if nothing is pending
-                self._transactions.r_en.eq(1),
-                self.sid.bus_i.r_w_n .eq(self._transactions.level == 0),
+                # Consume 1 transaction iff the head existed AT this edge. r_en
+                # must not be asserted unconditionally: a word strobed into an
+                # empty FIFO on this same cycle becomes readable next cycle,
+                # where a blanket r_en pops it while the SID bus was already
+                # latched as a read (level was 0 here) — silently swallowing
+                # the write (~1/60 of writes; dropped SID note-ons).
+                self._transactions.r_en.eq(self._transactions.r_rdy),
+                self.sid.bus_i.r_w_n .eq(~self._transactions.r_rdy),
                 self.sid.bus_i.addr  .eq(self._transactions.r_data),
                 self.sid.bus_i.data  .eq(self._transactions.r_data >> 5),
                 # audio signals
