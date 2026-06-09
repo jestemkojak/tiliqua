@@ -206,6 +206,10 @@ class SIDPlayerSwSoc(TiliquaSoc):
         self.sid_model = kwargs.pop("sid_model", "8580")  # build-time SID chip
         _sid = self._import_sid_top()
         SIDPeripheral = _sid.SIDPeripheral
+        # Bigger L1 caches (2KB each): the software 6502 thrashes the default
+        # 512B caches against the 64KB PSRAM image -> ~10x too slow -> SID write
+        # timing smears -> dropped notes. See docs/sid_player_sw_dropped_notes_*.
+        kwargs.setdefault("cpu_variant", "tiliqua_rv32im_bigcache")
         super().__init__(finalize_csr_bridge=False, mainram_size=0x4000, **kwargs)
         self.sid_periph = SIDPeripheral(sid2_define=(self.sid_model == "8580"))
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")

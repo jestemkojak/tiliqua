@@ -48,6 +48,19 @@ CPU_VARIANTS = {
         '--fetch-l1-sets=8',
         '--fetch-l1-ways=1',
     ],
+    # Same as tiliqua_rv32im but with 4x larger L1 caches (512B -> 2KB each:
+    # 16 sets x 2 ways x 64B line). For sid_player_sw, whose software 6502
+    # emulator thrashes the 512B caches against the 64KB PSRAM tune image and
+    # the big opcode-match code, running ~10x slower than a real 1MHz 6502 and
+    # smearing SID writes across the frame (dropped notes). Risk: sync Fmax is
+    # already tight (~49MHz vs 60) and LUTs ~87% on the ECP5-25 -- measure
+    # post-build. Needs a netlist regen (see docs/sid_player_sw_dropped_notes_*).
+    "tiliqua_rv32im_bigcache": CPU_BASE + [
+        '--lsu-l1-sets=16',
+        '--lsu-l1-ways=2',
+        '--fetch-l1-sets=16',
+        '--fetch-l1-ways=2',
+    ],
     # special variant with big icache, necessary if
     # the CPU is directly fetching instructions from spiflash
     "tiliqua_rv32im_xip": CPU_BASE + [
