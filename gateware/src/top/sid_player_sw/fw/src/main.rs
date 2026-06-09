@@ -33,6 +33,7 @@ use tiliqua_hal::embedded_graphics::{
 use heapless::String;
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 use critical_section::Mutex;
 use irq::handler;
 
@@ -58,23 +59,18 @@ fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
     Ok(())
 }
 
-/// 6502 with a concrete (non-capturing) SID-write hook, so the whole CPU is a
-/// nameable type and can live in a `static` shared with the timer ISR.
-type PlayerCpu = CPU<player::PsidBus<fn(u8, u8)>, Nmos6502>;
+/// The non-generic `PsidBus` makes the whole CPU a nameable type, so it can
+/// live in a `static` shared with the timer ISR.
+type PlayerCpu = CPU<player::PsidBus, Nmos6502>;
 
-/// Write one SID register via the SIDPeripheral CSR. Non-capturing so it works
-/// as a plain `fn` pointer; steals SID_PERIPH (effectively a single owner).
+/// Write one SID register via the SIDPeripheral CSR. Steals SID_PERIPH
+/// (effectively a single owner).
 fn sid_write(reg: u8, val: u8) {
+    // NOTE: no FIFO backpressure here, and it still can't overflow. Replay paces
+    // PLAY-frame writes at their real 1MHz cycle spacing (see play_tick), and INIT
+    // drains its setup burst into the depth-16 FIFO that empties at 1MHz — with the
+    // ≤16-deep same-stamp bursts real tunes produce, the FIFO never builds up.
     let p = unsafe { pac::Peripherals::steal() };
-    // Backpressure: the gateware transaction FIFO drains ~1 entry per phi2
-    // (~1MHz). The emulated 6502 issues writes far faster, so without this the
-    // FIFO overflows and writes are silently dropped (dropped notes). Spin until
-    // it can accept; we are the only writer, so `writable`==1 guarantees the
-    // write lands. Bounded so a pathological stall can never freeze the SoC —
-    // accepting a single dropped write rather than freezing the ISR.
-    for _ in 0..100_000u32 {
-        if p.SID_PERIPH.txn_status().read().writable().bit_is_set() { break; }
-    }
     p.SID_PERIPH.transaction_data().write(|w| unsafe {
         w.transaction_data().bits(player::sid_txn(reg, val))
     });
@@ -89,6 +85,14 @@ fn output_mute(mute: bool) {
     p.PMOD0_PERIPH.flags().write(|w| w.mute().bit(mute));
 }
 
+/// Drain captured writes straight to the SID, unpaced, then clear the buffer.
+/// Used after INIT (one-shot setup: volume, filter) — tunes that set $D418 only
+/// in INIT would otherwise be silent. The depth-16 FIFO absorbs the burst.
+fn drain_sid_writes(bus: &mut player::PsidBus) {
+    for w in bus.writes.iter() { sid_write(w.reg, w.val); }
+    bus.writes.clear();
+}
+
 /// Playback state driven by the TIMER0 interrupt at the tune's play rate.
 struct Playback {
     cpu: PlayerCpu,
@@ -98,17 +102,94 @@ struct Playback {
 
 static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
 
+/// DIAGNOSTIC (running peaks/totals; UI loop emits over UART). Measures whether
+/// the emulator runs faster or slower than a real 1MHz 6502 — the deciding factor
+/// for whether cycle-accurate pacing is feasible:
+///   PLAY_MAX_DUR  — worst PLAY-frame wall-clock (sync/60MHz cycles).
+///   PLAY_CPU_CYC  — 6502 cycles that same frame ran (cpu.cycles delta).
+///     effective MHz = PLAY_CPU_CYC / (PLAY_MAX_DUR/60). <1 => slower than 1MHz.
+///   PLAY_OVERRUN  — frames whose emulation exceeded the play period (tick lost).
+///   PLAY_CALL_BAD — `call()` overran max_steps (emulator stuck on an opcode).
+///   PLAY_MIN_DUR  — best PLAY-frame wall-clock (dur now includes replay time);
+///     min/max together measure replay-anchor jitter on hardware.
+///   PLAY_REPLAY_BAIL — frames whose replay crossed the period boundary (writes
+///     issued unpaced from there on; relative spacing lost for that frame).
+///   PLAY_DROPS    — cumulative SID writes lost to a full capture buffer.
+static PLAY_MAX_DUR:     AtomicU32 = AtomicU32::new(0);
+static PLAY_MIN_DUR:     AtomicU32 = AtomicU32::new(u32::MAX);
+static PLAY_CPU_CYC:     AtomicU32 = AtomicU32::new(0);
+static PLAY_OVERRUN:     AtomicU32 = AtomicU32::new(0);
+static PLAY_CALL_BAD:    AtomicU32 = AtomicU32::new(0);
+static PLAY_REPLAY_BAIL: AtomicU32 = AtomicU32::new(0);
+static PLAY_DROPS:       AtomicU32 = AtomicU32::new(0);
+
 /// TIMER0 ISR body: run one PLAY frame on the software 6502. Real-time work
 /// lives here (not the UI loop) so menu redraws can never starve the audio.
 fn play_tick() {
-    critical_section::with(|cs| {
+    // DIAGNOSTIC: time the emulated frame against the play period (Timer0 is a
+    // periodic down-counter reloaded to play_period each tick).
+    let timer = unsafe { Timer0::summon() };
+    let c_start = timer.counter();
+    let dcyc: u32 = critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
         if let Some(pb) = g.as_mut() {
             if !pb.paused && pb.play_addr != 0 {
-                player::call(&mut pb.cpu, pb.play_addr, 2_000_000);
+                let c0 = pb.cpu.cycles;
+                if !player::call(&mut pb.cpu, pb.play_addr, 2_000_000) {
+                    PLAY_CALL_BAD.store(PLAY_CALL_BAD.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                }
+                // Replay the captured frame at the SID's real 1MHz spacing: the
+                // emulator stretched inter-write gaps ~5x, breaking envelopes.
+                // Anchor at NOW (after emulation), so spacing is preserved no
+                // matter how long the emulation took. Timer0 is a down-counter;
+                // 1 emulated 6502 cycle = 60 sync ticks. elapsed = t0 - c.
+                let t0 = timer.counter();
+                let mut bailed = false;
+                for w in pb.cpu.memory.writes.iter() {
+                    if !bailed {
+                        let target = w.cycle * 60; // sync ticks since frame start
+                        loop {
+                            let c = timer.counter();
+                            if c > t0 {
+                                // Counter reloaded: we crossed the period boundary.
+                                // t0 - c would underflow — bail: issue this and all
+                                // remaining writes immediately (unpaced) so none are
+                                // lost, and stop spinning for the rest of the frame.
+                                PLAY_REPLAY_BAIL.store(
+                                    PLAY_REPLAY_BAIL.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                                bailed = true;
+                                break;
+                            }
+                            if t0 - c >= target { break; }
+                        }
+                    }
+                    sid_write(w.reg, w.val);
+                }
+                PLAY_DROPS.store(pb.cpu.memory.dropped, Ordering::Relaxed);
+                return (pb.cpu.cycles - c0) as u32; // 6502 cycles this frame ran
             }
         }
+        0
     });
+    let c_end = timer.counter();
+    // Counter went UP => it hit 0 and reloaded mid-frame => emulation took longer
+    // than the play period (the next tick can be coalesced => a skipped PLAY
+    // frame => a dropped note). Otherwise c_start - c_end is this frame's time;
+    // pair it with the 6502-cycle count to get the effective emulation MHz.
+    if c_end > c_start {
+        PLAY_OVERRUN.store(PLAY_OVERRUN.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    } else {
+        let dur = c_start - c_end; // now includes replay time (budget must cover it)
+        if dur > PLAY_MAX_DUR.load(Ordering::Relaxed) {
+            PLAY_MAX_DUR.store(dur, Ordering::Relaxed);
+            PLAY_CPU_CYC.store(dcyc, Ordering::Relaxed);
+        }
+        // Min only over frames that actually ran PLAY — paused/idle ISR passes
+        // would otherwise drive it to ~0 and hide the real jitter spread.
+        if dcyc > 0 && dur < PLAY_MIN_DUR.load(Ordering::Relaxed) {
+            PLAY_MIN_DUR.store(dur, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Load a tune+subtune into the shared CPU and run INIT, under a critical
@@ -126,6 +207,7 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
         }
         pb.cpu.registers.stack_pointer.0 = 0xFD;
         player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000);
+        drain_sid_writes(&mut pb.cpu.memory); // INIT setup (volume/filter) -> SID now
         let cia = (pb.cpu.memory.mem[0xDC04] as u16) | ((pb.cpu.memory.mem[0xDC05] as u16) << 8);
         period = Some(psid::play_period_cycles(
             CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(subtune), cia) as u64);
@@ -287,18 +369,19 @@ fn main() -> ! {
 
     // --- Construct software 6502 CPU over the 64KB PSRAM image -----------
     // The RISC-V is the only master of this PSRAM window, so no cache thrashing
-    // or coherency hacks are needed. The SID-write hook is a plain fn pointer
-    // (not a capturing closure) so the CPU is a nameable type shareable with
-    // the timer ISR.
+    // or coherency hacks are needed. The non-generic PsidBus makes the CPU a
+    // nameable type shareable with the timer ISR; its `writes` Vec captures each
+    // frame's SID writes for paced replay (see play_tick).
     let image: &'static mut [u8; 0x10000] =
         unsafe { &mut *(0x2080_0000 as *mut [u8; 0x10000]) };
     let mut cpu: PlayerCpu =
-        CPU::new(player::PsidBus { mem: image, on_sid_write: sid_write as fn(u8, u8) }, Nmos6502);
+        CPU::new(player::PsidBus { mem: image, writes: heapless::Vec::new(), dropped: 0 }, Nmos6502);
     cpu.registers.stack_pointer.0 = 0xFD;
 
     // Load initial tune and run INIT (hdr already validated/parsed above).
     let _ = load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
     player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+    drain_sid_writes(&mut cpu.memory); // INIT setup (volume/filter) -> SID now
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
     let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia);
     info!("play rate: clock={:?} cia={} timer={:#x} period={} ({} Hz)",
@@ -327,6 +410,7 @@ fn main() -> ! {
     let mut selected: usize = 0;
     let mut modify   = false;
     let mut browse_idx: usize = 0;
+    let mut dbg_div: u32 = 0; // DIAGNOSTIC: throttles the PLAY-timing UART line
 
     // Scope-card state (mirrors the initial scope/persist config above).
     let mut decay: u8     = 10;   // persistence 1..80
@@ -345,6 +429,25 @@ fn main() -> ! {
 
         loop {
             encoder.update();
+
+            // DIAGNOSTIC (throttled; UART is blocking so it stays out of the ISR):
+            // dump the PLAY frame-timing peaks/totals (cumulative, never reset) —
+            // dur min..max bounds the replay-anchor jitter, drops/bail must stay 0.
+            dbg_div = dbg_div.wrapping_add(1);
+            if dbg_div % 64 == 0 {
+                let dur  = PLAY_MAX_DUR.load(Ordering::Relaxed);
+                let mn   = PLAY_MIN_DUR.load(Ordering::Relaxed);
+                let cyc  = PLAY_CPU_CYC.load(Ordering::Relaxed);
+                let ovr  = PLAY_OVERRUN.load(Ordering::Relaxed);
+                let bad  = PLAY_CALL_BAD.load(Ordering::Relaxed);
+                let drp  = PLAY_DROPS.load(Ordering::Relaxed);
+                let bail = PLAY_REPLAY_BAIL.load(Ordering::Relaxed);
+                // eff%: 6502 cycles vs the phi2 cycles (dur/60) that frame took.
+                // 100 = exactly 1MHz; <100 = slower than a real 6502.
+                let effpct = if dur != 0 { (cyc as u64 * 60 * 100 / dur as u64) as u32 } else { 0 };
+                info!("PLAY dur={}..{} cpu_cyc={} eff={}% period={} overrun={} stuck={} drops={} bail={}",
+                      mn, dur, cyc, effpct, play_period, ovr, bad, drp, bail);
+            }
 
             // -- Hot-plug --
             if playing_fallback && msc.ready() {
