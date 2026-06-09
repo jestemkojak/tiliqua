@@ -1,7 +1,11 @@
 # sid_player_sw dropped notes — investigation, root cause, and the RISC-V (VexiiRiscv) rebuild setup
 
-Status: 2026-06-08. Root cause found and verified. Fix (bigger CPU caches) in
-progress; netlist-regen toolchain via podman is derisked and documented below.
+Status: 2026-06-10. **ACTUAL root cause found and fixed in gateware (§9):** the
+SIDPeripheral transaction FIFO silently swallowed writes strobed on the
+phi2_edge cycle (~1/60 of all writes). The earlier "emulator too slow → write
+timing stretched" theory (§3) explained the symptoms but its fixes (cache,
+capture+replay) never cured them — because the writes were being *lost*, not
+mistimed. §§3–8 kept for the record; netlist-regen toolchain doc (§5) stands.
 
 ---
 
@@ -428,6 +432,65 @@ How to actually eliminate the dropped notes, given cache can't reach 100%:
 **NEXT:** implement §8 capture+replay (busy-wait pacing, with the review fixes
 folded in above: INIT drain, timer-wrap bail-out, CAP=256, jitter measurement).
 TDD the host-testable capture/stamping in player.rs first.
+
+## 9. THE ACTUAL ROOT CAUSE (2026-06-10): SIDPeripheral swallowed-write race
+
+After 418fbd2 (cycle-faithful capture+replay, all delivery counters clean)
+notes STILL dropped — timing was exhausted as a cause. The remaining
+unvalidated segments were write *content* (mos6502 emulation) and the
+gateware SID path. Reviewing `SIDPeripheral.elaborate` (src/top/sid/top.py)
+found a race in the transaction-FIFO drain:
+
+```python
+with m.If(phi2_edge):                      # cycle T
+    m.d.sync += [
+        self._transactions.r_en.eq(1),     # BUG: unconditional
+        self.sid.bus_i.r_w_n.eq(self._transactions.level == 0),
+        self.sid.bus_i.addr.eq(self._transactions.r_data), ...
+```
+
+If a write strobes into an **empty** FIFO on the same cycle as `phi2_edge`:
+`level` is still 0 at T, so the SID bus is latched as a READ (garbage addr) —
+but the word becomes `r_rdy` at T+1, where the blanket `r_en=1` **pops it**.
+The transaction is consumed without ever being presented to the SID. No
+overflow, no level excursion, no diagnostic. (amaranth `SyncFIFO`: comb read
+port, 1-cycle write→read latency; pop = `r_rdy & r_en`.)
+
+### Why it fits every observation
+- During playback the emulator is *slower* than the 1-per-phi2 drain, so
+  essentially every write lands in an empty FIFO at an arbitrary divider
+  phase → **~1/60 of SID writes silently lost** at random.
+- A lost gate-on write = an envelope that never opens = a dropped note,
+  **pre-filter** — exactly the §2 voice-scope observation.
+- Measured FIFO `max_level=0/16` (the §2 "ruled out overflow" data): consistent
+  — the loss was never about occupancy.
+- Every firmware delivery change (backpressure, capture+replay, fixed-offset
+  anchor) re-rolled write arrival *phases* → drop pattern changed ("loses
+  notes, differently") but never went away.
+- The gateware `sid_player`'s 6502 is clocked off the same divider (fixed
+  write phase) and the MIDI SID synth writes sparsely — neither shows it the
+  same way.
+
+### Evidence, fix, regression test (commit 708cb20)
+- `tests/test_sid_periph.py` sweeps a one-shot write strobe across all 60
+  divider phases into an empty FIFO and requires each to appear on the SID bus
+  as a write cycle. **Before the fix exactly phase 59 (phi2_edge) swallowed
+  the write**; 59/60 delivered.
+- Fix: gate the pop and the R/W decision on `r_rdy` *sampled at the edge*:
+  `r_en.eq(self._transactions.r_rdy)`, `r_w_n.eq(~self._transactions.r_rdy)`.
+  A word arriving on the edge cycle now simply waits one phi2.
+- Full suite 116/116 passed.
+
+### Follow-ups after HW verification
+- Listen test: Commando + stress tunes; voice-scope envelopes should appear on
+  every trigger. Diagnostics should stay drops=0 bail=0 late=0 overrun=0.
+- The §8 capture+replay machinery may no longer be strictly necessary (the §3
+  "stretched timing breaks envelopes" mechanism was never actually proven —
+  the lost writes explain the symptoms on their own). It is still more
+  faithful to real-C64 delivery; keep it, but it could be simplified if ever
+  needed. Strip the bring-up diagnostics once HW-verified.
+- This bug affected ALL users of the shared FIFO path (sid MIDI synth,
+  sid_player ext path): rare hung/missing notes there should also disappear.
 
 ### To resume / rebuild (remember the shim + 6581!)
 ```bash
