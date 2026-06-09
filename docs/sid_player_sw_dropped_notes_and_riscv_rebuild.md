@@ -288,12 +288,20 @@ are accessible. So:
 - Replace `PsidBus<F: FnMut(u8,u8)>` (closure hook) with a **non-generic**
   `PsidBus` owning:
   ```rust
-  pub struct SidWrite { pub cycle: u32, pub reg: u8, pub val: u8 }
+  pub struct SidWrite { pub cycle: u32, pub reg: u8, pub val: u8 }   // 8 B after align
   pub struct PsidBus {
       pub mem: &'static mut [u8; 0x10000],
-      pub writes: heapless::Vec<SidWrite, CAP>,   // CAP ~512 (measured max ~160/frame)
+      pub writes: heapless::Vec<SidWrite, CAP>,   // CAP = 256 (measured max ~160/frame)
   }
   ```
+  **CAP = 256, not 512.** The buffer lives in the `PLAYBACK` static → blockram
+  BSS. Verified in the built ELF: real `.bss` is 28 B and `.stack` is auto-sized
+  to the *remaining* blockram (~16.2 KB of the 16 KB region; `SidList`, name
+  strings etc. are stack locals in `main`, and there is no stack guard — overflow
+  is silent corruption). 512×8 B = 4 KB would silently shrink the stack to
+  ~12 KB; 256 (2 KB) still has 60% headroom over the measured 160/frame peak.
+  Do NOT shrink `SidWrite` with `#[repr(packed)]` — misaligned u32 loads can
+  trap on this core; if CAP must grow, split into parallel arrays instead.
   Bonus: dropping the generic **simplifies the `static` CPU type** in main.rs —
   no more `fn(u8,u8)` workaround (that workaround existed only to make the type
   nameable). `PlayerCpu = CPU<PsidBus, Nmos6502>`.
@@ -302,9 +310,26 @@ are accessible. So:
 - `call()`: latch `c0` at entry; clear `bus.writes`; after each `single_step()`,
   stamp entries `[last..len]` with `(cpu.cycles - c0) as u32`. (Keep the RTS
   sentinel + max_steps loop as-is.)
-- Overflow policy: fixed CAP, drop on overflow (measured peak ~160 ≪ 512; a
-  pathological tune dropping a few writes is better than alloc/panic). Optionally
-  count drops in a diagnostic.
+- Overflow policy: fixed CAP, drop on overflow (a pathological tune dropping a
+  few writes is better than alloc/panic). The drop counter diagnostic is
+  **mandatory during bring-up**, not optional — it is the only HW-visible signal
+  for both buffer-overflow and the INIT-drain issue below. Note the drop hits
+  the *tail* of the burst, which is where note-on gate writes tend to be —
+  i.e. an overflow reproduces exactly the dropped-note symptom.
+
+### INIT writes MUST be drained explicitly (regression trap)
+Under the old closure hook, `init()`'s SID writes reached the chip immediately —
+and tunes routinely set master volume (`$D418`), filter and initial waveforms
+*only* in INIT. Under this design they land in `bus.writes`, and the next
+`play_tick`'s `call()` **clears the buffer at entry** → INIT writes silently
+lost → tune plays silent/wrong-timbre (a worse regression than the bug being
+fixed). Fix: after `init()` returns — in `reload_tune()` AND the boot path in
+`main()` — drain `bus.writes` straight through `sid_write` *unpaced* (INIT is
+one-shot setup; immediate delivery is exactly the pre-§8 behavior, pacing
+irrelevant). Also: INIT bursts can far exceed a PLAY frame (inits commonly
+clear all 25 registers several times), so CAP overflow during INIT can eat the
+tail — where the volume write often sits. Add a host test counting INIT writes
+across the test corpus to confirm CAP covers it.
 
 ### Replay (main.rs ISR) — pacing decision PENDING (asked user)
 Candidates (see AskUserQuestion 2026-06-09):
@@ -314,7 +339,19 @@ Candidates (see AskUserQuestion 2026-06-09):
    issue `sid_write(reg,val)`. Anchoring at *replay start* (not frame start)
    preserves relative spacing despite the ~6 ms emulation lead. Adds ~1.25 ms to
    the ISR (≪ 20 ms vblank; scales down for CIA multispeed: less work/sub-frame).
-   Firmware-only, simplest.
+   Firmware-only, simplest. Two corrections to this scheme (from design review):
+   - **Timer-wrap bail-out is required.** The math is unsigned on a down-counter
+     that *reloads at the period boundary*: if replay crosses it (overrun),
+     elapsed wraps huge → every remaining write flushes instantly AND the
+     overrun accounting is confused. Detect `Timer0.counter() > T_start` →
+     flush the rest immediately, bump a counter, break.
+   - **Anchor jitter — measure it.** Anchoring at end-of-emulation makes
+     inter-frame write spacing `period + (emu_N+1 − emu_N)`. Hard-restart /
+     test-bit sequences span 2–3 frames and see that jitter directly. We only
+     record `max_dur` today — no variance data — so "emulation time is stable
+     per-tune" is an assumption. During bring-up log min/typ/max dur; if
+     variance is audible, anchor at `tick + fixed_offset` (offset = emu budget)
+     for tunes where it fits instead.
 2. Second hardware timer ISR to pop writes — more moving parts, no real benefit
    (UI is best-effort; the main ISR may block).
 3. Gateware timestamped-write FIFO (push `(stamp,reg,val)`, drains at phi2
@@ -322,10 +359,17 @@ Candidates (see AskUserQuestion 2026-06-09):
    rebuild (NOT firmware-only).
 
 ### Feasibility check (both rate classes)
+- The budget condition (replay adds the *real burst length* on top of emulation):
+  `cpu_cyc × (1/eff + 1) ≤ period` — i.e. at eff=19%, a frame's burst must be
+  ≤ period/6.26.
 - vblank (~20 ms period): emulate ~6 ms + replay ~1.25 ms ≈ 7.5 ms ISR ≪ 20 ms.
 - CIA multispeed (e.g. 200 Hz, 5 ms): each sub-frame does ~¼ work → emulate
   ~1.5 ms + replay ~0.3 ms ≈ 1.8 ms ≪ 5 ms. Replay span = frame's cpu_cycles ×
   1 µs, which equals the real sub-frame burst length → correct.
+  ⚠️ The "~¼ work per sub-frame" is an *average* and unverified — multispeed
+  tunes commonly do uneven work per tick (music update on tick 0, effects on
+  the rest), so per-tick overruns can hide under a fine-looking average. Keep
+  `PLAY_OVERRUN` live through bring-up; it catches exactly this.
 
 ### TDD split
 - **Host-testable (do first, TDD):** after a PLAY frame, `bus.writes` holds the
@@ -333,14 +377,27 @@ Candidates (see AskUserQuestion 2026-06-09):
   non-decreasing** `cycle` stamps, first stamp ≥0, last ≤ frame cpu_cyc. Adapt the
   existing closure-based tests (`init_writes_sid_via_hook`,
   `commando_writes_per_frame`) to read `bus.writes`.
+  Monotonicity alone is weak — add a **stamp-delta test**: a hand-assembled
+  snippet (`STA $D404` / known-cycle delay, e.g. a few `NOP`s / `STA $D404`)
+  asserting the stamp *difference* equals the computed cycle distance. That
+  relative spacing is the property the whole fix rests on.
+  Also: an INIT-write-count test over the test corpus (CAP coverage, see the
+  INIT-drain section above).
 - **Hardware-only:** replay pacing (Timer0 busy-wait) — verify on HW that Commando's
   dropped notes return and voice-scope envelopes appear.
 
 ### Risks / watch-items
 - Removing the `FnMut` generic touches `call()`, `init()`, the `static`
   `PlayerCpu` type, and `reload_tune()` — recompile host tests + firmware.
+  `reload_tune()` and the boot path additionally gain the INIT drain (above) —
+  there are TWO `init()` call sites; drain after both.
 - The current diagnostic ISR (`PLAY_*` + eff line) can stay during bring-up to
-  confirm replay doesn't blow the frame budget (watch `overrun`).
+  confirm replay doesn't blow the frame budget (watch `overrun`); extend it
+  with min/typ dur (anchor-jitter measurement) + the buffer-drop and
+  replay-bail counters.
+- The replay spin loop executes from PSRAM (`REGION_TEXT = psram`); a one-off
+  I-cache miss mid-replay is ~10 µs of timing error on a single write. Bounded
+  and likely inaudible — keep the loop tiny so it stays cached.
 - `heapless` is already a firmware dep (used for `String`); reuse it for the Vec.
 
 ### (original options, for reference)
@@ -368,8 +425,9 @@ How to actually eliminate the dropped notes, given cache can't reach 100%:
   `TxnStatus` CSR (in `top/sid/top.py`) is still present (harmless) — revert later.
 - this doc (§8 capture+replay design, this update).
 
-**NEXT:** implement §8 capture+replay (pacing mechanism pending user pick; busy-wait
-recommended). TDD the host-testable capture/stamping in player.rs first.
+**NEXT:** implement §8 capture+replay (busy-wait pacing, with the review fixes
+folded in above: INIT drain, timer-wrap bail-out, CAP=256, jitter measurement).
+TDD the host-testable capture/stamping in player.rs first.
 
 ### To resume / rebuild (remember the shim + 6581!)
 ```bash
