@@ -247,6 +247,102 @@ tag `[0:15]` (16 sets), data `[0:255]`. ways count = `grep -c ..._ways_[0-9]+_me
 Cache is confirmed insufficient (Fmax wall). Implement **capture+replay** next;
 it fixes timing at ANY eff so the 2 KB cache's 19% is plenty. Keep 2 KB, drop 4 KB.
 
+---
+
+## 8. CAPTURE + REPLAY — design (2026-06-09, before implementation)
+
+### The problem this fixes (precise statement)
+reSID is clocked at a real 1 MHz (phi2 = sync/60) continuously. The software
+6502 emits a PLAY frame's SID writes over ~6 ms wall-clock (eff≈19% on the 2 KB
+build) instead of the real ~1.25 ms. Because reSID keeps advancing at 1 MHz, the
+*inter-write spacing as reSID sees it* is stretched ~5×, which breaks SID
+envelope-trigger / hard-restart timing → note-ons never attack → silent + flat on
+the voice scope. We cannot slow reSID per-frame from firmware (it's fixed-rate
+gateware). So: **decouple delivery from emulation** — capture the frame's writes
+with their 6502-cycle stamps, then replay them into the SID at the correct
+*relative* 1 MHz spacing.
+
+### Why "relative" spacing is sufficient (and what real HW does)
+A real C64 emits a frame's writes in a tight burst (~1.25 ms for vblank), then is
+silent until the next frame (~20 ms later): burst, gap, burst, gap. reSID only
+cares about the spacing *between* writes. So reproducing each burst with correct
+internal 1 MHz spacing, separated by the (rock-solid TIMER0) frame period, matches
+the hardware stimulus. Absolute phase within the frame is irrelevant to timbre.
+
+### Stamping mechanism (the key constraint)
+The SID write is detected inside `PsidBus::set_byte` ($D400–$D41F), **mid 6502
+instruction**, where `cpu.cycles` is NOT visible (the bus is owned by the CPU; it
+can't see the cycle counter). BUT `call()` already single-steps, and after each
+`single_step()` both `cpu.cycles` and `cpu.memory` (the bus, holding the buffer)
+are accessible. So:
+- The bus pushes `(reg, val)` into a **fixed capture buffer it owns** (no stamp yet).
+- After each `single_step()`, `call()` stamps any newly-pushed entries with the
+  current **frame-relative** `cpu.cycles` (i.e. `cpu.cycles - c0`, c0 latched at
+  frame start). Per-instruction granularity (2–7 cycles) is plenty — SID writes
+  that matter for envelopes are ≥1 instruction apart; multiple writes within one
+  instruction keep buffer order and share a stamp (fine).
+- Stamps are **frame-relative u32** (cpu.cycles is absolute/cumulative across
+  frames — must subtract c0).
+
+### Data-structure / type changes (player.rs)
+- Replace `PsidBus<F: FnMut(u8,u8)>` (closure hook) with a **non-generic**
+  `PsidBus` owning:
+  ```rust
+  pub struct SidWrite { pub cycle: u32, pub reg: u8, pub val: u8 }
+  pub struct PsidBus {
+      pub mem: &'static mut [u8; 0x10000],
+      pub writes: heapless::Vec<SidWrite, CAP>,   // CAP ~512 (measured max ~160/frame)
+  }
+  ```
+  Bonus: dropping the generic **simplifies the `static` CPU type** in main.rs —
+  no more `fn(u8,u8)` workaround (that workaround existed only to make the type
+  nameable). `PlayerCpu = CPU<PsidBus, Nmos6502>`.
+- `set_byte`: on a $D4xx write, `self.writes.push(SidWrite{cycle:0,reg,val})`
+  (ignore push error = buffer full → drop, see overflow policy). Else write mem.
+- `call()`: latch `c0` at entry; clear `bus.writes`; after each `single_step()`,
+  stamp entries `[last..len]` with `(cpu.cycles - c0) as u32`. (Keep the RTS
+  sentinel + max_steps loop as-is.)
+- Overflow policy: fixed CAP, drop on overflow (measured peak ~160 ≪ 512; a
+  pathological tune dropping a few writes is better than alloc/panic). Optionally
+  count drops in a diagnostic.
+
+### Replay (main.rs ISR) — pacing decision PENDING (asked user)
+Candidates (see AskUserQuestion 2026-06-09):
+1. **Busy-wait in ISR (recommended):** after `call()`, latch `T_start =
+   Timer0.counter()`; for each buffered write, spin until
+   `(T_start - Timer0.counter()) >= write.cycle * 60` (60 sync per phi2), then
+   issue `sid_write(reg,val)`. Anchoring at *replay start* (not frame start)
+   preserves relative spacing despite the ~6 ms emulation lead. Adds ~1.25 ms to
+   the ISR (≪ 20 ms vblank; scales down for CIA multispeed: less work/sub-frame).
+   Firmware-only, simplest.
+2. Second hardware timer ISR to pop writes — more moving parts, no real benefit
+   (UI is best-effort; the main ISR may block).
+3. Gateware timestamped-write FIFO (push `(stamp,reg,val)`, drains at phi2
+   offsets) — most accurate/lowest jitter, but needs Amaranth + PAC changes +
+   rebuild (NOT firmware-only).
+
+### Feasibility check (both rate classes)
+- vblank (~20 ms period): emulate ~6 ms + replay ~1.25 ms ≈ 7.5 ms ISR ≪ 20 ms.
+- CIA multispeed (e.g. 200 Hz, 5 ms): each sub-frame does ~¼ work → emulate
+  ~1.5 ms + replay ~0.3 ms ≈ 1.8 ms ≪ 5 ms. Replay span = frame's cpu_cycles ×
+  1 µs, which equals the real sub-frame burst length → correct.
+
+### TDD split
+- **Host-testable (do first, TDD):** after a PLAY frame, `bus.writes` holds the
+  same `(reg,val)` sequence/order the old closure saw, with **monotonic
+  non-decreasing** `cycle` stamps, first stamp ≥0, last ≤ frame cpu_cyc. Adapt the
+  existing closure-based tests (`init_writes_sid_via_hook`,
+  `commando_writes_per_frame`) to read `bus.writes`.
+- **Hardware-only:** replay pacing (Timer0 busy-wait) — verify on HW that Commando's
+  dropped notes return and voice-scope envelopes appear.
+
+### Risks / watch-items
+- Removing the `FnMut` generic touches `call()`, `init()`, the `static`
+  `PlayerCpu` type, and `reload_tune()` — recompile host tests + firmware.
+- The current diagnostic ISR (`PLAY_*` + eff line) can stay during bring-up to
+  confirm replay doesn't blow the frame budget (watch `overrun`).
+- `heapless` is already a firmware dep (used for `String`); reuse it for the Vec.
+
 ### (original options, for reference)
 How to actually eliminate the dropped notes, given cache can't reach 100%:
 1. **Capture + replay (recommended, firmware-only):** during the ~6 ms emulation,
@@ -259,17 +355,21 @@ How to actually eliminate the dropped notes, given cache can't reach 100%:
 3. **Firmware hot-RAM split:** zero-page/stack (+ emulator hot code) into fast
    blockram for more raw speed; uncertain, more invasive than replay.
 
-### Working-tree state (UNCOMMITTED — all intentional, nothing committed yet)
-- `gateware/src/vendor/vexiiriscv/vexiiriscv.py` — added `tiliqua_rv32im_bigcache`
-  variant (2 KB I+D).
-- `gateware/src/top/sid_player_sw/top.py` — `kwargs.setdefault("cpu_variant",
-  "tiliqua_rv32im_bigcache")`.
+### Working-tree state (2026-06-09)
+**Committed:**
+- `1f8f4a1` — 2 KB cache: `tiliqua_rv32im_bigcache` variant (vexiiriscv.py),
+  top.py wiring, the `bb993242` netlist, and this doc.
+- `739fd52` — this doc's §7 (4 KB result; 4 KB experiment reverted, netlist deleted).
+
+**Uncommitted (intentional):**
 - `gateware/src/top/sid_player_sw/fw/src/main.rs` — diagnostic instrumentation
   (`PLAY_MAX_DUR/CPU_CYC/OVERRUN/CALL_BAD` + throttled UART `eff%` line);
-  backpressure spin REMOVED from `sid_write` (it was a proven no-op). The gateware
+  backpressure spin REMOVED from `sid_write` (proven no-op). The gateware
   `TxnStatus` CSR (in `top/sid/top.py`) is still present (harmless) — revert later.
-- untracked: this doc; `verilog/VexiiRiscv_bb993242….v` (the generated 2 KB netlist
-  — keep, it's what the bigcache build uses).
+- this doc (§8 capture+replay design, this update).
+
+**NEXT:** implement §8 capture+replay (pacing mechanism pending user pick; busy-wait
+recommended). TDD the host-testable capture/stamping in player.rs first.
 
 ### To resume / rebuild (remember the shim + 6581!)
 ```bash
