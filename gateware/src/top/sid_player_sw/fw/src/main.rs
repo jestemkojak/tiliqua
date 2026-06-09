@@ -67,9 +67,9 @@ type PlayerCpu = CPU<player::PsidBus, Nmos6502>;
 /// (effectively a single owner).
 fn sid_write(reg: u8, val: u8) {
     // NOTE: no FIFO backpressure here, and it still can't overflow. Replay paces
-    // PLAY-frame writes at their real 1MHz cycle spacing (see play_tick), and INIT
-    // drains its setup burst into the depth-16 FIFO that empties at 1MHz — with the
-    // ≤16-deep same-stamp bursts real tunes produce, the FIFO never builds up.
+    // PLAY-frame writes at their real 1MHz cycle spacing (see play_tick), matching
+    // the FIFO's 1-per-phi2 drain; same-stamp bursts are ≤16 deep. INIT bursts can
+    // exceed depth-16, so drain_sid_writes adds its own backpressure.
     let p = unsafe { pac::Peripherals::steal() };
     p.SID_PERIPH.transaction_data().write(|w| unsafe {
         w.transaction_data().bits(player::sid_txn(reg, val))
@@ -85,11 +85,21 @@ fn output_mute(mute: bool) {
     p.PMOD0_PERIPH.flags().write(|w| w.mute().bit(mute));
 }
 
-/// Drain captured writes straight to the SID, unpaced, then clear the buffer.
-/// Used after INIT (one-shot setup: volume, filter) — tunes that set $D418 only
-/// in INIT would otherwise be silent. The depth-16 FIFO absorbs the burst.
+/// Drain captured writes straight to the SID, then clear the buffer. Used after
+/// INIT (one-shot setup: volume, filter) — tunes that set $D418 only in INIT
+/// would otherwise be silent. INIT bursts can exceed the depth-16 FIFO (register
+/// clears run 25+ writes back-to-back), so poll `writable` before each write;
+/// bounded so a hardware fault can't wedge the caller (falls back to dropping).
 fn drain_sid_writes(bus: &mut player::PsidBus) {
-    for w in bus.writes.iter() { sid_write(w.reg, w.val); }
+    let p = unsafe { pac::Peripherals::steal() };
+    for w in bus.writes.iter() {
+        let mut spins = 0u32;
+        while p.SID_PERIPH.txn_status().read().writable().bit_is_clear() {
+            spins += 1;
+            if spins >= 100_000 { break; }
+        }
+        sid_write(w.reg, w.val);
+    }
     bus.writes.clear();
 }
 
