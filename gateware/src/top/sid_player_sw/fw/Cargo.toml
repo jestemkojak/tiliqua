@@ -9,7 +9,11 @@ tiliqua-lib = { path = "../../../rs/lib" }
 opts = { path = "../../../rs/opts" }
 tiliqua-pac = { path="../pac", default-features = false, features = ["critical-section", "vexriscv"] }
 
-log = "0.4.17"
+# release_max_level_info: compile debug!/trace! to nothing in release builds —
+# mos6502 emits a debug! per emulated instruction, and even runtime-filtered it
+# costs a max_level() load+branch in the hottest loop in the system (§2b of
+# docs/sid_player_sw_perf_review.md).
+log = { version = "0.4.17", features = ["release_max_level_info"] }
 embedded-hal = "=1.0.0"
 riscv = { version = "=0.11.1", features = ["critical-section-single-hart"] }
 riscv-rt = { version = "=0.12.2", features = ["single-hart"] }
