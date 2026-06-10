@@ -323,7 +323,10 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # dot-clouds. A cheap multi-pole leaky integrator (adders/shifts only)
         # band-limits them enough to draw clean lines. This is on the SCOPE
         # BRANCH ONLY — the audio outputs above keep reading raw voiceN_dca.
-        m.submodules.voice_smooth = voice_smooth = VoiceSmoother(n_channels=4, k=7, poles=4)
+        # 3 channels: only the raw voice taps need smoothing — the mix (scope
+        # ch3) is already band-limited by AudioDecimator and is fed to the
+        # plot_fifo directly from i_cal.
+        m.submodules.voice_smooth = voice_smooth = VoiceSmoother(n_channels=3, k=7, poles=4)
         m.d.comb += [
             voice_smooth.strobe.eq(self.sid_periph.audio_strobe),
             voice_smooth.i[0].eq(sid.voice0_dca),
