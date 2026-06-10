@@ -147,6 +147,11 @@ static PLAY_DROPS:       AtomicU32 = AtomicU32::new(0);
 /// anchor offset is derived from it. Written via `set_play_period` only.
 static PLAY_PERIOD: AtomicU32 = AtomicU32::new(0);
 
+/// Play ticks since boot (ISR-incremented; wraps). The UI loop divides by
+/// play_hz to pace repaints — blits are PSRAM traffic that competes with the
+/// 6502's tune fetches, and the framebuffer only refreshes ~60 Hz.
+static PLAY_TICKS: AtomicU32 = AtomicU32::new(0);
+
 /// Update the play rate everywhere it matters: the TIMER0 reload and the
 /// ISR-visible copy the replay anchor is derived from.
 fn set_play_period(timer: &mut Timer0, period: u32) {
@@ -161,6 +166,10 @@ fn play_tick() {
     // periodic down-counter reloaded to play_period each tick).
     let timer = unsafe { Timer0::summon() };
     let c_start = timer.counter();
+    // Count every tick (even while paused — the timer keeps firing) so the UI
+    // loop can pace its repaints. load/store, not fetch_add: riscv32im has no
+    // atomic RMW; single-writer (this ISR).
+    PLAY_TICKS.store(PLAY_TICKS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     let (dcyc, c_mid): (u32, u32) = critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
         if let Some(pb) = g.as_mut() {
@@ -472,6 +481,7 @@ fn main() -> ! {
     let mut modify   = false;
     let mut browse_idx: usize = 0;
     let mut dbg_div: u32 = 0; // DIAGNOSTIC: throttles the PLAY-timing UART line
+    let mut last_paint_ticks: u32 = 0; // play-tick of the last menu repaint
 
     // Scope-card state (mirrors the initial scope/persist config above).
     let mut decay: u8     = 10;   // persistence 1..80
@@ -490,27 +500,6 @@ fn main() -> ! {
 
         loop {
             encoder.update();
-
-            // DIAGNOSTIC (throttled; UART is blocking so it stays out of the ISR):
-            // dump the PLAY frame-timing peaks/totals (cumulative, never reset) —
-            // dur min..max = emulation-time jitter the fixed anchor absorbs;
-            // drops/bail/late must stay 0 for deterministic delivery.
-            dbg_div = dbg_div.wrapping_add(1);
-            if dbg_div % 64 == 0 {
-                let dur  = PLAY_MAX_DUR.load(Ordering::Relaxed);
-                let mn   = PLAY_MIN_DUR.load(Ordering::Relaxed);
-                let cyc  = PLAY_CPU_CYC.load(Ordering::Relaxed);
-                let ovr  = PLAY_OVERRUN.load(Ordering::Relaxed);
-                let bad  = PLAY_CALL_BAD.load(Ordering::Relaxed);
-                let drp  = PLAY_DROPS.load(Ordering::Relaxed);
-                let bail = PLAY_REPLAY_BAIL.load(Ordering::Relaxed);
-                let late = PLAY_LATE_ANCHOR.load(Ordering::Relaxed);
-                // eff%: 6502 cycles vs the phi2 cycles (dur/60) that frame took.
-                // 100 = exactly 1MHz; <100 = slower than a real 6502.
-                let effpct = if dur != 0 { (cyc as u64 * 60 * 100 / dur as u64) as u32 } else { 0 };
-                info!("PLAY dur={}..{} cpu_cyc={} eff={}% period={} overrun={} stuck={} drops={} bail={} late={}",
-                      mn, dur, cyc, effpct, play_period, ovr, bad, drp, bail, late);
-            }
 
             // -- Hot-plug --
             // Same 512-byte guard as the initial mount (silent ignore: the
@@ -609,7 +598,8 @@ fn main() -> ! {
                 }
             }
 
-            if encoder.poke_btn() {
+            let btn = encoder.poke_btn();
+            if btn {
                 match (page, selected) {
                     // Page row: enter/exit modify so rotation switches the card.
                     (_, 0) => { modify = !modify; }
@@ -665,6 +655,44 @@ fn main() -> ! {
                 // Most button actions toggle a marker or one row's text; clear
                 // just that row. Loading a new tune (above) sets full `redraw`.
                 if !redraw { redraw_row = Some(selected); }
+            }
+
+            // Pace repaints to ~the play rate (~50-60 Hz; the framebuffer
+            // refresh rate): the loop otherwise free-runs and re-blits the whole
+            // menu thousands of times/sec, and every blit is PSRAM traffic
+            // competing with the 6502's tune fetches (audio > visuals — this is
+            // what made Commando's dense "fast part" drop notes/stutter). Inputs
+            // and pending clears force an immediate repaint so navigation never
+            // lags; everything above this gate (encoder, hot-plug) is CSR-only
+            // and stays per-iteration.
+            let now_ticks = PLAY_TICKS.load(Ordering::Relaxed);
+            let elapsed = now_ticks.wrapping_sub(last_paint_ticks);
+            if !(ticks != 0 || btn || redraw || redraw_row.is_some()
+                 || elapsed.saturating_mul(60) >= play_hz) {
+                continue;
+            }
+            last_paint_ticks = now_ticks;
+
+            // DIAGNOSTIC (throttled to the paint cadence so it can't flood the
+            // blocking UART — that would throttle playback): dump the PLAY
+            // frame-timing peaks/totals (cumulative, never reset). dur min..max =
+            // emulation-time jitter the fixed anchor absorbs; drops/bail/late
+            // must stay 0 for deterministic delivery.
+            dbg_div = dbg_div.wrapping_add(1);
+            if dbg_div % 64 == 0 {
+                let dur  = PLAY_MAX_DUR.load(Ordering::Relaxed);
+                let mn   = PLAY_MIN_DUR.load(Ordering::Relaxed);
+                let cyc  = PLAY_CPU_CYC.load(Ordering::Relaxed);
+                let ovr  = PLAY_OVERRUN.load(Ordering::Relaxed);
+                let bad  = PLAY_CALL_BAD.load(Ordering::Relaxed);
+                let drp  = PLAY_DROPS.load(Ordering::Relaxed);
+                let bail = PLAY_REPLAY_BAIL.load(Ordering::Relaxed);
+                let late = PLAY_LATE_ANCHOR.load(Ordering::Relaxed);
+                // eff%: 6502 cycles vs the phi2 cycles (dur/60) that frame took.
+                // 100 = exactly 1MHz; <100 = slower than a real 6502.
+                let effpct = if dur != 0 { (cyc as u64 * 60 * 100 / dur as u64) as u32 } else { 0 };
+                info!("PLAY dur={}..{} cpu_cyc={} eff={}% period={} overrun={} stuck={} drops={} bail={} late={}",
+                      mn, dur, cyc, effpct, play_period, ovr, bad, drp, bail, late);
             }
 
             // Menu text is re-blitted every frame below (the persist/scope
