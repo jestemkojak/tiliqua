@@ -16,43 +16,19 @@ pub struct SidWrite {
 }
 
 /// 6502 address space backed by the tune image.
-/// $0000–$01FF (zero page + stack — the 6502's hottest addresses) are served
-/// from `zp_stack`, a plain array inside the Playback static (on-chip mainram,
-/// single-cycle), so they never contend for D-cache lines with tune code/data.
 /// $D400–$D41F writes are buffered as unstamped `SidWrite` entries;
 /// `call()` stamps them after each instruction completes.
 pub struct PsidBus {
-    pub mem:      &'static mut [u8; 0x10000],
-    pub zp_stack: [u8; 0x200],
-    pub writes:   heapless::Vec<SidWrite, SID_WRITE_CAP>,
+    pub mem:     &'static mut [u8; 0x10000],
+    pub writes:  heapless::Vec<SidWrite, SID_WRITE_CAP>,
     /// Cumulative count of writes lost because `writes` was full.
-    pub dropped:  u32,
-}
-
-impl PsidBus {
-    /// Raw image write honoring the ZP/stack split. Loader-only: never
-    /// captures SID writes ($D400.. is plain image data while loading).
-    pub fn poke(&mut self, a: u16, v: u8) {
-        if a < 0x200 {
-            self.zp_stack[a as usize] = v;
-        } else {
-            self.mem[a as usize] = v;
-        }
-    }
+    pub dropped: u32,
 }
 
 impl Bus for PsidBus {
-    fn get_byte(&mut self, a: u16) -> u8 {
-        if a < 0x200 {
-            self.zp_stack[a as usize]
-        } else {
-            self.mem[a as usize]
-        }
-    }
+    fn get_byte(&mut self, a: u16) -> u8 { self.mem[a as usize] }
     fn set_byte(&mut self, a: u16, v: u8) {
-        if a < 0x200 {
-            self.zp_stack[a as usize] = v;
-        } else if a & 0xFFE0 == 0xD400 {
+        if a & 0xFFE0 == 0xD400 {
             if self.writes.push(SidWrite { cycle: 0, reg: (a & 0x1F) as u8, val: v }).is_err() {
                 self.dropped += 1;
             }
@@ -117,7 +93,7 @@ mod tests {
     }
 
     fn new_bus(mem: &'static mut [u8; 0x10000]) -> PsidBus {
-        PsidBus { mem, zp_stack: [0u8; 0x200], writes: heapless::Vec::new(), dropped: 0 }
+        PsidBus { mem, writes: heapless::Vec::new(), dropped: 0 }
     }
 
     /// Repro of the hardware bring-up path on the host: parse the bundled
@@ -343,30 +319,6 @@ mod tests {
             }
             assert_eq!(cpu.memory.dropped, 0, "frame {frame}: unexpected write drop");
         }
-    }
-
-    /// ZP/stack split: $0000-$01FF live in the on-chip `zp_stack` array, not
-    /// the PSRAM-backed image. Writes must not leak into `mem`, reads must
-    /// come from the split array, and the boundary at $0200 must hit `mem`.
-    #[test]
-    fn zp_stack_split_routing() {
-        let mem = boxed_mem();
-        let mut bus = new_bus(mem);
-        bus.set_byte(0x0050, 0xAA); // zero page
-        bus.set_byte(0x01FF, 0xBB); // top of stack page
-        bus.set_byte(0x0200, 0xCC); // first image byte
-        assert_eq!(bus.get_byte(0x0050), 0xAA);
-        assert_eq!(bus.get_byte(0x01FF), 0xBB);
-        assert_eq!(bus.get_byte(0x0200), 0xCC);
-        assert_eq!(bus.mem[0x0050], 0, "ZP write leaked into the PSRAM image");
-        assert_eq!(bus.mem[0x01FF], 0, "stack write leaked into the PSRAM image");
-        assert_eq!(bus.mem[0x0200], 0xCC);
-        // Loader path must honor the same split.
-        bus.poke(0x0010, 0x11);
-        bus.poke(0x0300, 0x22);
-        assert_eq!(bus.get_byte(0x0010), 0x11);
-        assert_eq!(bus.mem[0x0010], 0);
-        assert_eq!(bus.mem[0x0300], 0x22);
     }
 
     /// Guard the CAP=256 choice: INIT bursts must not overflow the buffer for
