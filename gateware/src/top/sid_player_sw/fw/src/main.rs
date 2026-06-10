@@ -363,6 +363,17 @@ fn main() -> ! {
         ready
     };
 
+    // 512-byte blocks only: read_block drains a fixed 128 words and the
+    // gateware byte packer never backpressures, so any other sector size
+    // silently corrupts every read (§5c). Refuse the drive instead.
+    let usb_ready = usb_ready && match msc.block_size() {
+        512 => true,
+        bs => {
+            info!("USB: unsupported block size {} (need 512) — ignoring drive", bs);
+            false
+        }
+    };
+
     // Scratch buffer in PSRAM at +7 MB.
     let tune_buf: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut((PSRAM_BASE + 0x700000) as *mut u8, 65536)
@@ -498,7 +509,9 @@ fn main() -> ! {
             }
 
             // -- Hot-plug --
-            if playing_fallback && msc.ready() {
+            // Same 512-byte guard as the initial mount (silent ignore: the
+            // fallback tune keeps playing).
+            if playing_fallback && msc.ready() && msc.block_size() == 512 {
                 file_list.clear();
                 fat::list_sids(&msc, &mut file_list);
                 if !file_list.is_empty() {

@@ -23,7 +23,9 @@ impl UsbMsc {
 
     pub fn wait_ready(&self) { while !self.ready() {} }
 
-    /// Read one 512-byte block at `lba` into `buf`.
+    /// Read one 512-byte block at `lba` into `buf`. Callers must have checked
+    /// `block_size() == 512`: the fixed 128-word drain (and the gateware's
+    /// non-backpressuring byte packer) silently corrupts any other sector size.
     pub fn read_block(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), MscError> {
         if !self.ready() { return Err(MscError::NotReady); }
         self.regs.lba().write(|w| unsafe { w.value().bits(lba) });
