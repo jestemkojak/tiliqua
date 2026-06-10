@@ -112,33 +112,6 @@ struct Playback {
 
 static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
 
-/// DIAGNOSTIC (running peaks/totals; UI loop emits over UART). Measures whether
-/// the emulator runs faster or slower than a real 1MHz 6502 — the deciding factor
-/// for whether cycle-accurate pacing is feasible:
-///   PLAY_MAX_DUR  — worst PLAY-frame emulation wall-clock (sync/60MHz cycles,
-///     emulation only — replay waits at a fixed anchor and is excluded).
-///   PLAY_CPU_CYC  — 6502 cycles that same frame ran (cpu.cycles delta).
-///     effective MHz = PLAY_CPU_CYC / (PLAY_MAX_DUR/60). <1 => slower than 1MHz.
-///   PLAY_OVERRUN  — frames whose ISR (emulation+replay) exceeded the play
-///     period (tick lost).
-///   PLAY_CALL_BAD — `call()` overran max_steps (emulator stuck on an opcode).
-///   PLAY_MIN_DUR  — best PLAY-frame emulation wall-clock; min/max spread =
-///     the inter-frame jitter the fixed anchor exists to absorb.
-///   PLAY_REPLAY_BAIL — frames whose replay crossed the period boundary (writes
-///     issued unpaced from there on; relative spacing lost for that frame).
-///   PLAY_LATE_ANCHOR — frames where emulation overran the fixed anchor offset
-///     (replay fell back to anchoring at end-of-emulation: jitter for that
-///     frame). Must be 0 for inter-frame timing to be deterministic.
-///   PLAY_DROPS    — cumulative SID writes lost to a full capture buffer.
-static PLAY_MAX_DUR:     AtomicU32 = AtomicU32::new(0);
-static PLAY_MIN_DUR:     AtomicU32 = AtomicU32::new(u32::MAX);
-static PLAY_CPU_CYC:     AtomicU32 = AtomicU32::new(0);
-static PLAY_OVERRUN:     AtomicU32 = AtomicU32::new(0);
-static PLAY_CALL_BAD:    AtomicU32 = AtomicU32::new(0);
-static PLAY_REPLAY_BAIL: AtomicU32 = AtomicU32::new(0);
-static PLAY_LATE_ANCHOR: AtomicU32 = AtomicU32::new(0);
-static PLAY_DROPS:       AtomicU32 = AtomicU32::new(0);
-
 /// Current play period in sync cycles (TIMER0 reload), ISR-visible: the replay
 /// anchor offset is derived from it. Written via `set_play_period` only.
 static PLAY_PERIOD: AtomicU32 = AtomicU32::new(0);
@@ -158,46 +131,32 @@ fn set_play_period(timer: &mut Timer0, period: u32) {
 /// TIMER0 ISR body: run one PLAY frame on the software 6502. Real-time work
 /// lives here (not the UI loop) so menu redraws can never starve the audio.
 fn play_tick() {
-    // DIAGNOSTIC: time the emulated frame against the play period (Timer0 is a
-    // periodic down-counter reloaded to play_period each tick).
     let timer = unsafe { Timer0::summon() };
     let c_start = timer.counter();
     // Count every tick (even while paused — the timer keeps firing) so the UI
     // loop can pace its repaints. load/store, not fetch_add: riscv32im has no
     // atomic RMW; single-writer (this ISR).
     PLAY_TICKS.store(PLAY_TICKS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
-    let (dcyc, c_mid): (u32, u32) = critical_section::with(|cs| {
+    critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
         if let Some(pb) = g.as_mut() {
             if !pb.paused && pb.play_addr != 0 {
-                let c0 = pb.cpu.cycles;
-                if !player::call(&mut pb.cpu, pb.play_addr, 2_000_000) {
-                    PLAY_CALL_BAD.store(PLAY_CALL_BAD.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                }
-                // Replay the captured frame at the SID's real 1MHz spacing: the
-                // emulator stretched inter-write gaps ~5x, breaking envelopes.
-                // Anchor at a FIXED offset from the tick (half the play period),
-                // NOT at end-of-emulation: emulation duration swings by ~ms
-                // frame-to-frame (workload + cache state), and an end-of-emulation
-                // anchor passes that jitter into the *inter-frame* write spacing,
-                // re-rolling the SID envelope (ADSR delay bug) phase at every
-                // gate-on — a real C64 delivers frame-locked, deterministic
-                // timing. Commando-class tunes trigger every note across frames
-                // (gate-off 3+ frames before gate-on), so inter-frame timing is
-                // the load-bearing part. If emulation already overran the offset,
-                // fall back to anchoring here (counted; that frame jitters).
-                // Timer0 is a down-counter; 1 emulated 6502 cycle = 60 sync
-                // ticks; elapsed since anchor = t0 - c.
+                let _ = player::call(&mut pb.cpu, pb.play_addr, 2_000_000);
+                // Replay the captured frame at the SID's real 1MHz spacing,
+                // anchored at a FIXED offset from the tick (half the play
+                // period), NOT at end-of-emulation: emulation duration swings by
+                // ~ms frame-to-frame (workload + cache state), and an
+                // end-of-emulation anchor would pass that jitter into the
+                // *inter-frame* write spacing, re-rolling the SID envelope (ADSR
+                // delay bug) phase at every gate-on — a real C64 delivers
+                // frame-locked, deterministic timing. If emulation already
+                // overran the offset, fall back to anchoring here (that frame
+                // jitters). Timer0 is a down-counter; 1 emulated 6502 cycle = 60
+                // sync ticks; elapsed since anchor = t0 - c.
                 let offset = PLAY_PERIOD.load(Ordering::Relaxed) / 2;
                 let c_mid = timer.counter();
                 let lead = c_start.wrapping_sub(c_mid); // emu time (huge if reloaded)
-                let (t0, base) = if lead < offset {
-                    (c_start, offset)
-                } else {
-                    PLAY_LATE_ANCHOR.store(
-                        PLAY_LATE_ANCHOR.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                    (c_mid, 0)
-                };
+                let (t0, base) = if lead < offset { (c_start, offset) } else { (c_mid, 0) };
                 let mut bailed = false;
                 for w in pb.cpu.memory.writes.iter() {
                     if !bailed {
@@ -205,12 +164,9 @@ fn play_tick() {
                         loop {
                             let c = timer.counter();
                             if c > t0 {
-                                // Counter reloaded: we crossed the period boundary.
-                                // t0 - c would underflow — bail: issue this and all
-                                // remaining writes immediately (unpaced) so none are
-                                // lost, and stop spinning for the rest of the frame.
-                                PLAY_REPLAY_BAIL.store(
-                                    PLAY_REPLAY_BAIL.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                                // Counter reloaded: crossed the period boundary.
+                                // Issue this and all remaining writes immediately
+                                // (unpaced) so none are lost, and stop spinning.
                                 bailed = true;
                                 break;
                             }
@@ -219,32 +175,9 @@ fn play_tick() {
                     }
                     sid_write(w.reg, w.val);
                 }
-                PLAY_DROPS.store(pb.cpu.memory.dropped, Ordering::Relaxed);
-                return ((pb.cpu.cycles - c0) as u32, c_mid); // 6502 cycles + emu end
             }
         }
-        (0, c_start)
     });
-    let c_end = timer.counter();
-    // Counter went UP => it hit 0 and reloaded mid-frame => the ISR took longer
-    // than the play period (the next tick can be coalesced => a skipped PLAY
-    // frame => a dropped note). Otherwise c_start - c_mid is this frame's
-    // emulation time (replay's fixed-anchor wait excluded); pair it with the
-    // 6502-cycle count to get the effective emulation MHz.
-    if c_end > c_start {
-        PLAY_OVERRUN.store(PLAY_OVERRUN.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-    } else if c_mid <= c_start {
-        let dur = c_start - c_mid;
-        if dur > PLAY_MAX_DUR.load(Ordering::Relaxed) {
-            PLAY_MAX_DUR.store(dur, Ordering::Relaxed);
-            PLAY_CPU_CYC.store(dcyc, Ordering::Relaxed);
-        }
-        // Min only over frames that actually ran PLAY — paused/idle ISR passes
-        // would otherwise drive it to ~0 and hide the real jitter spread.
-        if dcyc > 0 && dur < PLAY_MIN_DUR.load(Ordering::Relaxed) {
-            PLAY_MIN_DUR.store(dur, Ordering::Relaxed);
-        }
-    }
 }
 
 /// Load a tune+subtune into the shared CPU and run INIT, under a critical
@@ -476,7 +409,6 @@ fn main() -> ! {
     let mut selected: usize = 0;
     let mut modify   = false;
     let mut browse_idx: usize = 0;
-    let mut dbg_div: u32 = 0; // DIAGNOSTIC: throttles the PLAY-timing UART line
     let mut last_paint_ticks: u32 = 0; // play-tick of the last menu repaint
 
     // Scope-card state (mirrors the initial scope/persist config above).
@@ -668,28 +600,6 @@ fn main() -> ! {
                 continue;
             }
             last_paint_ticks = now_ticks;
-
-            // DIAGNOSTIC (throttled to the paint cadence so it can't flood the
-            // blocking UART — that would throttle playback): dump the PLAY
-            // frame-timing peaks/totals (cumulative, never reset). dur min..max =
-            // emulation-time jitter the fixed anchor absorbs; drops/bail/late
-            // must stay 0 for deterministic delivery.
-            dbg_div = dbg_div.wrapping_add(1);
-            if dbg_div % 64 == 0 {
-                let dur  = PLAY_MAX_DUR.load(Ordering::Relaxed);
-                let mn   = PLAY_MIN_DUR.load(Ordering::Relaxed);
-                let cyc  = PLAY_CPU_CYC.load(Ordering::Relaxed);
-                let ovr  = PLAY_OVERRUN.load(Ordering::Relaxed);
-                let bad  = PLAY_CALL_BAD.load(Ordering::Relaxed);
-                let drp  = PLAY_DROPS.load(Ordering::Relaxed);
-                let bail = PLAY_REPLAY_BAIL.load(Ordering::Relaxed);
-                let late = PLAY_LATE_ANCHOR.load(Ordering::Relaxed);
-                // eff%: 6502 cycles vs the phi2 cycles (dur/60) that frame took.
-                // 100 = exactly 1MHz; <100 = slower than a real 6502.
-                let effpct = if dur != 0 { (cyc as u64 * 60 * 100 / dur as u64) as u32 } else { 0 };
-                info!("PLAY dur={}..{} cpu_cyc={} eff={}% period={} overrun={} stuck={} drops={} bail={} late={}",
-                      mn, dur, cyc, effpct, play_period, ovr, bad, drp, bail, late);
-            }
 
             // Menu text is re-blitted every frame below (the persist/scope
             // effect decays the framebuffer), so navigation needs no clear.
