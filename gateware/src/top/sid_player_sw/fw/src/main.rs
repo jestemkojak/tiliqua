@@ -44,18 +44,22 @@ fn trim_ascii(s: &[u8]) -> &str {
 }
 
 /// Write the tune payload into the 6502 memory image and zero CIA Timer A.
-/// Returns Err (without touching `mem`/`hdr`) for unsupported/corrupt files so
-/// callers can skip them gracefully instead of crashing.
+/// Returns Err (without touching the image/`hdr`) for unsupported/corrupt
+/// files so callers can skip them gracefully instead of crashing. Writes go
+/// via `poke` so the ZP/stack split stays coherent (tunes rarely load below
+/// $0200, but the header allows it).
 fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
-                    mem: &mut [u8; 0x10000]) -> Result<(), psid::PsidError> {
+                    bus: &mut player::PsidBus) -> Result<(), psid::PsidError> {
     *hdr = psid::PsidHeader::parse(&tune_buf[..len])?;
     let payload_raw = &tune_buf[hdr.data_offset as usize..len];
     let load_addr = hdr.effective_load_addr(payload_raw) as usize;
     let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
-    mem[load_addr..load_addr + payload.len()].copy_from_slice(payload);
+    for (i, &b) in payload.iter().enumerate() {
+        bus.poke((load_addr + i) as u16, b);
+    }
     // Zero CIA #1 Timer A so we can detect if INIT programs it (multispeed).
-    mem[0xDC04] = 0;
-    mem[0xDC05] = 0;
+    bus.poke(0xDC04, 0);
+    bus.poke(0xDC05, 0);
     Ok(())
 }
 
@@ -248,7 +252,7 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
     critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
         let pb = g.as_mut().unwrap();
-        if load_psid_to_mem(tune_buf, len, hdr, pb.cpu.memory.mem).is_err() {
+        if load_psid_to_mem(tune_buf, len, hdr, &mut pb.cpu.memory).is_err() {
             return; // leave `period` None -> caller treats as unsupported
         }
         pb.cpu.registers.stack_pointer.0 = 0xFD;
@@ -432,11 +436,11 @@ fn main() -> ! {
     let image: &'static mut [u8; 0x10000] =
         unsafe { &mut *(0x2080_0000 as *mut [u8; 0x10000]) };
     let mut cpu: PlayerCpu =
-        CPU::new(player::PsidBus { mem: image, writes: heapless::Vec::new(), dropped: 0 }, Nmos6502);
+        CPU::new(player::PsidBus { mem: image, zp_stack: [0u8; 0x200], writes: heapless::Vec::new(), dropped: 0 }, Nmos6502);
     cpu.registers.stack_pointer.0 = 0xFD;
 
     // Load initial tune and run INIT (hdr already validated/parsed above).
-    let _ = load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+    let _ = load_psid_to_mem(tune_buf, len, &mut hdr, &mut cpu.memory);
     player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
     drain_sid_writes(&mut cpu.memory); // INIT setup (volume/filter) -> SID now
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
