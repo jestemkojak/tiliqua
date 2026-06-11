@@ -823,6 +823,278 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Write-stream dump helpers (Stage 1: host-render SID reference WAVs)
+    // -----------------------------------------------------------------------
+
+    /// Pure scheduling function: given a prelude and per-frame write streams,
+    /// produce an absolute phi2 timeline suitable for emission as a `.sidw` file.
+    ///
+    /// # Parameters
+    /// - `prelude`: `(reg, val)` pairs emitted on consecutive phi2 cycles
+    ///   starting at phi2 cycle 10.
+    /// - `events`: `(frame_0based, stamp_6502_cycles, reg, val)` tuples, one per
+    ///   PLAY-frame write.  `stamp` is the `SidWrite::cycle` value (frame-relative
+    ///   6502-cycle offset).
+    /// - `period_sync`: play-frame period in 60 MHz sync ticks.
+    /// - `init_burst_phi2_end`: first phi2 cycle *after* the INIT burst
+    ///   (= prelude_end_phi2 + number of INIT writes, computed by caller).
+    /// - `c64`: if true, use pure phi2 domain (19656 phi2/frame); otherwise use
+    ///   the hardware-quantum path (sync ticks → phi2 with remainder accumulation).
+    ///
+    /// Returns a sorted, strictly-increasing `Vec<(abs_phi2, reg, val)>`.
+    fn schedule_events(
+        prelude:           &[(u8, u8)],
+        events:            &[(usize /*frame*/, u32 /*stamp*/, u8, u8)],
+        period_sync:       u32,
+        init_burst_phi2_end: u64,
+        c64:               bool,
+    ) -> std::vec::Vec<(u64, u8, u8)> {
+        let mut out: std::vec::Vec<(u64, u8, u8)> = std::vec::Vec::new();
+
+        // 1. Prelude: phi2 cycles 10, 11, 12, …
+        let prelude_start: u64 = 10;
+        for (i, &(reg, val)) in prelude.iter().enumerate() {
+            out.push((prelude_start + i as u64, reg, val));
+        }
+
+        // 2. PLAY events — two timing modes.
+        //
+        // Hardware quantum: keep the timeline in 60 MHz sync ticks and convert to
+        // phi2 at emission so the fractional ~19950.616 phi2/frame remainder
+        // accumulates correctly.  The frame anchor (middle of frame n+1) is:
+        //   T_sync(n) = base_sync + (n+1)*P + P/2 + stamp*60
+        // where base_sync = (init_burst_phi2_end + 2) * 60.
+        //
+        // C64 quantum: pure phi2 domain, 19 656 phi2/frame (PAL VBlank).
+        let base_sync: u64 = (init_burst_phi2_end + 2) * 60;
+        let p = period_sync as u64;
+        const PAL_FRAME: u64 = 19_656;
+        let base_phi2: u64 = init_burst_phi2_end + 2;
+
+        for &(frame, stamp, reg, val) in events {
+            let abs_phi2 = if c64 {
+                base_phi2 + (frame as u64 + 1) * PAL_FRAME + PAL_FRAME / 2 + stamp as u64
+            } else {
+                let t_sync = base_sync
+                    + (frame as u64 + 1) * p
+                    + p / 2
+                    + stamp as u64 * 60;
+                t_sync / 60
+            };
+            out.push((abs_phi2, reg, val));
+        }
+
+        // 3. Monotonic serialisation: enforce strictly increasing order.
+        //    Events are already ordered within each source (prelude ascending,
+        //    PLAY events non-decreasing because stamps are non-decreasing within
+        //    a frame and frames are iterated in order).  A merge-sort-style pass
+        //    suffices; we sort then bump collisions.
+        out.sort_by_key(|&(t, _, _)| t);
+        let mut prev: u64 = 0;
+        for entry in out.iter_mut() {
+            if entry.0 <= prev {
+                entry.0 = prev + 1;
+            }
+            prev = entry.0;
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit test for schedule_events (non-ignored — always runs in `cargo test`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schedule_events_properties() {
+        // (a) Strictly increasing output with min spacing 1.
+        // Synthetic: 3 frames × 4 writes, all at stamp=0 (worst-case for
+        // monotone enforcement).
+        let events: std::vec::Vec<(usize, u32, u8, u8)> = (0..3)
+            .flat_map(|f| (0..4u32).map(move |s| (f, s * 10, 0u8, 0u8)))
+            .collect();
+        let prelude = std::vec![(0x04u8, 0x08u8), (0x0Bu8, 0x08u8), (0x12u8, 0x08u8)];
+        let init_burst_end: u64 = prelude.len() as u64 + 10 + 5; // pretend 5 INIT writes
+
+        let hw = schedule_events(&prelude, &events, 1_197_037, init_burst_end, false);
+        assert!(!hw.is_empty());
+        let mut prev = 0u64;
+        for &(t, _, _) in &hw {
+            assert!(t > prev, "not strictly increasing: {} <= {}", t, prev);
+            prev = t;
+        }
+
+        // (b) HW mode: mean frame-anchor spacing over 1 000 synthetic frames
+        //     (one write per frame at stamp=0) should be within ±0.05 of 19 950.6.
+        let period_sync: u32 = 1_197_037;
+        let n_frames: usize = 1_000;
+        let single_write_per_frame: std::vec::Vec<(usize, u32, u8, u8)> =
+            (0..n_frames).map(|f| (f, 0u32, 0u8, 0u8)).collect();
+        let hw2 = schedule_events(&[], &single_write_per_frame, period_sync, 100, false);
+        assert_eq!(hw2.len(), n_frames);
+        // Frame-anchor = the phi2 timestamp of write n.
+        // Spacing between consecutive anchors.
+        let spacings: std::vec::Vec<f64> = hw2.windows(2)
+            .map(|w| (w[1].0 - w[0].0) as f64)
+            .collect();
+        let mean_spacing = spacings.iter().sum::<f64>() / spacings.len() as f64;
+        let expected = period_sync as f64 / 60.0;  // ~19950.617
+        assert!(
+            (mean_spacing - expected).abs() < 0.05,
+            "HW mean frame spacing {mean_spacing:.4} not within ±0.05 of {expected:.4}"
+        );
+
+        // (c) C64 mode: spacing is exactly 19 656.
+        let c64_out = schedule_events(&[], &single_write_per_frame, period_sync, 100, true);
+        assert_eq!(c64_out.len(), n_frames);
+        for w in c64_out.windows(2) {
+            assert_eq!(
+                w[1].0 - w[0].0, PAL_FRAME_PHI2,
+                "C64 spacing should be exactly {PAL_FRAME_PHI2}"
+            );
+        }
+    }
+
+    // PAL frame length in phi2 cycles (used by the unit test above and dump_writes).
+    const PAL_FRAME_PHI2: u64 = 19_656;
+
+    // -----------------------------------------------------------------------
+    // Ignored dump test (run with: cargo test --target x86_64-unknown-linux-gnu
+    //   --lib dump_writes -- --ignored --nocapture)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn dump_writes() {
+        use crate::psid::PsidHeader;
+        use std::io::Write as IoWrite;
+
+        // --- env parameters (follow GATE_TRACE_FRAMES style) ----------------
+        let sid_path = std::env::var("DUMP_SID")
+            .unwrap_or_else(|_| "../../../../../docs/Commando.sid".into());
+        let out_path = std::env::var("DUMP_OUT")
+            .unwrap_or_else(|_| "/tmp/sid_writes.sidw".into());
+        let n_frames: usize = std::env::var("DUMP_FRAMES")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(10_600);
+        let c64_mode: bool = std::env::var("DUMP_C64")
+            .map(|s| s == "1").unwrap_or(false);
+
+        // --- load .sid file -------------------------------------------------
+        let sid_bytes = std::fs::read(&sid_path)
+            .unwrap_or_else(|e| panic!("cannot read {sid_path}: {e}"));
+        let hdr = PsidHeader::parse(&sid_bytes).expect("parse PSID header");
+
+        let subtune: u16 = std::env::var("DUMP_SUBTUNE")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(hdr.start_song);
+
+        let payload_raw = &sid_bytes[hdr.data_offset as usize..];
+        let load = hdr.effective_load_addr(payload_raw) as usize;
+        let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+
+        // --- set up CPU -----------------------------------------------------
+        let mem = boxed_mem();
+        mem[load..load + payload.len()].copy_from_slice(payload);
+        // Firmware zeroes CIA timer after load (DC04/DC05 = 0).
+        mem[0xDC04] = 0;
+        mem[0xDC05] = 0;
+
+        let mut cpu = CPU::new(new_bus(mem), Nmos6502);
+        cpu.registers.stack_pointer.0 = 0xFD;
+
+        // --- build prelude (mirrors firmware sid_reset()) -------------------
+        // TEST bit on all voices, then zero all 25 registers ascending.
+        let mut prelude: std::vec::Vec<(u8, u8)> = std::vec::Vec::new();
+        for v in 0..3u8 {
+            prelude.push((4 + v * 7, 0x08));
+        }
+        for reg in 0..=0x18u8 {
+            prelude.push((reg, 0x00));
+        }
+
+        // --- run INIT -------------------------------------------------------
+        assert!(
+            init(&mut cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000),
+            "INIT overran max_steps"
+        );
+        assert_eq!(cpu.memory.dropped, 0, "INIT dropped writes — increase SID_WRITE_CAP?");
+        let init_writes: std::vec::Vec<(u8, u8)> =
+            cpu.memory.writes.iter().map(|w| (w.reg, w.val)).collect();
+
+        // --- read CIA timer (after INIT, before PLAY) -----------------------
+        let cia_timer: u16 = (cpu.memory.mem[0xDC04] as u16)
+            | ((cpu.memory.mem[0xDC05] as u16) << 8);
+
+        let period_sync: u32 = crate::psid::play_period_cycles(
+            60_000_000,
+            hdr.clock(),
+            hdr.is_cia(subtune),
+            cia_timer,
+        );
+
+        eprintln!(
+            "SID: {sid_path}  subtune={subtune}  clock={:?}  cia={}  cia_timer={cia_timer}  \
+             period_sync={period_sync}  c64={c64_mode}  frames={n_frames}",
+            hdr.clock(), hdr.is_cia(subtune)
+        );
+
+        // --- run PLAY frames, collect events --------------------------------
+        // Each event: (frame_0based, stamp, reg, val)
+        let mut play_events: std::vec::Vec<(usize, u32, u8, u8)> = std::vec::Vec::new();
+        for frame in 0..n_frames {
+            assert!(
+                call(&mut cpu, hdr.play_addr, 2_000_000),
+                "PLAY frame {frame} overran max_steps"
+            );
+            assert_eq!(cpu.memory.dropped, 0, "frame {frame}: dropped writes");
+            for w in cpu.memory.writes.iter() {
+                play_events.push((frame, w.cycle, w.reg, w.val));
+            }
+        }
+
+        // --- schedule absolute phi2 timestamps ------------------------------
+        // Extend prelude with INIT burst (both on consecutive phi2 cycles).
+        let mut full_prelude = prelude.clone();
+        full_prelude.extend_from_slice(&init_writes);
+
+        // Pass empty events to schedule_events for the prelude, then events.
+        // We call it with the combined prelude (prelude+init) but pass init_burst_phi2_end
+        // to the events scheduling (base_sync is derived from init_burst_phi2_end+2).
+        // schedule_events places the combined prelude starting at phi2=10 and events
+        // after init_burst_phi2_end+2.  We need init_burst_phi2_end to reflect the full
+        // combined prelude length.
+        let full_prelude_end: u64 = 10 + full_prelude.len() as u64;
+        let scheduled = schedule_events(
+            &full_prelude,
+            &play_events,
+            period_sync,
+            full_prelude_end,   // init_burst_phi2_end (= end of full prelude)
+            c64_mode,
+        );
+
+        // --- emit deltas to file --------------------------------------------
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create(&out_path)
+                .unwrap_or_else(|e| panic!("cannot create {out_path}: {e}")),
+        );
+        let total_writes = scheduled.len();
+        let mut prev_phi2: u64 = 0;
+        for &(abs_phi2, reg, val) in &scheduled {
+            let delta = abs_phi2 - prev_phi2;
+            writeln!(file, "{} {} {}", delta, reg, val)
+                .expect("write to sidw file");
+            prev_phi2 = abs_phi2;
+        }
+        drop(file);
+
+        let duration_s = prev_phi2 as f64 / 1_000_000.0;
+        eprintln!(
+            "dump_writes: total_writes={total_writes}  \
+             total_phi2={prev_phi2}  duration={duration_s:.1}s  out={out_path}"
+        );
+        assert!(total_writes > 0, "no writes emitted");
+    }
+
     /// Guard the CAP=256 choice: INIT bursts must not overflow the buffer for
     /// our bundled tunes. Also prints counts for future reference.
     #[test]
