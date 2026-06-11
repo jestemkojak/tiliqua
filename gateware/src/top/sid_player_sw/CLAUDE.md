@@ -55,6 +55,11 @@ tunes use them); revisit if a future tune requires them.
   the SID — so playback resumes cleanly. Unsupported/corrupt `.SID` files (e.g. multi-SID v4)
   must skip gracefully (`load_psid_to_mem`/`reload_tune` return `Result`/`Option`, show
   `UNSUPPORTED!`) — never `.expect()`-panic the player on a bad header.
+- Every tune (re)load runs `sid_reset()` ($00 to all 25 regs, `writable`-backpressured)
+  between a successful image load and INIT: PSID tunes assume a freshly **reset** chip
+  (Commando's INIT writes only the 3 gates + volume; stale waveform/freq/SR from the
+  previous tune otherwise plays a loud noise burst at tune start). Reset only after a
+  known-good load — an unsupported file must leave the still-playing tune untouched.
 
 ## Dual SID chip model (6581 vs 8580)
 - **Build-time selection:** `pdm sid_player_sw build --sid-model {6581,8580}` (default 8580).

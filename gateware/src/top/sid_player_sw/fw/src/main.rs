@@ -103,6 +103,27 @@ fn drain_sid_writes(bus: &mut player::PsidBus) {
     bus.writes.clear();
 }
 
+/// Reset the SID to its power-on register state: $00 to all 25 registers,
+/// ascending (each voice's CTRL is zeroed before its SR, so anything sounding
+/// is gated off into the fastest release). PSID tunes assume a freshly reset
+/// chip: Commando's INIT writes only the three gates + volume, and its frame-0
+/// gate-ons then play whatever waveform/freq/sustain the *previous* tune or
+/// run left behind — an audible stale-register noise burst at tune start that
+/// a real C64 doesn't have. Run between image load and INIT on every (re)load.
+/// 25 writes exceed the depth-16 transaction FIFO, so poll `writable` like
+/// `drain_sid_writes` (bounded: a fault degrades to dropped clears, not a hang).
+fn sid_reset() {
+    let p = unsafe { pac::Peripherals::steal() };
+    for reg in 0..=0x18u8 {
+        let mut spins = 0u32;
+        while p.SID_PERIPH.txn_status().read().writable().bit_is_clear() {
+            spins += 1;
+            if spins >= 100_000 { break; }
+        }
+        sid_write(reg, 0);
+    }
+}
+
 /// Playback state driven by the TIMER0 interrupt at the tune's play rate.
 struct Playback {
     cpu: PlayerCpu,
@@ -193,6 +214,9 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
         if load_psid_to_mem(tune_buf, len, hdr, pb.cpu.memory.mem).is_err() {
             return; // leave `period` None -> caller treats as unsupported
         }
+        // Only after the load is known-good: an unsupported file must leave
+        // the still-playing current tune's SID state untouched.
+        sid_reset();
         pb.cpu.registers.stack_pointer.0 = 0xFD;
         player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000);
         drain_sid_writes(&mut pb.cpu.memory); // INIT setup (volume/filter) -> SID now
@@ -378,7 +402,11 @@ fn main() -> ! {
     cpu.registers.stack_pointer.0 = 0xFD;
 
     // Load initial tune and run INIT (hdr already validated/parsed above).
+    // sid_reset is redundant right after bitstream load (the gateware holds SID
+    // reset for the first 24 phi2 edges) but kept for uniformity with
+    // reload_tune — it also covers warm relaunches from the bootloader.
     let _ = load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+    sid_reset();
     player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
     drain_sid_writes(&mut cpu.memory); // INIT setup (volume/filter) -> SID now
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
