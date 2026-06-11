@@ -38,7 +38,18 @@ sample-rate = 48 000 Hz).
   what the hardware voice jacks do (`pmod0.i_cal` point-samples at 48 kHz), so
   the characteristic aliasing is reproduced for an apples-to-apples jack
   comparison. The external C64 RC output filter is also skipped (jack taps are
-  pre-codec digital values). Raw format: **s16le**.
+  pre-codec digital values). Raw format: **s16le**. The WAV is **AC-coupled**
+  (`raw2wav.py --dc-block`): the 6581 voice DCA carries a ~+0.38-FS `VOICE_DC`
+  bias that the AC-coupled hardware codec strips, so removing it here keeps the
+  tap comparable to a jack capture / websid export (without it, `abs()`/RMS
+  per-note analysis is swamped by the offset — see the spec's V4 findings).
+
+  **Voice numbering — read this before comparing to a capture.** The taps are
+  **0-indexed** (`v0` = `voice0_dca_o`). Recordings named `*-1voice-*` or
+  `*-voice1` are **1-indexed** ("voice 1" = SID voice **index 0**), so the
+  captured/soloed voice is **`-t v0`**, not `-t v1`. Picking the wrong voice
+  yields a ~0.2 envelope correlation that looks like a fidelity bug; the right
+  voice gives ~0.98.
 - **`-t mix`** keeps upstream's `audio_o` path (24-bit, external RC filter on by
   default). Raw format: **s24be**. NB: this is *not yet* a port of the hardware
   `AudioDecimator` polyphase FIR (~19 kHz) — it is upstream's resampler. Treat

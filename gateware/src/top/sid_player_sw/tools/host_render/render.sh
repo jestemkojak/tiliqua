@@ -52,7 +52,11 @@ if [ -z "$OUT" ]; then
 fi
 
 # Output format: mix = s24be (upstream), taps = s16le (see harness.patch).
-if [ "$TAP" = "mix" ]; then RAWFMT="s24be"; else RAWFMT="s16le"; fi
+# Voice taps are AC-coupled (--dc-block) to strip the 6581 VOICE_DC bias (~½ FS)
+# so the WAV is directly comparable to an AC-coupled jack capture / websid voice
+# export; without it abs()/RMS analysis is swamped by DC (host_render spec, V4).
+# The mix tap already passes through the external RC high-pass, so leave it.
+if [ "$TAP" = "mix" ]; then RAWFMT="s24be"; DCBLOCK=""; else RAWFMT="s16le"; DCBLOCK="--dc-block"; fi
 
 # ----------------------------------------------------------------------------
 # Stage A: build a patched verilated sim binary (cached per model).
@@ -106,5 +110,5 @@ echo "[stage B] rendering tap=$TAP model=$MODEL phi2=$PHI2_HZ rate=$SAMPLE_RATE 
 mv "$BUILD_DIR/sid_api_audio.raw" "$RAW"
 
 mkdir -p "$(dirname "$OUT")"
-"$VENV_PY" "$RAW2WAV" "$RAW" "$OUT" --format "$RAWFMT" --rate "$SAMPLE_RATE"
+"$VENV_PY" "$RAW2WAV" "$RAW" "$OUT" --format "$RAWFMT" --rate "$SAMPLE_RATE" $DCBLOCK
 echo "[done] $OUT"

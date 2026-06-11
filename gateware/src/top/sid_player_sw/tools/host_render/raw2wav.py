@@ -31,18 +31,45 @@ def read_s16le(path):
     return np.fromfile(path, dtype="<i2")
 
 
+def dc_block(x, a=0.9995):
+    """One-pole high-pass (AC-couple): y[n] = x[n] - x[n-1] + a*y[n-1].
+
+    The 6581 voice DCA taps (voiceN_dca_o) carry a model DC bias of ~half the
+    dynamic range (VOICE_DC); the 8580's is 0. The hardware voice path is
+    AC-coupled (codec), so the jacks/captures are DC-free. Removing the DC here
+    makes a tap WAV directly comparable to a jack capture or a websid voice
+    export — without it, abs()/RMS analysis is swamped by the +0.38-FS offset
+    and per-note dynamics vanish (see the host_render spec, V4). a=0.9995 puts
+    the corner at a few Hz @ 48 kHz (inaudible, preserves the envelope).
+    """
+    out = np.empty(len(x), dtype=np.float64)
+    py = 0.0
+    px = 0.0
+    for i in range(len(x)):
+        py = x[i] - px + a * py
+        px = x[i]
+        out[i] = py
+    return np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("infile")
     ap.add_argument("outfile")
     ap.add_argument("--format", choices=["s24be", "s16le"], required=True)
     ap.add_argument("--rate", type=int, default=48000)
+    ap.add_argument("--dc-block", action="store_true",
+                    help="AC-couple the output (remove 6581 VOICE_DC bias) so a "
+                         "voice tap is comparable to an AC-coupled jack capture.")
     args = ap.parse_args()
 
     if args.format == "s24be":
         x = read_s24be(args.infile)
     else:
         x = read_s16le(args.infile)
+
+    if args.dc_block:
+        x = dc_block(x.astype(np.float64))
 
     w = wave.open(args.outfile, "wb")
     w.setnchannels(1)

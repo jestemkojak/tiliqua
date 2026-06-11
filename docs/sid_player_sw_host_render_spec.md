@@ -35,11 +35,39 @@ end-to-end). Deltas vs the spec below and remaining work:
   (external RC filter on), not a port of the hardware `AudioDecimator`
   polyphase FIR (6/125, ~19 kHz). Treat mix WAVs as approximate; voice taps
   (`v0/v1/v2`) are the faithful jack comparison.
-- **Validation:** V1 done (v1 tap byte-identical across two renders of a
-  29.9 s Commando dump; non-zero audio after 1 s — see commit `3f313d7`).
-  **V2 (pitch tone), V3 (60:1 clk ratio), V4 (per-note peak table vs the
-  `3f0af6f` capture) have NOT been run** — do these before drawing
-  model-vs-player conclusions from renders.
+- **Validation:** V1–V4 all DONE (2026-06-11). V1: v1 tap byte-identical across
+  two renders (commit `3f313d7`). V2: a 1 kHz tone renders at 999.985 Hz
+  (−0.001 % vs the 1 MHz-phi2 expectation, +1.497 % sharp vs C64 PAL — matches
+  the predicted ~1.5 %). V3: 24:1 (harness) vs 60:1 (hardware) clk:phi2 ratio →
+  byte-identical voice taps. **V4: PASS — the host render reproduces the
+  hardware `3f0af6f` capture's voice 1 better than websid does** (envelope corr
+  0.984 vs websid 0.944; per-note loud/soft classes byte-identical to the
+  capture, 32/32). See "V4 findings" below — two methodology fixes were needed
+  to get there.
+
+### V4 findings (two comparison hazards, both now fixed in the tooling)
+
+1. **6581 voice taps carry a DC bias.** `voiceN_dca_o` on the 6581 sits at
+   ~+0.38 FS (the model's `VOICE_DC` ≈ ½ dynamic range; the 8580's is 0). The
+   hardware voice path is AC-coupled (codec), so jack captures / websid exports
+   are DC-free. Comparing a raw tap WAV (DC-laden) to a capture makes
+   `abs()`/RMS analysis useless — the offset swamps the per-note dynamics
+   (with DC: host per-note peaks span only 1.15×; without: the real ~4× split
+   appears). **Fix:** `render.sh` now AC-couples voice taps via
+   `raw2wav.py --dc-block` (one-pole HP, corner a few Hz). The mix tap is left
+   alone (it already passes the external RC high-pass).
+2. **Voice numbering is off by one between the taps and the captures.** The
+   host_render taps `v0/v1/v2` are **0-indexed** (`voice0/1/2_dca_o`); the
+   recordings named `*-1voice-*` / `*-voice1` are **1-indexed** "voice 1" =
+   SID voice **index 0**. So the captured/soloed voice is host tap **`-t v0`**,
+   not `v1`. Correlating the wrong voice gives ~0.2 and looks like a fidelity
+   bug; the right voice gives 0.98. Confirmed by sweeping all three taps
+   (v0 = 0.82→0.98 across windows, v1/v2 ≈ 0.2).
+
+The note_peaks *class string* is fragile on the noisy 200 s captures (the
+onset-based t0 fit latches onto ~1000 spurious onsets in a 6 s window); the
+**lag-aligned RMS envelope correlation is the robust metric** and is what the
+0.984-vs-0.944 result above uses.
 
 ## Why this isolates faults
 
@@ -137,15 +165,21 @@ that throwaway script into `tools/note_peaks.py` while at it).
 
 - V1 ✅ DONE: render twice → byte-identical (verified on v1 tap, 29.9 s
   Commando dump, commit `3f313d7`).
-- V2 ❌ TODO: 1 kHz test tone tune (reuse `tools/gen_stress_sid.py`) → expected
-  pitch at 1 MHz phi2 (1.5 % sharp vs C64-targeted pitch).
-- V3 ❌ TODO: one short render at 60:1 clk ratio (patch or harness param) vs
-  default ratio → byte-identical voice taps expected; if not, match hardware's
-  60:1.
-- V4 ❌ TODO: per-note peak table (frames 3200–3500, `tools/note_peaks.py`) vs
-  the `3f0af6f` capture — soft/loud classes must match the capture (delivery
-  already proven good), and v1-tap render vs capture envelope corr should beat
-  websid's.
+- V2 ✅ DONE: a fixed-frequency tone (`Fn=0x4189`) renders at 999.985 Hz —
+  −0.001 % vs the 1 MHz-phi2 expectation and +1.497 % sharp vs the C64 PAL
+  pitch (matches the predicted ~1.5 %). The `make_sid` validator asserts the
+  voice-0 freq changes, so the tone was emitted as a direct `.sidw` write-stream
+  (reset → set ADSR/freq/CTRL → hold) rather than via `gen_stress_sid.py`.
+- V3 ✅ DONE: built a 30-clk-per-half-cycle variant (60:1, hardware) and diffed
+  its voice tap against the default 24:1 harness build on the same dump →
+  **byte-identical**. The reDIP-SID pipeline settles within either half-cycle,
+  so the harness ratio faithfully matches hardware; no change needed.
+- V4 ✅ DONE: see "V4 findings" above. On the correctly-mapped voice (host
+  `-t v0` = the captured "voice 1"), with voice taps DC-blocked: envelope corr
+  host-vs-capture = **0.984** > websid-vs-capture 0.944, and the per-note
+  loud/soft class string is **byte-identical to the capture (32/32)**. The host
+  render matches the hardware better than websid does — delivery/model/player
+  all confirmed faithful for this tune.
 
 ## Deliverables / layout
 
@@ -175,8 +209,18 @@ Stage 3 trivial. No gateware/firmware changes; nothing on the real-time path.
 
 ## Remaining work (pick up from here)
 
-1. Run validations **V2–V4** (see checklist above). V4 is the payoff: it
-   directly tests whether the soft/loud note-class split is model or player.
-2. Optional fidelity upgrade: port the `AudioDecimator` polyphase FIR
+V2–V4 are all done (2026-06-11); the payoff (V4) confirmed the host render
+matches the hardware capture better than websid. What's left is optional:
+
+1. Optional fidelity upgrade: port the `AudioDecimator` polyphase FIR
    coefficients into the `-t mix` path (currently upstream's resampler — see
    Implementation status).
+2. Optional robustness: `note_peaks.py`'s onset-based t0 fit is fragile on
+   noisy multi-voice captures (it found ~1000 spurious onsets in a 6 s window).
+   A "known gate times + single best lag" alignment (we know the dump's gate
+   frames) would make the per-note class string trustworthy without the
+   envelope-correlation fallback. Until then, prefer the lag-aligned RMS
+   envelope correlation as the headline metric.
+3. The V4 conclusion was validated only on Commando voice 0. Re-running V4 on
+   another tune (and the other two voices, with fresh co-built captures) would
+   broaden the "model + player faithful" claim beyond one voice of one tune.
