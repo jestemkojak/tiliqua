@@ -869,12 +869,11 @@ mod tests {
         // C64 quantum: pure phi2 domain, 19 656 phi2/frame (PAL VBlank).
         let base_sync: u64 = (init_burst_phi2_end + 2) * 60;
         let p = period_sync as u64;
-        const PAL_FRAME: u64 = 19_656;
         let base_phi2: u64 = init_burst_phi2_end + 2;
 
         for &(frame, stamp, reg, val) in events {
             let abs_phi2 = if c64 {
-                base_phi2 + (frame as u64 + 1) * PAL_FRAME + PAL_FRAME / 2 + stamp as u64
+                base_phi2 + (frame as u64 + 1) * PAL_FRAME_PHI2 + PAL_FRAME_PHI2 / 2 + stamp as u64
             } else {
                 let t_sync = base_sync
                     + (frame as u64 + 1) * p
@@ -909,9 +908,11 @@ mod tests {
     fn schedule_events_properties() {
         // (a) Strictly increasing output with min spacing 1.
         // Synthetic: 3 frames × 4 writes, all at stamp=0 (worst-case for
-        // monotone enforcement).
+        // monotone enforcement — exercises the `entry.0 = prev + 1` de-collision
+        // path in schedule_events because every write in a frame maps to the
+        // same abs_phi2 before the bump pass).
         let events: std::vec::Vec<(usize, u32, u8, u8)> = (0..3)
-            .flat_map(|f| (0..4u32).map(move |s| (f, s * 10, 0u8, 0u8)))
+            .flat_map(|f| (0..4u32).map(move |_s| (f, 0u32, 0u8, 0u8)))
             .collect();
         let prelude = std::vec![(0x04u8, 0x08u8), (0x0Bu8, 0x08u8), (0x12u8, 0x08u8)];
         let init_burst_end: u64 = prelude.len() as u64 + 10 + 5; // pretend 5 INIT writes
