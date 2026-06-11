@@ -69,7 +69,13 @@ if [ ! -x "$BIN" ] || [ "$PATCH" -nt "$BIN" ] || [ "$DEPS_DIR/sid_api_sim.cpp" -
     mkdir -p "$BUILD_DIR"
     # Patched harness lives in our tree only; deps/ is never modified.
     cp "$DEPS_DIR/sid_api_sim.cpp" "$BUILD_DIR/sid_api_sim.cpp"
-    patch -p1 -d "$BUILD_DIR" < "$PATCH" || { echo "patch failed — harness.patch may be stale relative to deps/" >&2; exit 1; }
+    # Prefer patch(1) (fuzz-tolerant), fall back to git apply (always present
+    # alongside this repo) — Fedora minimal installs lack patch.
+    if command -v patch >/dev/null 2>&1; then
+        patch -p1 -d "$BUILD_DIR" < "$PATCH" || { echo "patch failed — harness.patch may be stale relative to deps/" >&2; exit 1; }
+    else
+        ( cd "$BUILD_DIR" && git apply -p1 "$PATCH" ) || { echo "git apply failed — harness.patch may be stale relative to deps/" >&2; exit 1; }
+    fi
     # Symlink the $readmemh .hex tables (referenced by relative path at runtime)
     # and cells_sim into the build dir so the binary can run from here.
     for hx in "$DEPS_DIR"/*.hex; do ln -sf "$hx" "$BUILD_DIR/"; done
