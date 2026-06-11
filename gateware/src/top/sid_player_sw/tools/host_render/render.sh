@@ -17,7 +17,7 @@ GATEWARE_DIR="$(cd "$SCRIPT_DIR/../../../../.." && pwd)"
 DEPS_DIR="$GATEWARE_DIR/deps/sid/gateware"
 BUILD_ROOT="$GATEWARE_DIR/build/host_render"
 VENV_PY="$GATEWARE_DIR/.venv/bin/python"
-VERILATOR="${VERILATOR:-/home/pawel/src/oss-cad-suite/bin/verilator}"
+VERILATOR="${VERILATOR:-verilator}"
 PATCH="$SCRIPT_DIR/harness.patch"
 RAW2WAV="$SCRIPT_DIR/raw2wav.py"
 
@@ -44,7 +44,7 @@ done
 case "$MODEL" in 6581|8580) ;; *) echo "bad -m: $MODEL"; usage ;; esac
 case "$TAP" in mix|v0|v1|v2) ;; *) echo "bad -t: $TAP"; usage ;; esac
 [ -f "$INPUT" ] || { echo "input not found: $INPUT" >&2; exit 1; }
-[ -x "$VERILATOR" ] || { echo "verilator not found at $VERILATOR (set \$VERILATOR)" >&2; exit 1; }
+command -v "$VERILATOR" >/dev/null 2>&1 || { echo "verilator not found: $VERILATOR (set \$VERILATOR to override)" >&2; exit 1; }
 
 if [ -z "$OUT" ]; then
     base="$(basename "$INPUT" .sidw)"
@@ -64,12 +64,12 @@ SID2_FLAG=""
 BUILD_DIR="$BUILD_ROOT/sim_${MODEL}"
 BIN="$BUILD_DIR/Vsid_api"
 
-if [ ! -x "$BIN" ]; then
+if [ ! -x "$BIN" ] || [ "$PATCH" -nt "$BIN" ] || [ "$DEPS_DIR/sid_api_sim.cpp" -nt "$BIN" ]; then
     echo "[stage A] building verilated sim for ${MODEL} ..."
     mkdir -p "$BUILD_DIR"
     # Patched harness lives in our tree only; deps/ is never modified.
     cp "$DEPS_DIR/sid_api_sim.cpp" "$BUILD_DIR/sid_api_sim.cpp"
-    ( cd "$BUILD_DIR" && git apply -p1 "$PATCH" )
+    patch -p1 -d "$BUILD_DIR" < "$PATCH" || { echo "patch failed — harness.patch may be stale relative to deps/" >&2; exit 1; }
     # Symlink the $readmemh .hex tables (referenced by relative path at runtime)
     # and cells_sim into the build dir so the binary can run from here.
     for hx in "$DEPS_DIR"/*.hex; do ln -sf "$hx" "$BUILD_DIR/"; done

@@ -52,6 +52,13 @@ The reDIP-SID model (6581 vs 8580) is selected by a Verilog ``` `define SID2 ```
 `gateware/build/host_render/sim_<model>/`. The upstream `--sid-model` runtime
 flag only masks filter-register bits and is unused here.
 
+## Running the sim binary by hand
+
+When you invoke the verilated binary (`Vsid_api`) directly without `render.sh`,
+the upstream default sample rate is **96 000 Hz** (see `--help`). `render.sh`
+always passes `--sample-rate 48000` explicitly, so the WAVs it produces are
+always 48 kHz regardless of that default.
+
 ## Patch note (deps/ is never modified)
 
 `harness.patch` is a `git apply -p1` diff against
