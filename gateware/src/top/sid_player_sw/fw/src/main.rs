@@ -91,36 +91,46 @@ fn output_mute(mute: bool) {
 /// clears run 25+ writes back-to-back), so poll `writable` before each write;
 /// bounded so a hardware fault can't wedge the caller (falls back to dropping).
 fn drain_sid_writes(bus: &mut player::PsidBus) {
-    let p = unsafe { pac::Peripherals::steal() };
     for w in bus.writes.iter() {
-        let mut spins = 0u32;
-        while p.SID_PERIPH.txn_status().read().writable().bit_is_clear() {
-            spins += 1;
-            if spins >= 100_000 { break; }
-        }
-        sid_write(w.reg, w.val);
+        sid_write_bp(w.reg, w.val);
     }
     bus.writes.clear();
 }
 
-/// Reset the SID to its power-on register state: $00 to all 25 registers,
-/// ascending (each voice's CTRL is zeroed before its SR, so anything sounding
-/// is gated off into the fastest release). PSID tunes assume a freshly reset
+/// One backpressured SID write: poll the FIFO's `writable` before pushing
+/// (bounded: a hardware fault degrades to a dropped write, not a hang).
+fn sid_write_bp(reg: u8, val: u8) {
+    let p = unsafe { pac::Peripherals::steal() };
+    let mut spins = 0u32;
+    while p.SID_PERIPH.txn_status().read().writable().bit_is_clear() {
+        spins += 1;
+        if spins >= 100_000 { break; }
+    }
+    sid_write(reg, val);
+}
+
+/// Reset the SID to its power-on state. PSID tunes assume a freshly reset
 /// chip: Commando's INIT writes only the three gates + volume, and its frame-0
 /// gate-ons then play whatever waveform/freq/sustain the *previous* tune or
 /// run left behind — an audible stale-register noise burst at tune start that
 /// a real C64 doesn't have. Run between image load and INIT on every (re)load.
-/// 25 writes exceed the depth-16 transaction FIFO, so poll `writable` like
-/// `drain_sid_writes` (bounded: a fault degrades to dropped clears, not a hang).
+///
+/// Two steps, because register clears alone cannot reach oscillator state:
+/// 1. TEST bit on all voices — zeroes each oscillator's phase accumulator and
+///    resets the noise LFSR. Ring-mod / hard-sync voices (Commando's intro:
+///    ctrl $15/$43) shape their output from the *neighbour* oscillator's
+///    phase, so matching a fresh chip needs accumulators at 0, not just
+///    registers. TEST stays set while the clears below drain (~1µs/write) and
+///    is released by the zero pass reaching each CTRL register.
+/// 2. $00 to all 25 registers, ascending (each voice's CTRL is zeroed before
+///    its SR, so anything sounding is gated off into the fastest release).
+/// 28 writes exceed the depth-16 transaction FIFO -> backpressured writes.
 fn sid_reset() {
-    let p = unsafe { pac::Peripherals::steal() };
+    for v in 0..3u8 {
+        sid_write_bp(4 + v * 7, 0x08);
+    }
     for reg in 0..=0x18u8 {
-        let mut spins = 0u32;
-        while p.SID_PERIPH.txn_status().read().writable().bit_is_clear() {
-            spins += 1;
-            if spins >= 100_000 { break; }
-        }
-        sid_write(reg, 0);
+        sid_write_bp(reg, 0);
     }
 }
 

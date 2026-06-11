@@ -698,7 +698,11 @@ mod tests {
         cpu.registers.stack_pointer.0 = 0xFD;
         assert!(init(&mut cpu, hdr.init_addr, hdr.start_song.saturating_sub(1) as u8, 2_000_000));
 
-        let (w0, w1) = (2690usize, 2820usize);
+        // Window via env: GATE_TRACE_FRAMES="3240:3360" (default ≈ 53.8–56.4 s).
+        let (w0, w1) = std::env::var("GATE_TRACE_FRAMES").ok()
+            .and_then(|s| s.split_once(':')
+                .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+            .unwrap_or((2690usize, 2820usize));
         // shadow SID register file to know freq/AD/SR at each gate event
         let mut regs = [0u8; 25];
         for frame in 0..w1 {
@@ -711,6 +715,7 @@ mod tests {
                         let old = regs[r];
                         let (g0, g1) = (old & 1, w.val & 1);
                         let freq = u16::from_le_bytes([regs[v * 7], regs[v * 7 + 1]]);
+                        let pw = u16::from_le_bytes([regs[v * 7 + 2], regs[v * 7 + 3]]) & 0xFFF;
                         let wave = w.val & 0xF0;
                         let edge = match (g0, g1) {
                             (0, 1) => "ON ",
@@ -719,7 +724,7 @@ mod tests {
                         };
                         eprintln!(
                             "frame {frame} t={:>7.2}s v{v} {edge} ctrl={:02X} wave={wave:02X} \
-                             freq={freq:04X} ad={:02X} sr={:02X}",
+                             freq={freq:04X} pw={pw:03X} ad={:02X} sr={:02X}",
                             frame as f64 * 0.02, w.val,
                             regs[v * 7 + 5], regs[v * 7 + 6]);
                     }
