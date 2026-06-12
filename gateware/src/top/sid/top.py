@@ -279,12 +279,21 @@ class SIDPeripheral(wiring.Component):
         writable: csr.Field(csr.action.R, unsigned(1))
         level:    csr.Field(csr.action.R, unsigned(5))   # occupancy; fits depth<=31
 
-    def __init__(self, *, transaction_depth=16, sid2_define=True):
+    class Phi2Sel(csr.Register, access="rw"):
+        """SID phi2 standard select: 0 = phi2_hz[0] (PAL), 1 = phi2_hz[1] (NTSC).
+        Reset 0. Firmware writes this on every tune load (AUTO follows the
+        PSID header) — see sid_player_sw fw/src/main.rs."""
+        sel: csr.Field(csr.action.RW, unsigned(1))
+
+    def __init__(self, *, transaction_depth=16, sid2_define=True,
+                 sync_hz=60_000_000, phi2_hz=(1_000_000, 1_000_000)):
         self._sid2_define = sid2_define
+        self._sync_hz  = sync_hz
+        self._phi2_hz  = phi2_hz
         self._transactions = SyncFIFO(width=16, depth=transaction_depth)
         self._midi_read_fifo = SyncFIFOBuffered(width=24, depth=8)
 
-        regs = csr.Builder(addr_width=5, data_width=8)
+        regs = csr.Builder(addr_width=6, data_width=8)
         self._transaction_data = regs.add("transaction_data", self.TransactionData(), offset=0x0)
         self._midi_write  = regs.add("midi_write",    self.MidiWrite(),   offset=0x4)
         self._midi_read   = regs.add("midi_read",     self.MidiRead(),    offset=0x8)
@@ -293,6 +302,7 @@ class SIDPeripheral(wiring.Component):
         self._midi_endp   = regs.add("usb_midi_endp", self.UsbMidiCfg(),  offset=0x14)
         self._build_model = regs.add("build_model",   self.BuildModel(),  offset=0x18)
         self._txn_status  = regs.add("txn_status",    self.TxnStatus(),   offset=0x1C)
+        self._phi2_sel    = regs.add("phi2_sel",      self.Phi2Sel(),     offset=0x20)
         self._bridge = csr.Bridge(regs.as_memory_map())
 
         self.sid = None
@@ -313,6 +323,9 @@ class SIDPeripheral(wiring.Component):
             # MIDI output ports (driven from CSR writes, read by SIDSoc)
             "usb_midi_host":   Out(1),
             "usb_midi_cfg_id": Out(4),
+            # phi2 standard currently selected (mirrors the phi2_sel CSR) —
+            # read by the SoC top to mux the per-standard audio decimators.
+            "phi2_sel":        Out(1),
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -330,19 +343,16 @@ class SIDPeripheral(wiring.Component):
             self._transactions.w_data.eq(Mux(self.ext_w_en, self.ext_w_data, self._transaction_data.f.transaction_data.w_data)),
         ]
 
-        DIVIDE_BY = 60 # sync clk / 60 should be ~1MHz. TODO generate this constant
-        phi2_clk_counter = Signal(8)
-        with m.If(phi2_clk_counter != DIVIDE_BY-1):
-            m.d.sync += phi2_clk_counter.eq(phi2_clk_counter + 1)
-        with m.Else():
-            m.d.sync += phi2_clk_counter.eq(0)
-
-        phi2 = Signal()
-        phi2_edge = Signal()
+        # Fractional-N phi2 divider, runtime-selectable standard (phi2_sel
+        # CSR). Defaults make this a flat /60 (~1MHz) exactly as before.
+        m.submodules.phi2_div = phi2_div = Phi2Divider(
+            sync_hz=self._sync_hz, phi2_hz=self._phi2_hz)
         m.d.comb += [
-            phi2.eq(phi2_clk_counter > int(DIVIDE_BY/2)),
-            phi2_edge.eq(phi2_clk_counter == (DIVIDE_BY-1))
+            phi2_div.sel.eq(self._phi2_sel.f.sel.data),
+            self.phi2_sel.eq(self._phi2_sel.f.sel.data),
         ]
+        phi2      = phi2_div.phi2
+        phi2_edge = phi2_div.phi2_edge
 
         # 'always' signals
         m.d.sync += [
