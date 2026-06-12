@@ -211,12 +211,31 @@ fn play_tick() {
     });
 }
 
+/// Drive the gateware phi2 divider (0 = PAL 985.5kHz, 1 = NTSC 1.023MHz).
+/// Like the scope CSRs this register is independent of the SID ISR state, so
+/// no critical section is needed; the worst race with reload_tune is
+/// last-write-wins of two writes derived from the same header.
+fn set_phi2(clock: psid::Clock) {
+    let ntsc = clock == psid::Clock::Ntsc;
+    unsafe { (*pac::SID_PERIPH::ptr()).phi2_sel().write(|w| w.sel().bit(ntsc)) };
+}
+
+/// Effective SID clock standard for the Clock menu row:
+/// 0 = AUTO (follow the PSID header), 1 = force PAL, 2 = force NTSC.
+fn effective_clock(clock_sel: usize, hdr: &psid::PsidHeader) -> psid::Clock {
+    match clock_sel {
+        1 => psid::Clock::Pal,
+        2 => psid::Clock::Ntsc,
+        _ => hdr.clock(),
+    }
+}
+
 /// Load a tune+subtune into the shared CPU and run INIT, under a critical
 /// section so it can't race the timer ISR. Returns Some((play_period_cycles,
 /// play_hz)) on success; None (leaving the current tune untouched) if the file
 /// is unsupported/corrupt. The caller must update the TIMER0 reload on Some.
 fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
-               subtune: u16) -> Option<(u32, u32)> {
+               subtune: u16, clock_sel: usize) -> Option<(u32, u32)> {
     let mut period: Option<u64> = None;
     critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
@@ -236,6 +255,12 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
         pb.play_addr = hdr.play_addr;
         pb.paused = false;
     });
+    if period.is_some() {
+        // Successful load: retune the SID phi2 to this tune's standard
+        // (or the forced override). Pitch follows the same header source
+        // that already drives tempo.
+        set_phi2(effective_clock(clock_sel, hdr));
+    }
     period.map(|p| (p as u32, (CLOCK_SYNC_HZ as u64 / p) as u32))
 }
 
@@ -245,7 +270,7 @@ enum Page { Player, Scope }
 
 /// Row count per card, including the "Page" row at index 0.
 fn rows_in(page: Page) -> usize {
-    match page { Page::Player => 4, Page::Scope => 6 }
+    match page { Page::Player => 5, Page::Scope => 6 }
 }
 
 /// Selectable scope timebases / vertical scales (display label via IntoStaticStr).
@@ -425,6 +450,7 @@ fn main() -> ! {
           hdr.clock(), hdr.is_cia(current_subtune), cia, period, CLOCK_SYNC_HZ / period);
     let mut play_hz = CLOCK_SYNC_HZ / period;
     let mut play_period = period;
+    set_phi2(hdr.clock()); // boot = AUTO: match the initial tune's standard
 
     // Hand the initialised CPU to the shared, ISR-visible playback state.
     critical_section::with(|cs| {
@@ -455,6 +481,8 @@ fn main() -> ! {
     let mut ys_idx: usize = 2;   // VSCALES index   -> 2V/d
     let mut intensity: u8 = 8;   // 0..15
     let mut hue: u8       = 0;   // 0..15
+    // Player-card Clock row: 0=AUTO (follow PSID header), 1=PAL, 2=NTSC.
+    let mut clock_sel: usize = 0;
 
     handler!(timer0 = || play_tick());
     irq::scope(|s| {
@@ -478,7 +506,7 @@ fn main() -> ! {
                         info!("Hot-plug: loaded {} bytes from USB", n);
                         let start = psid::PsidHeader::parse(&tune_buf[..n])
                             .map(|h| h.start_song).unwrap_or(1);
-                        if let Some((p, hz)) = reload_tune(tune_buf, n, &mut hdr, start) {
+                        if let Some((p, hz)) = reload_tune(tune_buf, n, &mut hdr, start, clock_sel) {
                             len = n; current_file = 0; current_subtune = start;
                             paused = false; playing_fallback = false; unsupported = false;
                             output_mute(false);
@@ -521,12 +549,17 @@ fn main() -> ! {
                                     .clamp(1, hdr.songs as i16) as u16;
                                 // Same (already-valid) tune, just a new subtune.
                                 if let Some((p, hz)) =
-                                    reload_tune(tune_buf, len, &mut hdr, current_subtune) {
+                                    reload_tune(tune_buf, len, &mut hdr, current_subtune, clock_sel) {
                                     paused = false; output_mute(false);
                                     play_period = p; play_hz = hz;
                                     set_play_period(&mut timer, play_period);
                                 }
                             }
+                        }
+                        (Page::Player, 3) => {
+                            clock_sel = (clock_sel as i16 + ticks as i16)
+                                .clamp(0, 2) as usize;
+                            set_phi2(effective_clock(clock_sel, &hdr));
                         }
                         (Page::Scope, 1) => {
                             decay = (decay as i16 + ticks as i16).clamp(1, 80) as u8;
@@ -580,7 +613,7 @@ fn main() -> ! {
                                         let start = psid::PsidHeader::parse(&tune_buf[..n])
                                             .map(|h| h.start_song).unwrap_or(1);
                                         if let Some((p, hz)) =
-                                            reload_tune(tune_buf, n, &mut hdr, start) {
+                                            reload_tune(tune_buf, n, &mut hdr, start, clock_sel) {
                                             len = n; current_file = browse_idx;
                                             current_subtune = start;
                                             paused = false; unsupported = false;
@@ -602,7 +635,8 @@ fn main() -> ! {
                         }
                     }
                     (Page::Player, 2) => { modify = !modify; }
-                    (Page::Player, 3) => {
+                    (Page::Player, 3) => { modify = !modify; }
+                    (Page::Player, 4) => {
                         paused = !paused;
                         critical_section::with(|cs| {
                             if let Some(pb) = PLAYBACK.borrow_ref_mut(cs).as_mut() {
@@ -665,7 +699,7 @@ fn main() -> ! {
                 // drives the metadata line at y=150, so extend the band to it.
                 let y   = vy0 + vspace * row as i32;
                 let top = y - 15;
-                let bot = if page == Page::Player && row == 2 { 155 } else { y + 5 };
+                let bot = if page == Page::Player && row == 2 { 167 } else { y + 5 };
                 Rectangle::new(Point::new(0, top),
                                Size::new(h_active as u32, (bot - top) as u32))
                     .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
@@ -695,6 +729,7 @@ fn main() -> ! {
                     (_, 0)            => "Menu",
                     (Page::Player, 1) => "File",
                     (Page::Player, 2) => "Song",
+                    (Page::Player, 3) => "Clock",
                     (Page::Player, _) => "State",
                     (Page::Scope, 1)  => "Decay",
                     (Page::Scope, 2)  => "Timebase",
@@ -712,6 +747,19 @@ fn main() -> ! {
                         write!(value, "{}{}", mark, fname).ok();
                     }
                     (Page::Player, 2) => { write!(value, "{}/{}", current_subtune, hdr.songs).ok(); }
+                    (Page::Player, 3) => {
+                        match clock_sel {
+                            1 => { write!(value, "PAL").ok(); }
+                            2 => { write!(value, "NTSC").ok(); }
+                            _ => {
+                                let c = match hdr.clock() {
+                                    psid::Clock::Ntsc => "NTSC",
+                                    psid::Clock::Pal  => "PAL",
+                                };
+                                write!(value, "AUTO ({})", c).ok();
+                            }
+                        }
+                    }
                     (Page::Player, _) => {
                         let state = if unsupported { "UNSUPPORTED!" }
                                     else if paused { "PAUSED" } else { "PLAYING" };
@@ -740,7 +788,7 @@ fn main() -> ! {
                 let mut meta: String<40> = String::new();
                 write!(meta, "{}  {}  {}  {} Hz",
                        hdr.model().as_str(), clock_str, speed_str, play_hz).ok();
-                Text::with_alignment(meta.as_str(), Point::new(cx, 150),
+                Text::with_alignment(meta.as_str(), Point::new(cx, 162),
                                      style_dim, Alignment::Center)
                     .draw(&mut display).ok();
             }
