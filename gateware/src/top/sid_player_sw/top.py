@@ -40,6 +40,15 @@ VoiceSmoother = _smooth.VoiceSmoother
 LinearUpsampler = _smooth.LinearUpsampler
 StreamThrottle = _smooth.StreamThrottle
 
+# Runtime-selectable SID phi2 rates. "Clean" near-PAL/NTSC targets chosen so
+# the AudioDecimator stays small (ratios 32/657 and 16/341; FIR tap ROM =
+# 5*m_down): exact 985248/1022727 Hz would need 51k/1.7M-tap FIRs (infeasible).
+# Pitch error vs a real C64: +0.44 / +0.46 cents — far below the ~5 cent
+# audibility threshold. See
+# docs/superpowers/specs/2026-06-12-sid-phi2-runtime-select-design.md.
+PHI2_HZ_PAL  = 985_500
+PHI2_HZ_NTSC = 1_023_000
+
 
 _USB_STATUS_LAYOUT = data.StructLayout({
     "connected": 1, "ready": 1, "busy": 1,
@@ -211,7 +220,10 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # timing smears -> dropped notes. See docs/sid_player_sw_dropped_notes_*.
         kwargs.setdefault("cpu_variant", "tiliqua_rv32im_bigcache")
         super().__init__(finalize_csr_bridge=False, mainram_size=0x4000, **kwargs)
-        self.sid_periph = SIDPeripheral(sid2_define=(self.sid_model == "8580"))
+        self.sid_periph = SIDPeripheral(
+            sid2_define=(self.sid_model == "8580"),
+            sync_hz=self.clock_settings.frequencies.sync,
+            phi2_hz=(PHI2_HZ_PAL, PHI2_HZ_NTSC))
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
         self.usb_msc = USBMSCPeripheral()
         self.csr_decoder.add(self.usb_msc.bus, addr=0x1200, name="usb_msc")
@@ -281,12 +293,25 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # above 24kHz into the audible band as broadband grit; the polyphase FIR
         # band-limits it first. See top/sid/audio.py.
         AudioDecimator = self._import_sid_audio().AudioDecimator
-        m.submodules.audio_decim = audio_decim = AudioDecimator(
-            fs_in=1_000_000, fs_out=self.clock_settings.audio_clock.fs())
-        m.d.comb += [
-            audio_decim.i.valid.eq(self.sid_periph.audio_strobe),
-            audio_decim.i.payload.as_value().eq(self.sid_periph.last_audio_left >> 8),
-        ]
+        fs_out = self.clock_settings.audio_clock.fs()
+        # One decimator per phi2 standard (the FIR ratio is fixed at
+        # elaboration by fs_in); both always run off the same strobe, the
+        # phi2_sel CSR muxes which output is heard. The unselected one sees a
+        # ~3.8%-off fs_in — harmless, its output is ignored.
+        m.submodules.audio_decim_pal = decim_pal = AudioDecimator(
+            fs_in=PHI2_HZ_PAL, fs_out=fs_out)
+        m.submodules.audio_decim_ntsc = decim_ntsc = AudioDecimator(
+            fs_in=PHI2_HZ_NTSC, fs_out=fs_out)
+        for decim in (decim_pal, decim_ntsc):
+            m.d.comb += [
+                decim.i.valid.eq(self.sid_periph.audio_strobe),
+                decim.i.payload.as_value().eq(self.sid_periph.last_audio_left >> 8),
+            ]
+        audio_out = Signal(dsp.ASQ)
+        with m.If(self.sid_periph.phi2_sel):
+            m.d.comb += audio_out.eq(decim_ntsc.o)
+        with m.Else():
+            m.d.comb += audio_out.eq(decim_pal.o)
 
         pmod0 = self.pmod0_periph.pmod
         m.d.comb += [
@@ -294,7 +319,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
             pmod0.i_cal.payload[0].as_value().eq(sid.voice0_dca),
             pmod0.i_cal.payload[1].as_value().eq(sid.voice1_dca),
             pmod0.i_cal.payload[2].as_value().eq(sid.voice2_dca),
-            pmod0.i_cal.payload[3].as_value().eq(audio_decim.o.as_value()),
+            pmod0.i_cal.payload[3].as_value().eq(audio_out.as_value()),
         ]
 
         # --- Voice scope ---------------------------------------------------

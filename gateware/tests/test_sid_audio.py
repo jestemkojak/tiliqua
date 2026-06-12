@@ -59,22 +59,31 @@ def _measure_tone_rms(freq_hz, fs_in=1_000_000, amp=0.4, n_in=4000, warmup=1200)
     return math.sqrt(sum(v * v for v in collected) / len(collected))
 
 
+# Runtime-selectable SID phi2 rates (must match PHI2_HZ_PAL/NTSC in
+# top/sid_player_sw/top.py). Decimator ratios: 32/657 and 16/341.
+PHI2_RATES = (985_500, 1_023_000)
+
+
 class SidAudioTests(unittest.TestCase):
 
     def test_passband_tone_survives(self):
-        """A 1kHz tone (well within the audio band) passes ~unattenuated."""
-        rms = _measure_tone_rms(1_000)
-        # input amp 0.4 -> expected RMS ~0.28; allow filter/quantization margin.
-        assert rms > 0.15, f"1kHz tone unexpectedly attenuated: rms={rms:.4f}"
+        """A 1kHz tone (well within the audio band) passes ~unattenuated at
+        both phi2 rates. warmup covers the PAL FIR group delay (3296 taps ->
+        ~1648 input samples)."""
+        for fs_in in PHI2_RATES:
+            rms = _measure_tone_rms(1_000, fs_in=fs_in, n_in=5500, warmup=2600)
+            assert rms > 0.15, (
+                f"fs_in={fs_in}: 1kHz tone unexpectedly attenuated: rms={rms:.4f}")
 
     def test_aliasing_tone_rejected(self):
-        """A 100kHz tone would alias to 4kHz under naive 48kHz sampling; the
-        anti-alias FIR must reject it so it never reaches the output."""
-        rms_pass = _measure_tone_rms(1_000)
-        rms_alias = _measure_tone_rms(100_000)
-        assert rms_alias < 0.25 * rms_pass, (
-            f"100kHz tone not rejected: alias_rms={rms_alias:.4f} "
-            f"passband_rms={rms_pass:.4f}")
+        """A 100kHz tone would alias into the audio band under naive 48kHz
+        sampling; the anti-alias FIR must reject it at both phi2 rates."""
+        for fs_in in PHI2_RATES:
+            rms_pass = _measure_tone_rms(1_000, fs_in=fs_in, n_in=5500, warmup=2600)
+            rms_alias = _measure_tone_rms(100_000, fs_in=fs_in, n_in=5500, warmup=2600)
+            assert rms_alias < 0.25 * rms_pass, (
+                f"fs_in={fs_in}: 100kHz tone not rejected: alias_rms={rms_alias:.4f} "
+                f"passband_rms={rms_pass:.4f}")
 
 
 if __name__ == "__main__":
