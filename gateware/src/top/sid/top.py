@@ -52,6 +52,7 @@ MIDI controllers supported:
 
 import os
 import sys
+from fractions import Fraction
 
 from amaranth import *
 from amaranth.lib import data, stream, wiring
@@ -173,6 +174,82 @@ class SID(wiring.Component):
         )
 
         return m
+
+class Phi2Divider(wiring.Component):
+
+    """
+    Fractional-N divider generating the SID phi2 square wave + edge strobe.
+
+    The period alternates between ``P`` and ``P+1`` sync cycles, steered by a
+    small accumulator (classic fractional-N), so the *average* rate is exactly
+    ``sync_hz / (P + num/den)`` for the selected standard. phi2 edges land on
+    the sync-clock grid -> +/-1 sync cycle (16.7ns) deterministic jitter;
+    sidebands are <-80dB in the audio band and further averaged by the
+    decimation FIR downstream — inaudible.
+
+    All divider state updates only at phi2 cadence (~1MHz), so nothing here
+    joins the 60MHz critical path (the reSID filter muladd).
+
+    With the default ``phi2_hz=(1_000_000, 1_000_000)`` the fraction is 0 and
+    the divider degenerates to the old flat /60 counter, bit-identical for
+    both ``sel`` values — non-opted-in SID targets are unchanged.
+    """
+
+    def __init__(self, sync_hz=60_000_000, phi2_hz=(1_000_000, 1_000_000)):
+        self._consts = []
+        for hz in phi2_hz:
+            frac = Fraction(sync_hz, hz)
+            p = frac.numerator // frac.denominator
+            self._consts.append((p, frac.numerator - p * frac.denominator,
+                                 frac.denominator))
+        super().__init__({
+            "sel":       In(1),   # 0 = phi2_hz[0], 1 = phi2_hz[1]
+            "phi2":      Out(1),  # ~50% duty square wave
+            "phi2_edge": Out(1),  # 1-sync-cycle pulse at each period wrap
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+
+        (p0, n0, d0), (p1, n1, d1) = self._consts
+        max_p = max(p0, p1) + 1  # +1: the long (P+1) period
+
+        # Selected constants (sel is quasi-static: a CSR the firmware writes
+        # on tune load; the muxes feed only phi2-cadence registers).
+        base = Signal(range(max_p + 1))
+        num  = Signal(range(max(n0, n1) + 1))
+        den  = Signal(range(max(d0, d1) + 1))
+        m.d.comb += [
+            base.eq(Mux(self.sel, p1, p0)),
+            num .eq(Mux(self.sel, n1, n0)),
+            den .eq(Mux(self.sel, d1, d0)),
+        ]
+
+        counter = Signal(range(max_p + 1))
+        period  = Signal(range(max_p + 1), init=p0)
+        # Invariant acc < den in steady state; a sel switch can leave
+        # acc >= new den, which the subtract branch drains within a few
+        # periods (period reads base+1 meanwhile — harmless transient).
+        acc = Signal(range(2 * max(d0, d1)))
+
+        # `>=` (not `!=`) so a period shrink across a sel switch can never
+        # strand the counter past the wrap point.
+        with m.If(counter >= period - 1):
+            m.d.sync += counter.eq(0)
+            # Fractional accumulator chooses the next period length.
+            with m.If(acc + num >= den):
+                m.d.sync += [acc.eq(acc + num - den), period.eq(base + 1)]
+            with m.Else():
+                m.d.sync += [acc.eq(acc + num), period.eq(base)]
+        with m.Else():
+            m.d.sync += counter.eq(counter + 1)
+
+        m.d.comb += [
+            self.phi2.eq(counter > (period >> 1)),
+            self.phi2_edge.eq(counter == period - 1),
+        ]
+        return m
+
 
 class SIDPeripheral(wiring.Component):
     class TransactionData(csr.Register, access="w"):
