@@ -174,6 +174,14 @@ that throwaway script into `tools/note_peaks.py` while at it).
   pitch (matches the predicted ~1.5 %). The `make_sid` validator asserts the
   voice-0 freq changes, so the tone was emitted as a direct `.sidw` write-stream
   (reset → set ADSR/freq/CTRL → hold) rather than via `gen_stress_sid.py`.
+  Cross-checked at full-tune scale (2026-06-12): rendering Commando voice 0 both
+  ways (default vs `DUMP_C64=1`, `-m 6581 -t v0`) gives 211.5 s vs 208.4 s — a
+  constant **1.497 %** time-stretch. Linearly time-warping the C64 render onto the
+  hardware length lifts the RMS-envelope correlation to **0.993**, i.e. the only
+  systematic difference between the two is that single constant tempo/pitch
+  offset; notes and envelopes are otherwise identical. (Raw sample corr stays
+  low, ~0.06 — aliased point-sampled carrier phase isn't preserved by resampling,
+  so envelope is the right metric, as in V4.)
 - V3 ✅ DONE: built a 30-clk-per-half-cycle variant (60:1, hardware) and diffed
   its voice tap against the default 24:1 harness build on the same dump →
   **byte-identical**. The reDIP-SID pipeline settles within either half-cycle,
