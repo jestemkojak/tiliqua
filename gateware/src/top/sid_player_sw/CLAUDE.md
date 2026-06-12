@@ -32,13 +32,14 @@ tunes use them); revisit if a future tune requires them.
   broadband "grit" (the audible difference vs a software-reSID reference, which
   resamples with a FIR). Confirmed by WAV analysis: spectral flatness 0.43 vs reSID
   0.34, elevated >10kHz energy, stair-stepped waveform.
-- Fix: `top/sid/audio.py` `AudioDecimator` = polyphase FIR (`dsp.Resample`,
-  n_up/m_down from fs_out/fs_in → 6/125, ~19kHz cutoff) + small input FIFO (absorbs the
-  single-MAC FIR's per-output backpressure burst). Fed by `SIDPeripheral.audio_strobe`
-  (1MHz, pulses the cycle after each `last_audio_*` latch so it sees the fresh sample).
-  Costs ~570 LUTs + 1 multiplier; runs at phi2 cadence so it does NOT join the critical
-  path (sync Fmax unchanged ~55MHz). Host-tested in `tests/test_sid_audio.py` (1kHz
-  passes, 100kHz alias-tone rejected).
+- Fix: `top/sid/audio.py` `AudioDecimator` = polyphase FIR (`dsp.Resample`). Two
+  instances (PAL 985.5kHz → 32/657, NTSC 1.023MHz → 16/341) run in parallel;
+  the `phi2_sel` CSR (0=PAL, 1=NTSC, firmware auto-sets from the PSID header
+  per tune, Clock menu row overrides) muxes which one reaches the codec/scope
+  mix. phi2 itself comes from `Phi2Divider` (fractional-N, `src/top/sid/top.py`)
+  at the same rates — true C64 pitch within +0.5 cents. Small input FIFO
+  (absorbs the single-MAC FIR's per-output backpressure burst). Fed by
+  `SIDPeripheral.audio_strobe`.
 ## Voice scope signal path (audio ALWAYS wins over visuals)
 - The 3 voice taps (`sid.voiceN_dca`) are ~1MHz reSID outputs (ASQ Q1.15) with a
   model-dependent DC bias (6581 `VOICE_DC` = ½ dynamic range; 8580 = 0). Point-sampling
