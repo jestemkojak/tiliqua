@@ -31,6 +31,33 @@ cd ..
 (defaults: `-i /tmp/sid_writes.sidw -m 6581 -t mix`, phi2 = 1 000 000 Hz,
 sample-rate = 48 000 Hz).
 
+## Dumping a different tune
+
+Step 1 (the `dump_writes` host test) is model-agnostic — it just runs the tune
+through our `mos6502` and records the SID register write-stream. Point it at any
+`.sid` with env vars:
+
+| env var        | default              | meaning                                   |
+| -------------- | -------------------- | ----------------------------------------- |
+| `DUMP_SID`     | `docs/Commando.sid`  | path to the `.sid` to dump                |
+| `DUMP_SUBTUNE` | header `start_song`  | which subtune (1-based)                   |
+| `DUMP_FRAMES`  | `10600`              | # of 50 Hz PAL frames (10600 ≈ 211 s)     |
+| `DUMP_OUT`     | `/tmp/sid_writes.sidw` | write-stream output path                |
+| `DUMP_C64`     | `0`                  | `1` for C64-timing mode                   |
+
+```sh
+cd gateware/src/top/sid_player_sw/fw
+DUMP_SID=/path/to/foo.sid DUMP_SUBTUNE=1 DUMP_FRAMES=3000 DUMP_OUT=/tmp/foo.sidw \
+  cargo test --target x86_64-unknown-linux-gnu --lib dump_writes -- --ignored --nocapture
+cd ../tools/host_render
+./render.sh -i /tmp/foo.sidw -m 6581 -t v0 -o foo-v0.wav   # -m must match the tune's model
+```
+
+The dump prints `clock` / `cia` / `cia_timer` / `period_sync` so you can verify
+the rate it picked. The model is **not** in the dump — `render.sh -m {6581,8580}`
+selects the reDIP-SID RTL model, and must match the tune's declared chip (PSID
+header `flags` bits 4-5) for correct filter timbre.
+
 ## tap vs mix semantics
 
 - **`-t v0|v1|v2`** point-samples the `voiceN_dca_o` RTL tap at 48 kHz with **no
@@ -40,9 +67,14 @@ sample-rate = 48 000 Hz).
   comparison. The external C64 RC output filter is also skipped (jack taps are
   pre-codec digital values). Raw format: **s16le**. The WAV is **AC-coupled**
   (`raw2wav.py --dc-block`): the 6581 voice DCA carries a ~+0.38-FS `VOICE_DC`
-  bias that the AC-coupled hardware codec strips, so removing it here keeps the
-  tap comparable to a jack capture / websid export (without it, `abs()`/RMS
-  per-note analysis is swamped by the offset — see the spec's V4 findings).
+  bias. Note the Tiliqua path is **DC-coupled** — the `I2SCalibrator` `A·x+B`
+  (`eurorack_pmod.py`) only nulls the codec's own zero (`B`≈0.03/0.0), not the
+  signal DC, and the eurorack-pmod jack is DC-coupled by design — so on hardware
+  the bias reaches the jack. It is stripped *downstream* by the AC-coupled input
+  of whatever records the jack (and websid's voice export is likewise
+  AC-coupled/normalized). `--dc-block` therefore mimics the **recorder**, not the
+  Tiliqua, keeping the tap comparable to a jack capture / websid export (without
+  it, `abs()`/RMS per-note analysis is swamped by the offset — see spec V4).
 
   **Voice numbering — read this before comparing to a capture.** The taps are
   **0-indexed** (`v0` = `voice0_dca_o`). Recordings named `*-1voice-*` or

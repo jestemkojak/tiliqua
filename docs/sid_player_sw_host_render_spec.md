@@ -49,8 +49,12 @@ end-to-end). Deltas vs the spec below and remaining work:
 
 1. **6581 voice taps carry a DC bias.** `voiceN_dca_o` on the 6581 sits at
    ~+0.38 FS (the model's `VOICE_DC` ≈ ½ dynamic range; the 8580's is 0). The
-   hardware voice path is AC-coupled (codec), so jack captures / websid exports
-   are DC-free. Comparing a raw tap WAV (DC-laden) to a capture makes
+   Tiliqua voice path is in fact **DC-coupled** — `I2SCalibrator`'s `A·x+B`
+   (`eurorack_pmod.py`) only nulls the codec's own zero, and the eurorack-pmod
+   jack is DC-coupled by design — so the bias reaches the jack on hardware. It's
+   stripped *downstream* by the AC-coupled input of whatever records the jack
+   (and websid's voice export is AC-coupled too), which is why jack captures /
+   websid exports are DC-free. Comparing a raw tap WAV (DC-laden) to a capture makes
    `abs()`/RMS analysis useless — the offset swamps the per-note dynamics
    (with DC: host per-note peaks span only 1.15×; without: the real ~4× split
    appears). **Fix:** `render.sh` now AC-couples voice taps via
