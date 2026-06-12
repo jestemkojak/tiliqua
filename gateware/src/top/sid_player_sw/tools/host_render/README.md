@@ -28,8 +28,8 @@ cd ..
 ```
 
 `render.sh [-i dump.sidw] [-m 6581|8580] [-t mix|v0|v1|v2] [-o out.wav]`
-(defaults: `-i /tmp/sid_writes.sidw -m 6581 -t mix`, phi2 = 1 000 000 Hz,
-sample-rate = 48 000 Hz).
+(defaults: `-i /tmp/sid_writes.sidw -m 6581 -t mix`,
+phi2 = 985 500 Hz (PAL-rate; PHI2_HZ env to override), sample-rate = 48 000 Hz).
 
 ## Dumping a different tune
 
@@ -44,6 +44,7 @@ through our `mos6502` and records the SID register write-stream. Point it at any
 | `DUMP_FRAMES`  | `10600`              | # of 50 Hz PAL frames (10600 ≈ 211 s)     |
 | `DUMP_OUT`     | `/tmp/sid_writes.sidw` | write-stream output path                |
 | `DUMP_C64`     | `0`                  | `1` for C64-timing mode                   |
+| `DUMP_PHI2`    | `985500`             | phi2 Hz for hardware-quantum scheduling   |
 
 ```sh
 cd gateware/src/top/sid_player_sw/fw

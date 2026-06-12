@@ -844,11 +844,12 @@ mod tests {
     ///
     /// Returns a sorted, strictly-increasing `Vec<(abs_phi2, reg, val)>`.
     fn schedule_events(
-        prelude:           &[(u8, u8)],
-        events:            &[(usize /*frame*/, u32 /*stamp*/, u8, u8)],
-        period_sync:       u32,
+        prelude:             &[(u8, u8)],
+        events:              &[(usize /*frame*/, u32 /*stamp*/, u8, u8)],
+        period_sync:         u32,
         init_burst_phi2_end: u64,
-        c64:               bool,
+        c64:                 bool,
+        phi2_hz:             u64,
     ) -> std::vec::Vec<(u64, u8, u8)> {
         let mut out: std::vec::Vec<(u64, u8, u8)> = std::vec::Vec::new();
 
@@ -860,14 +861,15 @@ mod tests {
 
         // 2. PLAY events — two timing modes.
         //
-        // Hardware quantum: keep the timeline in 60 MHz sync ticks and convert to
-        // phi2 at emission so the fractional ~19950.616 phi2/frame remainder
-        // accumulates correctly.  The frame anchor (middle of frame n+1) is:
-        //   T_sync(n) = base_sync + (n+1)*P + P/2 + stamp*60
-        // where base_sync = (init_burst_phi2_end + 2) * 60.
+        // Hardware quantum: keep the timeline in 60 MHz sync ticks and convert
+        // to phi2 at emission so the fractional phi2/frame remainder
+        // accumulates correctly. phi2_hz=985_500 matches the gateware's
+        // PAL-rate fractional divider (DUMP_PHI2 to override; 1_000_000
+        // reproduces pre-phi2-select builds).
         //
         // C64 quantum: pure phi2 domain, 19 656 phi2/frame (PAL VBlank).
-        let base_sync: u64 = (init_burst_phi2_end + 2) * 60;
+        let clk: u64 = 60_000_000;
+        let base_sync: u64 = (init_burst_phi2_end + 2) * clk / phi2_hz;
         let p = period_sync as u64;
         let base_phi2: u64 = init_burst_phi2_end + 2;
 
@@ -878,8 +880,8 @@ mod tests {
                 let t_sync = base_sync
                     + (frame as u64 + 1) * p
                     + p / 2
-                    + stamp as u64 * 60;
-                t_sync / 60
+                    + stamp as u64 * clk / phi2_hz;
+                t_sync * phi2_hz / clk
             };
             out.push((abs_phi2, reg, val));
         }
@@ -917,7 +919,7 @@ mod tests {
         let prelude = std::vec![(0x04u8, 0x08u8), (0x0Bu8, 0x08u8), (0x12u8, 0x08u8)];
         let init_burst_end: u64 = prelude.len() as u64 + 10 + 5; // pretend 5 INIT writes
 
-        let hw = schedule_events(&prelude, &events, 1_197_037, init_burst_end, false);
+        let hw = schedule_events(&prelude, &events, 1_197_037, init_burst_end, false, 985_500);
         assert!(!hw.is_empty());
         let mut prev = 0u64;
         for &(t, _, _) in &hw {
@@ -926,27 +928,31 @@ mod tests {
         }
 
         // (b) HW mode: mean frame-anchor spacing over 1 000 synthetic frames
-        //     (one write per frame at stamp=0) should be within ±0.05 of 19 950.6.
+        //     must track phi2_hz: period_sync * phi2_hz / 60e6.
+        for phi2_hz in [985_500u64, 1_000_000u64] {
+            let period_sync: u32 = 1_197_037;
+            let n_frames: usize = 1_000;
+            let single_write_per_frame: std::vec::Vec<(usize, u32, u8, u8)> =
+                (0..n_frames).map(|f| (f, 0u32, 0u8, 0u8)).collect();
+            let hw2 = schedule_events(&[], &single_write_per_frame, period_sync, 100, false, phi2_hz);
+            assert_eq!(hw2.len(), n_frames);
+            let spacings: std::vec::Vec<f64> = hw2.windows(2)
+                .map(|w| (w[1].0 - w[0].0) as f64)
+                .collect();
+            let mean_spacing = spacings.iter().sum::<f64>() / spacings.len() as f64;
+            let expected = period_sync as f64 * phi2_hz as f64 / 60_000_000.0;
+            assert!(
+                (mean_spacing - expected).abs() < 0.05,
+                "HW mean frame spacing {mean_spacing:.4} not within ±0.05 of {expected:.4} (phi2={phi2_hz})"
+            );
+        }
+
+        // (c) C64 mode: spacing is exactly 19 656.
         let period_sync: u32 = 1_197_037;
         let n_frames: usize = 1_000;
         let single_write_per_frame: std::vec::Vec<(usize, u32, u8, u8)> =
             (0..n_frames).map(|f| (f, 0u32, 0u8, 0u8)).collect();
-        let hw2 = schedule_events(&[], &single_write_per_frame, period_sync, 100, false);
-        assert_eq!(hw2.len(), n_frames);
-        // Frame-anchor = the phi2 timestamp of write n.
-        // Spacing between consecutive anchors.
-        let spacings: std::vec::Vec<f64> = hw2.windows(2)
-            .map(|w| (w[1].0 - w[0].0) as f64)
-            .collect();
-        let mean_spacing = spacings.iter().sum::<f64>() / spacings.len() as f64;
-        let expected = period_sync as f64 / 60.0;  // ~19950.617
-        assert!(
-            (mean_spacing - expected).abs() < 0.05,
-            "HW mean frame spacing {mean_spacing:.4} not within ±0.05 of {expected:.4}"
-        );
-
-        // (c) C64 mode: spacing is exactly 19 656.
-        let c64_out = schedule_events(&[], &single_write_per_frame, period_sync, 100, true);
+        let c64_out = schedule_events(&[], &single_write_per_frame, period_sync, 100, true, 985_500);
         assert_eq!(c64_out.len(), n_frames);
         for w in c64_out.windows(2) {
             assert_eq!(
@@ -979,6 +985,8 @@ mod tests {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(10_600);
         let c64_mode: bool = std::env::var("DUMP_C64")
             .map(|s| s == "1").unwrap_or(false);
+        let phi2_hz: u64 = std::env::var("DUMP_PHI2")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(985_500);
 
         // --- load .sid file -------------------------------------------------
         let sid_bytes = std::fs::read(&sid_path)
@@ -1071,6 +1079,7 @@ mod tests {
             period_sync,
             full_prelude_end,   // init_burst_phi2_end (= end of full prelude)
             c64_mode,
+            phi2_hz,
         );
 
         // --- emit deltas to file --------------------------------------------

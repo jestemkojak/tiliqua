@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render a SID write-stream dump (.sidw) through the verilated reDIP-SID RTL into
-# a 48 kHz WAV, reproducing the Tiliqua signal path (1 MHz phi2; point-sampled
-# voice taps / decimated-ish mix).
+# a 48 kHz WAV, reproducing the Tiliqua signal path (985.5 kHz PAL-rate phi2,
+# override with PHI2_HZ env; point-sampled voice taps / decimated-ish mix).
 #
 # Usage: render.sh [-i dump.sidw] [-m 6581|8580] [-t mix|v0|v1|v2] [-o out.wav]
 #
@@ -26,7 +26,7 @@ INPUT="/tmp/sid_writes.sidw"
 MODEL="6581"
 TAP="mix"
 OUT=""
-PHI2_HZ="1000000"
+PHI2_HZ="${PHI2_HZ:-985500}"
 SAMPLE_RATE="48000"
 
 usage() { echo "Usage: render.sh [-i dump.sidw] [-m 6581|8580] [-t mix|v0|v1|v2] [-o out.wav]"; exit 1; }
