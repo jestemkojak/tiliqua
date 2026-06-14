@@ -121,5 +121,41 @@ class Phi2DividerTests(unittest.TestCase):
                              f"sel={sel}: not a flat /60")
 
 
+def _run_divider_at(sync_hz, phi2_hz, sel, window, warmup=2000):
+    m = Module()
+    m.submodules.dut = dut = Phi2Divider(sync_hz=sync_hz, phi2_hz=phi2_hz)
+    result = {}
+
+    async def testbench(ctx):
+        ctx.set(dut.sel, sel)
+        for _ in range(warmup):
+            await ctx.tick()
+        edges = 0
+        for _ in range(window):
+            edges += ctx.get(dut.phi2_edge)
+            await ctx.tick()
+        result["edges"] = edges
+
+    sim = Simulator(m)
+    sim.add_clock(1 / sync_hz)
+    sim.add_testbench(testbench)
+    sim.run()
+    return result["edges"]
+
+
+class Phi2Divider30MHzTests(unittest.TestCase):
+    PHI2 = (985_500, 1_023_000)
+
+    def test_pal_rate_exact_30mhz(self):
+        """sel=0 -> 657 edges per 20 000 30MHz cycles (Fraction(30e6,985500)=20000/657)."""
+        self.assertEqual(_run_divider_at(30_000_000, self.PHI2, 0, 3 * 20_000),
+                         3 * 657)
+
+    def test_ntsc_rate_exact_30mhz(self):
+        """sel=1 -> 341 edges per 10 000 30MHz cycles (Fraction(30e6,1023000)=10000/341)."""
+        self.assertEqual(_run_divider_at(30_000_000, self.PHI2, 1, 3 * 10_000),
+                         3 * 341)
+
+
 if __name__ == "__main__":
     unittest.main()

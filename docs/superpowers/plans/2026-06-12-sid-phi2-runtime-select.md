@@ -1,6 +1,6 @@
 # SID φ2 Runtime PAL/NTSC Select Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Clock the SID at true C64 pitch — runtime-selectable PAL (985 500 Hz) / NTSC (1 023 000 Hz) via a CSR, auto-picked per tune from the PSID header — replacing the hardcoded 1 MHz divider that makes every tune +1.497 % sharp.
 
@@ -33,7 +33,7 @@ A standalone fractional-N divider component, host-testable in amaranth.sim (the 
 - Test: `gateware/tests/test_sid_phi2.py` (create)
 - Modify: `gateware/src/top/sid/top.py` (add `Phi2Divider` above `SIDPeripheral`, add `from fractions import Fraction` import)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `gateware/tests/test_sid_phi2.py`:
 
@@ -165,12 +165,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd gateware && pdm run pytest tests/test_sid_phi2.py -v`
 Expected: FAIL (ImportError: cannot import name 'Phi2Divider' from 'top.sid.top')
 
-- [ ] **Step 3: Implement `Phi2Divider`**
+- [x] **Step 3: Implement `Phi2Divider`**
 
 In `gateware/src/top/sid/top.py`, add to the imports near the top of the file:
 
@@ -259,12 +259,12 @@ class Phi2Divider(wiring.Component):
 
 Note: `wiring`, `In`, `Out`, `Signal`, `Mux`, `Module` are already imported in this file (used by `SIDPeripheral`). Only `Fraction` is new.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd gateware && pdm run pytest tests/test_sid_phi2.py -v`
 Expected: 5 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd /home/pawel/code/tiliqua
@@ -280,7 +280,7 @@ git commit -m "sid: Phi2Divider fractional-N divider for runtime PAL/NTSC phi2"
 - Modify: `gateware/src/top/sid/top.py` (`SIDPeripheral.__init__` ~line 205, CSR classes ~line 197, `elaborate` ~lines 256–268)
 - Regression: `gateware/tests/test_sid_periph.py` (NO changes — it must pass as-is, proving back-compat)
 
-- [ ] **Step 1: Add the `Phi2Sel` CSR register class**
+- [x] **Step 1: Add the `Phi2Sel` CSR register class**
 
 In `gateware/src/top/sid/top.py`, after `class BuildModel` (~line 199), add:
 
@@ -292,7 +292,7 @@ In `gateware/src/top/sid/top.py`, after `class BuildModel` (~line 199), add:
         sel: csr.Field(csr.action.RW, unsigned(1))
 ```
 
-- [ ] **Step 2: Extend `__init__`**
+- [x] **Step 2: Extend `__init__`**
 
 Change the signature (~line 205):
 
@@ -323,7 +323,7 @@ Add the readback port to the signature dict in `super().__init__({...})` (after 
             "phi2_sel":        Out(1),
 ```
 
-- [ ] **Step 3: Replace the divider block in `elaborate`**
+- [x] **Step 3: Replace the divider block in `elaborate`**
 
 Replace lines 256–268 (the `DIVIDE_BY = 60` block through the `phi2`/`phi2_edge` comb assignments) with:
 
@@ -342,12 +342,12 @@ Replace lines 256–268 (the `DIVIDE_BY = 60` block through the `phi2`/`phi2_edg
 
 Everything downstream (`self.sid.bus_i.phi2`, `audio_strobe`, the `startup` reset window, transaction pop) keeps using `phi2`/`phi2_edge` unchanged.
 
-- [ ] **Step 4: Run the regression + new tests**
+- [x] **Step 4: Run the regression + new tests**
 
 Run: `cd gateware && pdm run pytest tests/test_sid_periph.py tests/test_sid_phi2.py -v`
 Expected: ALL pass with **zero changes to `test_sid_periph.py`** (it builds `SIDPeripheral()` with defaults → flat /60; its `DIVIDE_BY = 60` phase calibration must still hold). If it fails, the back-compat degeneration is broken — fix the divider, do not touch the test.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd /home/pawel/code/tiliqua
@@ -363,7 +363,7 @@ git commit -m "sid: phi2_sel CSR drives Phi2Divider in SIDPeripheral (default = 
 - Modify: `gateware/src/top/sid_player_sw/top.py` (constants near top; `__init__` ~line 214; `elaborate` ~lines 283–298)
 - Modify: `gateware/tests/test_sid_audio.py` (parametrize over the two new rates)
 
-- [ ] **Step 1: Update the decimator test first (it should fail only on runtime length, then pass — the DUT code is unchanged)**
+- [x] **Step 1: Update the decimator test first (it should fail only on runtime length, then pass — the DUT code is unchanged)**
 
 In `gateware/tests/test_sid_audio.py`, replace the two test methods:
 
@@ -400,7 +400,7 @@ class SidAudioTests(unittest.TestCase):
 Run: `cd gateware && pdm run pytest tests/test_sid_audio.py -v`
 Expected: 2 passed (slower than before — bigger FIRs; a few minutes is normal). This proves `AudioDecimator` needs no code changes for the new rates.
 
-- [ ] **Step 2: Add the rate constants and thread params into `SIDPeripheral`**
+- [x] **Step 2: Add the rate constants and thread params into `SIDPeripheral`**
 
 In `gateware/src/top/sid_player_sw/top.py`, add at module level (after the imports):
 
@@ -430,7 +430,7 @@ with:
             phi2_hz=(PHI2_HZ_PAL, PHI2_HZ_NTSC))
 ```
 
-- [ ] **Step 3: Dual decimators + mux in `elaborate`**
+- [x] **Step 3: Dual decimators + mux in `elaborate`**
 
 Replace lines 283–289 (single `audio_decim` instantiation + feed) with:
 
@@ -471,14 +471,14 @@ with:
 
 (The scope mix channel taps `pmod0.i_cal.payload[3]` at ~line 353, so it follows the mux automatically — no scope-branch change. `dsp` is already imported in this file.)
 
-- [ ] **Step 4: Elaboration smoke test**
+- [x] **Step 4: Elaboration smoke test**
 
 There is no fast full-elaboration unit test for the SoC; rely on the gateware test suite + the full build in Task 6. Run the related suites now:
 
 Run: `cd gateware && pdm run pytest tests/test_sid_phi2.py tests/test_sid_periph.py tests/test_sid_audio.py -v`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd /home/pawel/code/tiliqua
@@ -494,12 +494,12 @@ git commit -m "sid_player_sw: dual PAL/NTSC decimators muxed by phi2_sel"
 - Modify: `gateware/src/top/sid_player_sw/fw/src/main.rs` (helpers near `reload_tune` ~line 218; state vars ~line 449; rotate-edit match ~line 501; button match ~line 569; labels/values ~lines 694–725; metadata ~lines 666–746; `rows_in` ~line 248; boot path ~line 423)
 - Generated (not committed): `pac/src/generated/` via `--pac-only`
 
-- [ ] **Step 1: Regenerate the PAC**
+- [x] **Step 1: Regenerate the PAC**
 
 Run: `cd gateware && pdm sid_player_sw build --pac-only`
 Expected: completes; the PAC now has `SID_PERIPH.phi2_sel()` with field `sel()`. (PAC output is gitignored — nothing to commit from this step.)
 
-- [ ] **Step 2: Add the helpers**
+- [x] **Step 2: Add the helpers**
 
 In `fw/src/main.rs`, immediately above `fn reload_tune` (~line 214), add:
 
@@ -524,7 +524,7 @@ fn effective_clock(clock_sel: usize, hdr: &psid::PsidHeader) -> psid::Clock {
 }
 ```
 
-- [ ] **Step 3: Auto-select in `reload_tune`**
+- [x] **Step 3: Auto-select in `reload_tune`**
 
 Change the signature (~line 218) to take the override state:
 
@@ -550,7 +550,7 @@ Update the three call sites to pass `clock_sel` (hot-plug ~line 481, subtune edi
 reload_tune(tune_buf, n, &mut hdr, start, clock_sel)
 ```
 
-- [ ] **Step 4: Boot path + state var**
+- [x] **Step 4: Boot path + state var**
 
 Add to the menu-state declarations block (after `let mut hue: u8 = 0;`, ~line 457):
 
@@ -565,7 +565,7 @@ The initial tune is loaded *before* that block without `reload_tune` (~line 418�
     set_phi2(hdr.clock()); // boot = AUTO: match the initial tune's standard
 ```
 
-- [ ] **Step 5: Menu row — count, labels, values, handlers**
+- [x] **Step 5: Menu row — count, labels, values, handlers**
 
 1. `rows_in` (~line 248): `Page::Player => 4` → `Page::Player => 5`.
 
@@ -622,7 +622,7 @@ with:
                     }
 ```
 
-- [ ] **Step 6: Move the metadata line below the 5th row**
+- [x] **Step 6: Move the metadata line below the 5th row**
 
 Player now has 5 rows (last baseline y = 72 + 18·4 = 144; FONT_9X15 glyphs span ~y−11..y+3), so the metadata line at y=150 would collide. Three coordinated edits:
 
@@ -632,7 +632,7 @@ Player now has 5 rows (last baseline y = 72 + 18·4 = 144; FONT_9X15 glyphs span
 
 `HEADER_H` (190) still covers everything (Scope card's 6 rows reach y=162+ band ≤ 185 — no change needed; leave the constant and its comment as-is).
 
-- [ ] **Step 7: Build firmware + host tests**
+- [x] **Step 7: Build firmware + host tests**
 
 Run: `cd gateware && pdm sid_player_sw build --fw-only`
 Expected: compiles cleanly (uses the Task-1–3 gateware only at final flash; this checks the firmware against the regenerated PAC).
@@ -640,7 +640,7 @@ Expected: compiles cleanly (uses the Task-1–3 gateware only at final flash; th
 Run: `cd gateware/src/top/sid_player_sw/fw && cargo test --target x86_64-unknown-linux-gnu --lib`
 Expected: all existing host tests pass (no host-testable logic changed; `set_phi2`/UI live in `main.rs`, outside the lib).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd /home/pawel/code/tiliqua
@@ -659,7 +659,7 @@ The host dump/render pipeline models the FPGA. Its hardware-quantum path hardcod
 - Modify: `gateware/src/top/sid_player_sw/tools/host_render/render.sh` (~line 29 + header comment)
 - Modify: `gateware/src/top/sid_player_sw/tools/host_render/README.md` (env table ~line 42, defaults line ~line 31)
 
-- [ ] **Step 1: Update the `schedule_events` unit test (TDD)**
+- [x] **Step 1: Update the `schedule_events` unit test (TDD)**
 
 In `player.rs`, in `fn schedule_events_properties` (~line 908): all existing calls gain a final `phi2_hz` argument, and assertion (b) derives its expectation from it. Replace the three call sites and the (b) expectation:
 
@@ -692,7 +692,7 @@ In `player.rs`, in `fn schedule_events_properties` (~line 908): all existing cal
 Run: `cd gateware/src/top/sid_player_sw/fw && cargo test --target x86_64-unknown-linux-gnu --lib schedule_events`
 Expected: FAIL to compile (`schedule_events` takes 5 args).
 
-- [ ] **Step 2: Generalize `schedule_events`**
+- [x] **Step 2: Generalize `schedule_events`**
 
 Change the signature (~line 846) and the conversion math:
 
@@ -731,7 +731,7 @@ and replace the hardcoded ×60 / ÷60 conversions (the `base_sync` definition an
 
 (u64 headroom: t_sync ≤ ~1.3e10 sync ticks × 985 500 ≈ 1.3e16 ≪ u64::MAX.)
 
-- [ ] **Step 3: Thread `DUMP_PHI2` through `dump_writes`**
+- [x] **Step 3: Thread `DUMP_PHI2` through `dump_writes`**
 
 In the env-parameter block of `fn dump_writes` (~line 975, after `c64_mode`):
 
@@ -756,7 +756,7 @@ and pass it at the call (~line 1068):
 Run: `cd gateware/src/top/sid_player_sw/fw && cargo test --target x86_64-unknown-linux-gnu --lib`
 Expected: all pass (including `schedule_events_properties`).
 
-- [ ] **Step 4: render.sh + README**
+- [x] **Step 4: render.sh + README**
 
 `render.sh` line 29: `PHI2_HZ="1000000"` → `PHI2_HZ="${PHI2_HZ:-985500}"`. Header comment (line 3): change `(1 MHz phi2; ...)` to `(985.5 kHz PAL-rate phi2, override with PHI2_HZ env; ...)`.
 
@@ -766,7 +766,7 @@ Expected: all pass (including `schedule_events_properties`).
 | `DUMP_PHI2`    | `985500`             | phi2 Hz for hardware-quantum scheduling   |
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd /home/pawel/code/tiliqua
@@ -782,12 +782,12 @@ git commit -m "host_render: parametrize phi2 (default 985500) to track new gatew
 
 **Files:** none modified — verification only, then docs.
 
-- [ ] **Step 1: Full bitstream build**
+- [x] **Step 1: Full bitstream build**
 
 Run: `cd gateware && pdm sid_player_sw build` (~4–5 min)
 Expected: completes. If it fails with `CalledProcessError: 'build_top.sh' returned non-zero`, the real cause is in stdout — grep for `ERROR`/`logic loop`.
 
-- [ ] **Step 2: Resource + Fmax checks**
+- [x] **Step 2: Resource + Fmax checks**
 
 Run: `grep -E "DP16KD|MULT18X18D|TRELLIS_COMB" gateware/build/sid-player-sw-r5/top.tim`
 Expected (vs pre-change 34 / 11 / 20772):
@@ -798,7 +798,7 @@ Expected (vs pre-change 34 / 11 / 20772):
 Run: `grep "Max frequency.*glbnet.*clk'" gateware/build/sid-player-sw-r5/top.tim`
 Expected: the **second** line (the `Warning:` post-route one) shows achieved Fmax not lower than the current build's (~55 MHz; the design's known 60 MHz shortfall is the reSID muladd, pre-existing). A drop > ~1 MHz means the divider/mux landed on the critical path — investigate before proceeding.
 
-- [ ] **Step 3: Full test suites**
+- [x] **Step 3: Full test suites**
 
 Run: `cd gateware && pdm test`
 Expected: all pass.
@@ -806,7 +806,7 @@ Expected: all pass.
 Run: `cd gateware/src/top/sid_player_sw/fw && cargo test --target x86_64-unknown-linux-gnu --lib`
 Expected: all pass.
 
-- [ ] **Step 4: Update `sid_player_sw/CLAUDE.md`**
+- [x] **Step 4: Update `sid_player_sw/CLAUDE.md`**
 
 In `gateware/src/top/sid_player_sw/CLAUDE.md`, the "Audio output / anti-aliasing" section's `n_up/m_down from fs_out/fs_in → 6/125` wording is now stale. Update that sentence to:
 
@@ -821,7 +821,7 @@ In `gateware/src/top/sid_player_sw/CLAUDE.md`, the "Audio output / anti-aliasing
   `SIDPeripheral.audio_strobe`.
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd /home/pawel/code/tiliqua
@@ -835,26 +835,26 @@ git commit -m "sid_player_sw: docs for runtime phi2 PAL/NTSC select"
 
 Per the spec's verification section and the verification-before-completion skill: the pitch claim must be **measured**, not asserted. This task needs the Tiliqua connected; coordinate with the user.
 
-- [ ] **Step 1: Flash**
+- [x] **Step 1: Flash**
 
 Run: `cd gateware && pdm run flash archive build/sid-player-sw-r5/<git-short-hash>.tar.gz`
 (archive name = git HEAD short hash at build time.)
 
-- [ ] **Step 2: UI sanity**
+- [x] **Step 2: UI sanity**
 
 With a PAL tune (e.g. Commando): title unchanged; metadata row shows `6581  PAL …`; Player card shows `Clock  AUTO (PAL)`. Rotate the Clock row to NTSC while playing — pitch must audibly rise (~+0.6 semitone) immediately; back to AUTO restores it.
 
-- [ ] **Step 3: Pitch/timing A/B against the C64 reference**
+- [x] **Step 3: Pitch/timing A/B against the C64 reference**
 
 Capture Commando voice-0 from the hardware jack (same setup as the existing `docs/recordings/` captures) and compare against `docs/recordings/commando-c64ref-6581-v0.wav` (real-C64 PAL timing, 208.4 s):
 - time-stretch factor 1.000 ± 0.03 % (the old build measured 1.497 %),
 - envelope correlation ≥ 0.99 **without** time-warping,
 - measured pitch offset ≤ 1 cent (target +0.44 ¢).
 
-- [ ] **Step 4: NTSC spot check**
+- [x] **Step 4: NTSC spot check**
 
 Load one NTSC-flagged tune: metadata shows `NTSC`, `Clock AUTO (NTSC)`, play rate ≈ 59.83 Hz on the metadata line, and pitch correct on the same bitstream (this is the runtime-select payoff).
 
-- [ ] **Step 5: Final commit / report**
+- [x] **Step 5: Final commit / report**
 
 Report measured numbers (stretch factor, correlation, pitch offset, Fmax, utilisation) — pass or fail — honestly. If all pass, the feature is done.
