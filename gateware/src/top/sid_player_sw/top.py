@@ -316,9 +316,9 @@ class SIDPlayerSwSoc(TiliquaSoc):
         pmod0 = self.pmod0_periph.pmod
         m.d.comb += [
             pmod0.i_cal.valid.eq(1),
-            pmod0.i_cal.payload[0].as_value().eq(sid.voice0_dca),
-            pmod0.i_cal.payload[1].as_value().eq(sid.voice1_dca),
-            pmod0.i_cal.payload[2].as_value().eq(sid.voice2_dca),
+            pmod0.i_cal.payload[0].as_value().eq(self.sid_periph.voice0_dca_o),
+            pmod0.i_cal.payload[1].as_value().eq(self.sid_periph.voice1_dca_o),
+            pmod0.i_cal.payload[2].as_value().eq(self.sid_periph.voice2_dca_o),
             pmod0.i_cal.payload[3].as_value().eq(audio_out.as_value()),
         ]
 
@@ -354,9 +354,9 @@ class SIDPlayerSwSoc(TiliquaSoc):
         m.submodules.voice_smooth = voice_smooth = VoiceSmoother(n_channels=3, k=7, poles=4)
         m.d.comb += [
             voice_smooth.strobe.eq(self.sid_periph.audio_strobe),
-            voice_smooth.i[0].eq(sid.voice0_dca),
-            voice_smooth.i[1].eq(sid.voice1_dca),
-            voice_smooth.i[2].eq(sid.voice2_dca),
+            voice_smooth.i[0].eq(self.sid_periph.voice0_dca_o),
+            voice_smooth.i[1].eq(self.sid_periph.voice1_dca_o),
+            voice_smooth.i[2].eq(self.sid_periph.voice2_dca_o),
         ]
 
         # Non-blocking tap into the scope: smoothed voices + the already

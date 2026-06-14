@@ -154,7 +154,7 @@ class SID(wiring.Component):
         self.add_verilog_sources(platform)
 
         # rough usage
-        # - i_clk must be >20x phi2 clk (on bus_i)
+        # - i_clk must be >20x phi2 clk (on bus_i); sid=30MHz => 30 cycles/phi2
         # - falling edge of phi2 starts internal pipeline, takes ~20 cycles
         # procedure:
         # - bring phi2 low for ~12 cycles
@@ -164,7 +164,7 @@ class SID(wiring.Component):
         #   - maybe write to sid register using bus_i (keep data there until next clock)
 
         m.submodules.vsid = Instance("sid_api",
-            i_clk     = ClockSignal("sync"),
+            i_clk     = ClockSignal("sid"),
             i_bus_i   = self.bus_i,
             i_cs      = self.cs,
             o_data_o  = self.data_o,
@@ -521,9 +521,9 @@ class SIDSoc(TiliquaSoc):
 
         m.d.comb += [
             pmod0.i_cal.valid.eq(1),
-            pmod0.i_cal.payload[0].as_value().eq(sid.voice0_dca),
-            pmod0.i_cal.payload[1].as_value().eq(sid.voice1_dca),
-            pmod0.i_cal.payload[2].as_value().eq(sid.voice2_dca),
+            pmod0.i_cal.payload[0].as_value().eq(self.sid_periph.voice0_dca_o),
+            pmod0.i_cal.payload[1].as_value().eq(self.sid_periph.voice1_dca_o),
+            pmod0.i_cal.payload[2].as_value().eq(self.sid_periph.voice2_dca_o),
             pmod0.i_cal.payload[3].as_value().eq(self.sid_periph.last_audio_left>>8),
         ]
 
