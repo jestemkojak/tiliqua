@@ -336,6 +336,7 @@ class TiliquaDomainGeneratorPLLExternal(Elaboratable):
         m.domains.fast       = ClockDomain()
         m.domains.audio      = ClockDomain()
         m.domains.raw48      = ClockDomain()
+        m.domains.sid        = ClockDomain()  # 30 MHz: reSID core (CLKOS2 = VCO 600/20)
         m.domains.expll_clk0 = ClockDomain()
         if self.settings.modeline or self.settings.dynamic_modeline:
             m.domains.expll_clk1 = ClockDomain()
@@ -383,6 +384,7 @@ class TiliquaDomainGeneratorPLLExternal(Elaboratable):
                 # Generated clock outputs.
                 o_CLKOP=feedback60,
                 o_CLKOS=ClockSignal("fast"),
+                o_CLKOS2=ClockSignal("sid"),
 
                 # Status.
                 o_LOCK=locked60,
@@ -405,6 +407,10 @@ class TiliquaDomainGeneratorPLLExternal(Elaboratable):
                 p_CLKOS_DIV=5,
                 p_CLKOS_CPHASE=4,
                 p_CLKOS_FPHASE=0,
+                p_CLKOS2_ENABLE="ENABLED",
+                p_CLKOS2_DIV=20,          # 600 MHz VCO / 20 = 30 MHz
+                p_CLKOS2_CPHASE=4,
+                p_CLKOS2_FPHASE=0,
                 p_FEEDBK_PATH="CLKOP",
                 p_CLKFB_DIV=5,
 
@@ -466,6 +472,7 @@ class TiliquaDomainGeneratorPLLExternal(Elaboratable):
             ResetSignal("sync")  .eq(~locked60),
             ResetSignal("fast")  .eq(~locked60),
             ResetSignal("usb")   .eq(~locked60),
+            ResetSignal("sid")   .eq(~locked60),
         ]
 
         return m
@@ -498,6 +505,7 @@ class TiliquaDomainGenerator2PLLs(Elaboratable):
         m.domains.fast   = ClockDomain()
         m.domains.audio  = ClockDomain()
         m.domains.raw48  = ClockDomain()
+        m.domains.sid    = ClockDomain()  # 30 MHz: reSID core (CLKOS3 = VCO 600/20; CLKOS2 used by audio)
 
         clk48 = platform.request(platform.default_clk, dir='i').i
         reset  = Signal(init=0)
@@ -527,6 +535,7 @@ class TiliquaDomainGenerator2PLLs(Elaboratable):
                 o_CLKOP=feedback60,
                 o_CLKOS=ClockSignal("fast"),
                 o_CLKOS2=ClockSignal("audio"),
+                o_CLKOS3=ClockSignal("sid"),
 
                 # Status.
                 o_LOCK=locked60,
@@ -553,6 +562,10 @@ class TiliquaDomainGenerator2PLLs(Elaboratable):
                 p_CLKOS2_DIV=clkos2_dividers[self.settings.audio_clock],
                 p_CLKOS2_CPHASE=4,
                 p_CLKOS2_FPHASE=0,
+                p_CLKOS3_ENABLE="ENABLED",
+                p_CLKOS3_DIV=20,          # 600 MHz VCO / 20 = 30 MHz
+                p_CLKOS3_CPHASE=4,
+                p_CLKOS3_FPHASE=0,
                 p_FEEDBK_PATH="CLKOP",
                 p_CLKFB_DIV=5,
 
@@ -607,6 +620,7 @@ class TiliquaDomainGenerator2PLLs(Elaboratable):
             ResetSignal("sync")  .eq(~locked60),
             ResetSignal("fast")  .eq(~locked60),
             ResetSignal("usb")   .eq(~locked60),
+            ResetSignal("sid")   .eq(~locked60),
             ResetSignal("audio") .eq(~locked60),
         ]
 
@@ -639,6 +653,7 @@ class TiliquaDomainGenerator4PLLs(Elaboratable):
         m.domains.fast   = ClockDomain()
         m.domains.audio  = ClockDomain()
         m.domains.raw48  = ClockDomain()
+        m.domains.sid    = ClockDomain()  # 30 MHz: reSID core (CLKOS2 = VCO 600/20)
 
         clk48 = platform.request(platform.default_clk, dir='i').i
         reset  = Signal(init=0)
@@ -657,6 +672,7 @@ class TiliquaDomainGenerator4PLLs(Elaboratable):
                 # Generated clock outputs.
                 o_CLKOP=feedback60,
                 o_CLKOS=ClockSignal("fast"),
+                o_CLKOS2=ClockSignal("sid"),
 
                 # Status.
                 o_LOCK=locked60,
@@ -679,6 +695,10 @@ class TiliquaDomainGenerator4PLLs(Elaboratable):
                 p_CLKOS_DIV=5,
                 p_CLKOS_CPHASE=4,
                 p_CLKOS_FPHASE=0,
+                p_CLKOS2_ENABLE="ENABLED",
+                p_CLKOS2_DIV=20,          # 600 MHz VCO / 20 = 30 MHz
+                p_CLKOS2_CPHASE=4,
+                p_CLKOS2_FPHASE=0,
                 p_FEEDBK_PATH="CLKOP",
                 p_CLKFB_DIV=5,
 
@@ -837,6 +857,7 @@ class TiliquaDomainGenerator4PLLs(Elaboratable):
             ResetSignal("sync")  .eq(~locked60),
             ResetSignal("fast")  .eq(~locked60),
             ResetSignal("usb")   .eq(~locked60),
+            ResetSignal("sid")   .eq(~locked60),
             ResetSignal("audio") .eq(~locked_audio),
         ]
 
