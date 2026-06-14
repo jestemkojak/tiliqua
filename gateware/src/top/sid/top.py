@@ -56,7 +56,8 @@ from fractions import Fraction
 
 from amaranth import *
 from amaranth.lib import data, stream, wiring
-from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered
+from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered, AsyncFIFO
+from amaranth.lib.cdc import FFSynchronizer, PulseSynchronizer
 from amaranth.lib.wiring import In, Out, connect, flipped
 from amaranth_soc import csr
 
@@ -286,11 +287,12 @@ class SIDPeripheral(wiring.Component):
         sel: csr.Field(csr.action.RW, unsigned(1))
 
     def __init__(self, *, transaction_depth=16, sid2_define=True,
-                 sync_hz=60_000_000, phi2_hz=(1_000_000, 1_000_000)):
+                 sid_hz=30_000_000, phi2_hz=(1_000_000, 1_000_000)):
         self._sid2_define = sid2_define
-        self._sync_hz  = sync_hz
+        self._sid_hz   = sid_hz
         self._phi2_hz  = phi2_hz
-        self._transactions = SyncFIFO(width=16, depth=transaction_depth)
+        self._transactions = AsyncFIFO(width=16, depth=transaction_depth,
+                                       w_domain="sync", r_domain="sid")
         self._midi_read_fifo = SyncFIFOBuffered(width=24, depth=8)
 
         regs = csr.Builder(addr_width=6, data_width=8)
@@ -326,6 +328,11 @@ class SIDPeripheral(wiring.Component):
             # phi2 standard currently selected (mirrors the phi2_sel CSR) —
             # read by the SoC top to mux the per-standard audio decimators.
             "phi2_sel":        Out(1),
+            # Voice taps captured into `sync` (gated by the synchronized audio
+            # strobe), so the tops never sample a raw sid-domain bus.
+            "voice0_dca_o": Out(signed(16)),
+            "voice1_dca_o": Out(signed(16)),
+            "voice2_dca_o": Out(signed(16)),
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -344,40 +351,43 @@ class SIDPeripheral(wiring.Component):
         ]
 
         # Fractional-N phi2 divider, runtime-selectable standard (phi2_sel
-        # CSR). Defaults make this a flat /60 (~1MHz) exactly as before.
-        m.submodules.phi2_div = phi2_div = Phi2Divider(
-            sync_hz=self._sync_hz, phi2_hz=self._phi2_hz)
+        # CSR). Runs in the `sid` domain (input clock = sid_hz). Defaults make
+        # this a flat /30 (~1MHz) at the 30MHz sid clock.
+        m.submodules.phi2_div = phi2_div = DomainRenamer("sid")(
+            Phi2Divider(sync_hz=self._sid_hz, phi2_hz=self._phi2_hz))
+        sel_sid = Signal()
+        m.submodules += FFSynchronizer(self._phi2_sel.f.sel.data, sel_sid,
+                                       o_domain="sid")
         m.d.comb += [
-            phi2_div.sel.eq(self._phi2_sel.f.sel.data),
-            self.phi2_sel.eq(self._phi2_sel.f.sel.data),
+            phi2_div.sel.eq(sel_sid),
+            self.phi2_sel.eq(self._phi2_sel.f.sel.data),  # sync mirror for decim mux
         ]
         phi2      = phi2_div.phi2
         phi2_edge = phi2_div.phi2_edge
 
-        # 'always' signals
-        m.d.sync += [
+        # SID bus + reset run in the sid domain.
+        m.d.sid += [
             self.sid.bus_i.phi2  .eq(phi2),
             self.sid.cs          .eq(0b0100), # cs_n = 0, cs_io1_n = 1
         ]
 
-        # last_audio_* is latched on phi2_edge (m.d.sync below), so it holds the
-        # fresh sample on the *next* cycle: pulse the strobe then to align.
-        m.d.sync += self.audio_strobe.eq(phi2_edge)
-
         startup = Signal(8)
 
-        # route FIFO'd transactions -> SID
-        m.d.sync += self._transactions.r_en.eq(0)
+        # route FIFO'd transactions -> SID (in the sid domain)
+        m.d.sid += self._transactions.r_en.eq(0)
+        # sid-domain holding registers (updated once per phi2 edge).
+        hold_l = Signal(signed(24)); hold_r = Signal(signed(24))
+        hold_v0 = Signal(signed(16)); hold_v1 = Signal(signed(16)); hold_v2 = Signal(signed(16))
         with m.If(phi2_edge):
 
             # TODO verify
             with m.If(startup < 24):
-                m.d.sync += startup.eq(startup+1)
-                m.d.sync += self.sid.bus_i.res.eq(1)
+                m.d.sid += startup.eq(startup+1)
+                m.d.sid += self.sid.bus_i.res.eq(1)
             with m.Else():
-                m.d.sync += self.sid.bus_i.res.eq(0)
+                m.d.sid += self.sid.bus_i.res.eq(0)
 
-            m.d.sync += [
+            m.d.sid += [
                 # Consume 1 transaction iff the head existed AT this edge. r_en
                 # must not be asserted unconditionally: a word strobed into an
                 # empty FIFO on this same cycle becomes readable next cycle,
@@ -388,9 +398,27 @@ class SIDPeripheral(wiring.Component):
                 self.sid.bus_i.r_w_n .eq(~self._transactions.r_rdy),
                 self.sid.bus_i.addr  .eq(self._transactions.r_data),
                 self.sid.bus_i.data  .eq(self._transactions.r_data >> 5),
-                # audio signals
-                self.last_audio_left .eq(self.sid.audio_o.left),
-                self.last_audio_right.eq(self.sid.audio_o.right),
+                # audio + voice taps -> sid-domain holding registers
+                hold_l.eq(self.sid.audio_o.left),
+                hold_r.eq(self.sid.audio_o.right),
+                hold_v0.eq(self.sid.voice0_dca),
+                hold_v1.eq(self.sid.voice1_dca),
+                hold_v2.eq(self.sid.voice2_dca),
+            ]
+
+        # Strobe sid->sync; capture holds into sync regs when it fires (holds are
+        # stable for ~tens of sync cycles between phi2 edges, so this multi-bit
+        # crossing is coherent).
+        m.submodules.strobe_ps = strobe_ps = PulseSynchronizer(i_domain="sid", o_domain="sync")
+        m.d.comb += strobe_ps.i.eq(phi2_edge)
+        m.d.sync += self.audio_strobe.eq(strobe_ps.o)
+        with m.If(strobe_ps.o):
+            m.d.sync += [
+                self.last_audio_left .eq(hold_l),
+                self.last_audio_right.eq(hold_r),
+                self.voice0_dca_o.eq(hold_v0),
+                self.voice1_dca_o.eq(hold_v1),
+                self.voice2_dca_o.eq(hold_v2),
             ]
 
         m.submodules.midi_read_fifo = midi_read_fifo = self._midi_read_fifo
@@ -421,7 +449,7 @@ class SIDPeripheral(wiring.Component):
         # Transaction FIFO status: firmware polls this for backpressure.
         m.d.comb += [
             self._txn_status.f.writable.r_data.eq(self._transactions.w_rdy),
-            self._txn_status.f.level.r_data.eq(self._transactions.level),
+            self._txn_status.f.level.r_data.eq(self._transactions.w_level),
         ]
 
         return m

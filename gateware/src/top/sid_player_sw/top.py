@@ -222,7 +222,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         super().__init__(finalize_csr_bridge=False, mainram_size=0x4000, **kwargs)
         self.sid_periph = SIDPeripheral(
             sid2_define=(self.sid_model == "8580"),
-            sync_hz=self.clock_settings.frequencies.sync,
+            sid_hz=30_000_000,
             phi2_hz=(PHI2_HZ_PAL, PHI2_HZ_NTSC))
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
         self.usb_msc = USBMSCPeripheral()
