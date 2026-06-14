@@ -696,7 +696,7 @@ fn main() -> ! {
             } else if let Some(row) = redraw_row.take() {
                 // Clear only the changed row's text band (full width: long
                 // filenames span the line). The Player "Song" row (2) also
-                // drives the metadata line at y=150, so extend the band to it.
+                // drives the metadata line at y=162, so extend the band to it.
                 let y   = vy0 + vspace * row as i32;
                 let top = y - 15;
                 let bot = if page == Page::Player && row == 2 { 167 } else { y + 5 };

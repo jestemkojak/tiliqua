@@ -44,7 +44,11 @@ def dc_block(x, a=0.9995):
     """
     out = np.empty(len(x), dtype=np.float64)
     py = 0.0
-    px = 0.0
+    # Pre-charge the filter to the first sample: the 6581 VOICE_DC is already
+    # present at sim start, and on hardware it is a standing offset, not a
+    # step. Starting from px=0 turns it into a step whose high-pass response
+    # is an audible ~30 ms thump at t=0 (a fake "glitch" on the voice tap).
+    px = float(x[0]) if len(x) else 0.0
     for i in range(len(x)):
         py = x[i] - px + a * py
         px = x[i]

@@ -1,5 +1,19 @@
 # Tiliqua
 
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked locally as markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical states: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context setup. Domain reference is `CLAUDE.md` (gateware/firmware project docs). See `docs/agents/domain.md`.
+
 ## Build & test (pdm project lives in `gateware/`, not repo root)
 - `cd gateware && pdm <target> build` — build a bitstream (targets in `gateware/pyproject.toml [tool.pdm.scripts]`, e.g. `sid_player`, `polysyn`, `bootloader`)
 - `pdm <target> build --pac-only` regenerates the Rust PAC from SVD (do this after any Amaranth CSR change, else firmware won't see new registers); `--fw-only` rebuilds firmware reusing the existing bitstream. The PAC `pac/src/generated/` is gitignored & regenerated each build, so CSR changes never show in `git status`.
