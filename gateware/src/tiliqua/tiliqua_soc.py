@@ -64,7 +64,7 @@ class TiliquaSoc(Component):
     def __init__(self, *, firmware_bin_path, ui_name, ui_tag, platform_class, clock_settings,
                  touch=False, finalize_csr_bridge=True, poke_outputs=False, mainram_size=0x4000,
                  fw_location=None, fw_offset=None, cpu_variant="tiliqua_rv32im",
-                 extra_cpu_regions=[], fb_overlay=None):
+                 extra_cpu_regions=[], fb_overlay=None, persist_freeze_rows=0):
 
         super().__init__({})
 
@@ -234,7 +234,7 @@ class TiliquaSoc(Component):
 
         # Video persistance DMA effect
         self.persist_periph = persist.Peripheral(
-            bus_dma=self.psram_periph)
+            bus_dma=self.psram_periph, freeze_rows=persist_freeze_rows)
         self.csr_decoder.add(self.persist_periph.bus, addr=self.persist_periph_base, name="persist_periph")
 
         # Pixel plotting, blending, rotation backend (no CSR interface)

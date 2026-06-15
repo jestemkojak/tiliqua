@@ -219,6 +219,11 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # 512B caches against the 64KB PSRAM image -> ~10x too slow -> SID write
         # timing smears -> dropped notes. See docs/sid_player_sw_dropped_notes_*.
         kwargs.setdefault("cpu_variant", "tiliqua_rv32im_bigcache")
+        # Freeze the top menu band (y < HEADER_H=200, see fw/src/main.rs) from
+        # persist phosphor decay so the menu text doesn't flicker at fast
+        # (low) scope-decay settings, and the UI loop can stop re-blitting it
+        # every frame (firmware task).
+        kwargs.setdefault("persist_freeze_rows", 200)
         super().__init__(finalize_csr_bridge=False, mainram_size=0x4000, **kwargs)
         self.sid_periph = SIDPeripheral(
             sid2_define=(self.sid_model == "8580"),
