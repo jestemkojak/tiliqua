@@ -120,3 +120,18 @@ tunes use them); revisit if a future tune requires them.
   `partition`, `psid`, `sid_scan`, `player`. `usb_msc`/`fat` are hardware-bound.
 - The pac CSR asm (`pac/src/macros.rs`) is `target_arch`-gated; fix it in the
   template (`src/rs/template/pac/`), not just the generated copy.
+
+## Audio debugging tools (`tools/`)
+- Run them with `gateware/.venv/bin/python` (has matplotlib+scipy); the system
+  `python3` has only numpy → `wav_compare.py` etc. die with `ModuleNotFoundError: matplotlib`.
+- `host_render/` renders the firmware's dumped SID write-stream through **verilated
+  reSID** (timing-immune): dump via `DUMP_SID=… cargo test --lib dump_writes -- --ignored
+  --nocapture`, render with `host_render/render.sh`. If host output is correct but HW is
+  wrong, the bug is gateware/hardware (e.g. the 60MHz timing FAIL corrupts the reSID filter
+  → unfiltered mix), NOT firmware/model.
+- Envelope cross-correlation is unreliable on dense SID tunes (no silence to align on);
+  prefer host_render as the reference and compare per-window drift / spectral bands.
+
+## Sibling target
+- `src/top/sid_player/` is the OLD **hardware-6502** variant (gateware `Cpu6502Bridge` +
+  arlet `cpu.v`). This `_sw` tree is the active **software-6502** player — don't cross-edit.

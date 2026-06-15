@@ -238,11 +238,11 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
 
 /// Top-level menu card. Row 0 of every card is the "Page" selector.
 #[derive(Clone, Copy, PartialEq)]
-enum Page { Player, Scope }
+enum Page { Player, Config }
 
 /// Row count per card, including the "Page" row at index 0.
 fn rows_in(page: Page) -> usize {
-    match page { Page::Player => 5, Page::Scope => 6 }
+    match page { Page::Player => 5, Page::Config => 7 }
 }
 
 /// Selectable scope timebases / vertical scales (display label via IntoStaticStr).
@@ -289,7 +289,7 @@ fn main() -> ! {
 
     let h_active = display.size().width  as i16;
     let v_active = display.size().height as i16;
-    const HEADER_H: i16 = 190; // room for the 6-row Scope card above the waveform
+    const HEADER_H: i16 = 200; // room for the 7-row Config card above the waveform
 
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
@@ -446,6 +446,13 @@ fn main() -> ! {
     let mut modify   = false;
     let mut browse_idx: usize = 0;
     let mut last_paint_ticks: u32 = 0; // play-tick of the last menu repaint
+    // Hot-plug enumeration latch: once a drive's files are listed we attempt a
+    // single load. Without this the block re-lists + re-loads file 0 every loop
+    // iteration while `playing_fallback` stays set (e.g. file 0 is unsupported),
+    // spamming the log and starving audio with USB/PSRAM traffic. Reset when the
+    // drive goes away so re-insertion is detected; left false while the list is
+    // empty so the boot-time read race keeps retrying until files appear.
+    let mut usb_listed = false;
 
     // Scope-card state (mirrors the initial scope/persist config above).
     let mut decay: u8     = 10;   // persistence 1..80
@@ -469,11 +476,16 @@ fn main() -> ! {
 
             // -- Hot-plug --
             // Same 512-byte guard as the initial mount (silent ignore: the
-            // fallback tune keeps playing).
-            if playing_fallback && msc.ready() && msc.block_size() == 512 {
+            // fallback tune keeps playing). `usb_listed` latches a single
+            // enumeration+load attempt per insertion (see its declaration);
+            // a drive going away re-arms it.
+            let usb_present = msc.ready() && msc.block_size() == 512;
+            if !usb_present { usb_listed = false; }
+            if playing_fallback && usb_present && !usb_listed {
                 file_list.clear();
                 fat::list_sids(&msc, &mut file_list);
                 if !file_list.is_empty() {
+                    usb_listed = true; // enumerated: don't re-list/re-load every frame
                     if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
                         info!("Hot-plug: loaded {} bytes from USB", n);
                         let start = psid::PsidHeader::parse(&tune_buf[..n])
@@ -505,7 +517,7 @@ fn main() -> ! {
                             page = if (cur + ticks as i16).clamp(0, 1) == 0 {
                                 Page::Player
                             } else {
-                                Page::Scope
+                                Page::Config
                             };
                             selected = 0;
                         }
@@ -533,28 +545,30 @@ fn main() -> ! {
                                 .clamp(0, 2) as usize;
                             set_phi2(effective_clock(clock_sel, &hdr));
                         }
-                        (Page::Scope, 1) => {
+                        (Page::Config, 1) => {
                             decay = (decay as i16 + ticks as i16).clamp(1, 80) as u8;
                             persist.set_persistence(decay);
                         }
-                        (Page::Scope, 2) => {
+                        (Page::Config, 2) => {
                             tb_idx = (tb_idx as i16 + ticks as i16)
                                 .clamp(0, TIMEBASES.len() as i16 - 1) as usize;
                             scope.set_timebase(TIMEBASES[tb_idx]);
                         }
-                        (Page::Scope, 3) => {
+                        (Page::Config, 3) => {
                             ys_idx = (ys_idx as i16 + ticks as i16)
                                 .clamp(0, VSCALES.len() as i16 - 1) as usize;
                             scope.set_yscale(VSCALES[ys_idx]);
                         }
-                        (Page::Scope, 4) => {
+                        (Page::Config, 4) => {
                             intensity = (intensity as i16 + ticks as i16).clamp(0, 15) as u8;
                             scope.set_intensity(intensity);
                         }
-                        (Page::Scope, 5) => {
+                        (Page::Config, 5) => {
                             hue = (hue as i16 + ticks as i16).clamp(0, 15) as u8;
                             scope.set_hue(hue);
                         }
+                        // Row 6 (Rescan USB) is an action triggered by press, not
+                        // a value; rotation in modify does nothing (falls through).
                         _ => {}
                     }
                     // A value edit changes only its own row's text (the Song
@@ -620,8 +634,41 @@ fn main() -> ! {
                         // playback continues seamlessly.
                         output_mute(paused);
                     }
-                    // All Scope param rows: press toggles modify, then rotate adjusts.
-                    (Page::Scope, _) => { modify = !modify; }
+                    // Rescan USB: re-enumerate the drive and load its first .SID
+                    // (mirrors the boot/hot-plug path) so a freshly-swapped drive
+                    // is picked up without a reboot. Fires on press directly (it's
+                    // an action, not a value), so it never enters `modify`.
+                    (Page::Config, 6) => {
+                        if msc.ready() && msc.block_size() == 512 {
+                            file_list.clear();
+                            fat::list_sids(&msc, &mut file_list);
+                            // Re-arm the auto hot-plug latch to match the new list:
+                            // latched (no auto re-list) if we found files, else
+                            // re-armed so the auto path keeps retrying.
+                            usb_listed = !file_list.is_empty();
+                            browse_idx = 0;
+                            if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
+                                let start = psid::PsidHeader::parse(&tune_buf[..n])
+                                    .map(|h| h.start_song).unwrap_or(1);
+                                if let Some((p, hz)) =
+                                    reload_tune(tune_buf, n, &mut hdr, start, clock_sel) {
+                                    len = n; current_file = 0; current_subtune = start;
+                                    paused = false; playing_fallback = false; unsupported = false;
+                                    output_mute(false);
+                                    play_period = p; play_hz = hz;
+                                    set_play_period(&mut timer, play_period);
+                                } else {
+                                    // First file unsupported: keep current tune.
+                                    unsupported = true;
+                                }
+                            }
+                        }
+                        // File list + every row may change -> full clear.
+                        redraw = true;
+                    }
+                    // All other Config rows (scope params): press toggles modify,
+                    // then rotate adjusts.
+                    (Page::Config, _) => { modify = !modify; }
                     _ => {}
                 }
                 // Most button actions toggle a marker or one row's text; clear
@@ -703,15 +750,16 @@ fn main() -> ! {
                     (Page::Player, 2) => "Song",
                     (Page::Player, 3) => "Clock",
                     (Page::Player, _) => "State",
-                    (Page::Scope, 1)  => "Decay",
-                    (Page::Scope, 2)  => "Timebase",
-                    (Page::Scope, 3)  => "Y-Scale",
-                    (Page::Scope, 4)  => "Intensity",
-                    (Page::Scope, _)  => "Hue",
+                    (Page::Config, 1) => "Decay",
+                    (Page::Config, 2) => "Timebase",
+                    (Page::Config, 3) => "Y-Scale",
+                    (Page::Config, 4) => "Intensity",
+                    (Page::Config, 6) => "Rescan USB",
+                    (Page::Config, _) => "Hue",
                 };
                 let mut value: String<24> = String::new();
                 match (page, n) {
-                    (_, 0) => { write!(value, "{}", if page == Page::Player { "Player" } else { "Scope" }).ok(); }
+                    (_, 0) => { write!(value, "{}", if page == Page::Player { "Player" } else { "Config" }).ok(); }
                     (Page::Player, 1) => {
                         let shown = if modify && selected == 1 { browse_idx } else { current_file };
                         let mark  = if !file_list.is_empty() && shown == current_file { "*" } else { "" };
@@ -737,11 +785,20 @@ fn main() -> ! {
                                     else if paused { "PAUSED" } else { "PLAYING" };
                         write!(value, "{}", state).ok();
                     }
-                    (Page::Scope, 1)  => { write!(value, "{}", decay).ok(); }
-                    (Page::Scope, 2)  => { let s: &str = TIMEBASES[tb_idx].into(); write!(value, "{}", s).ok(); }
-                    (Page::Scope, 3)  => { let s: &str = VSCALES[ys_idx].into(); write!(value, "{}", s).ok(); }
-                    (Page::Scope, 4)  => { write!(value, "{}", intensity).ok(); }
-                    (Page::Scope, _)  => { write!(value, "{}", hue).ok(); }
+                    (Page::Config, 1) => { write!(value, "{}", decay).ok(); }
+                    (Page::Config, 2) => { let s: &str = TIMEBASES[tb_idx].into(); write!(value, "{}", s).ok(); }
+                    (Page::Config, 3) => { let s: &str = VSCALES[ys_idx].into(); write!(value, "{}", s).ok(); }
+                    (Page::Config, 4) => { write!(value, "{}", intensity).ok(); }
+                    (Page::Config, 6) => {
+                        // Reflects the last enumeration: file count, or NO DRIVE
+                        // when nothing is mounted. Updates the moment Rescan runs.
+                        if msc.ready() && msc.block_size() == 512 {
+                            write!(value, "{} files", file_list.len()).ok();
+                        } else {
+                            write!(value, "NO DRIVE").ok();
+                        }
+                    }
+                    (Page::Config, _) => { write!(value, "{}", hue).ok(); }
                 }
                 Text::new(label, Point::new(label_x, y), font)
                     .draw(&mut display).ok();

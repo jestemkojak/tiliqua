@@ -148,7 +148,7 @@ impl<'a> Seek for MscStorage<'a> {
 /// Mount the USB FAT volume and read the `idx`-th root `*.SID` into `dst`.
 pub fn load_sid(msc: &UsbMsc, idx: usize, dst: &mut [u8]) -> Result<usize, StorageError> {
     let storage = MscStorage::new(msc);
-    log::info!("fat: partition base_lba={}", storage.base_lba());
+    log::debug!("fat: partition base_lba={}", storage.base_lba());
     let fs = match FileSystem::new(storage, FsOptions::new()) {
         Ok(fs) => fs,
         Err(_) => {
