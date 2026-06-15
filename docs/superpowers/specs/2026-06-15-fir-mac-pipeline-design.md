@@ -1,7 +1,7 @@
 # FIR Multiply-Accumulate Pipeline — Design
 
 **Date:** 2026-06-15
-**Status:** Approved (design); implementation plan to follow.
+**Status:** Implemented (commit b541268). See "## Results" below.
 
 ## Problem
 
@@ -132,3 +132,15 @@ stream `valid`/`ready` handshake, which absorbs the +1 latency.
 - Closing `sync` at 60 MHz unconditionally (the next path, if any, is a separate effort).
 - Moving the decimator(s) to the `sid` domain (the alternative approach, not chosen).
 - Registering the multiplier operands for a ~120 MHz FIR (unnecessary at a 60 MHz target).
+
+## Results
+
+- Build: `b541268` (`gateware/build/sid-player-sw-r5/top.tim`).
+- sync (`$glbnet$clk`) post-route Fmax: 56.99 MHz -> **64.36 MHz (PASS at 60.00 MHz)**.
+- New `sync` critical path: `audio_decim_pal.resample.filt` — BRAM clk-to-q ->
+  LUT4 -> MULT18X18D -> **`p[30]_TRELLIS_FF_Q`** (the new product register) = 15.54 ns.
+  The accumulator carry chain (`p -> y`) is now a separate shorter path. The old
+  17.55 ns `BRAM -> MULT -> accumulator -> y` path is broken; `resample.filt` is no
+  longer the limiter in the accumulate sense — the MAC pipeline split worked as designed.
+  sync is now PASS at 60 MHz with 4.36 MHz of margin.
+- `test_fir`/`test_resample`: PASS at the new N+2 latencies (verified in commit b541268).
