@@ -288,7 +288,10 @@ fn main() -> ! {
 
     let h_active = display.size().width  as i16;
     let v_active = display.size().height as i16;
-    const HEADER_H: i16 = 200; // room for the 7-row Config card above the waveform
+    // Room for the 7-row Config card above the waveform. MUST match
+    // persist_freeze_rows in top.py (the gateware freezes rows < this value
+    // from phosphor decay so the menu doesn't flicker) — keep the two in sync.
+    const HEADER_H: i16 = 200;
 
     let mut scope   = Scope0::new(peripherals.SCOPE_PERIPH, 6);
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
