@@ -74,7 +74,10 @@ class RasterTests(unittest.TestCase):
         check = wishbone.BusChecker(dut.bus, prefix='[bus] ')
         m.submodules += [dut, fb, fb.palette, check]
 
+        writes_seen = 0
+
         async def testbench(ctx):
+            nonlocal writes_seen
             ctx.set(fb.fbp.enable, 1)
             for _ in range(4):
                 while not ctx.get(dut.bus.stb):
@@ -87,8 +90,13 @@ class RasterTests(unittest.TestCase):
                     if ctx.get(dut.bus.we):
                         # Frozen band: written back unchanged (NOT decayed to 0xef).
                         self.assertEqual(ctx.get(dut.bus.dat_w), 0xffffffff)
+                        writes_seen += 1
                     await ctx.tick()
                 ctx.set(dut.bus.ack, 0)
+            # Guard against a false green: if the write burst were ever skipped,
+            # the assertion above would run zero times and the test would still
+            # pass. Require at least one checked write.
+            self.assertGreater(writes_seen, 0)
 
         sim = Simulator(m)
         sim.add_clock(1e-6)
