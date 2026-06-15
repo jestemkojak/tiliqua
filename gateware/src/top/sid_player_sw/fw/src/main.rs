@@ -66,10 +66,11 @@ type PlayerCpu = CPU<player::PsidBus, Nmos6502>;
 /// Write one SID register via the SIDPeripheral CSR. Steals SID_PERIPH
 /// (effectively a single owner).
 fn sid_write(reg: u8, val: u8) {
-    // NOTE: no FIFO backpressure here, and it still can't overflow. Replay paces
-    // PLAY-frame writes at their real 1MHz cycle spacing (see play_tick), matching
-    // the FIFO's 1-per-phi2 drain; same-stamp bursts are ≤16 deep. INIT bursts can
-    // exceed depth-16, so drain_sid_writes adds its own backpressure.
+    // NOTE: raw write primitive — no FIFO backpressure here. Bursty callers must
+    // go through sid_write_bp (polls `writable`) instead: play_tick drains each
+    // PLAY frame via sid_write_bp, and sid_reset/drain_sid_writes likewise, so
+    // their >16-write bursts can't overflow the depth-16 FIFO. Call sid_write
+    // directly only where a burst can't exceed the FIFO depth.
     let p = unsafe { pac::Peripherals::steal() };
     p.SID_PERIPH.transaction_data().write(|w| unsafe {
         w.transaction_data().bits(player::sid_txn(reg, val))
@@ -143,27 +144,20 @@ struct Playback {
 
 static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
 
-/// Current play period in sync cycles (TIMER0 reload), ISR-visible: the replay
-/// anchor offset is derived from it. Written via `set_play_period` only.
-static PLAY_PERIOD: AtomicU32 = AtomicU32::new(0);
-
 /// Play ticks since boot (ISR-incremented; wraps). The UI loop divides by
 /// play_hz to pace repaints — blits are PSRAM traffic that competes with the
 /// 6502's tune fetches, and the framebuffer only refreshes ~60 Hz.
 static PLAY_TICKS: AtomicU32 = AtomicU32::new(0);
 
-/// Update the play rate everywhere it matters: the TIMER0 reload and the
-/// ISR-visible copy the replay anchor is derived from.
+/// Set the play rate: program the TIMER0 reload (`period` sync cycles; the timer
+/// is a down-counter). Called on tune/subtune (re)load.
 fn set_play_period(timer: &mut Timer0, period: u32) {
-    PLAY_PERIOD.store(period, Ordering::Relaxed);
     timer.set_timeout_ticks(period);
 }
 
 /// TIMER0 ISR body: run one PLAY frame on the software 6502. Real-time work
 /// lives here (not the UI loop) so menu redraws can never starve the audio.
 fn play_tick() {
-    let timer = unsafe { Timer0::summon() };
-    let c_start = timer.counter();
     // Count every tick (even while paused — the timer keeps firing) so the UI
     // loop can pace its repaints. load/store, not fetch_add: riscv32im has no
     // atomic RMW; single-writer (this ISR).
@@ -173,38 +167,16 @@ fn play_tick() {
         if let Some(pb) = g.as_mut() {
             if !pb.paused && pb.play_addr != 0 {
                 let _ = player::call(&mut pb.cpu, pb.play_addr, 2_000_000);
-                // Replay the captured frame at the SID's real 1MHz spacing,
-                // anchored at a FIXED offset from the tick (half the play
-                // period), NOT at end-of-emulation: emulation duration swings by
-                // ~ms frame-to-frame (workload + cache state), and an
-                // end-of-emulation anchor would pass that jitter into the
-                // *inter-frame* write spacing, re-rolling the SID envelope (ADSR
-                // delay bug) phase at every gate-on — a real C64 delivers
-                // frame-locked, deterministic timing. If emulation already
-                // overran the offset, fall back to anchoring here (that frame
-                // jitters). Timer0 is a down-counter; 1 emulated 6502 cycle = 60
-                // sync ticks; elapsed since anchor = t0 - c.
-                let offset = PLAY_PERIOD.load(Ordering::Relaxed) / 2;
-                let c_mid = timer.counter();
-                let lead = c_start.wrapping_sub(c_mid); // emu time (huge if reloaded)
-                let (t0, base) = if lead < offset { (c_start, offset) } else { (c_mid, 0) };
-                let mut bailed = false;
+                // Drain this frame's captured writes to the SID, backpressured so
+                // a >16-write burst cannot overflow the depth-16 transaction FIFO.
+                // The FIFO's 1-per-phi2 (~1MHz) drain provides the inter-write
+                // spacing; we no longer busy-wait to a fixed per-frame anchor. The
+                // ADSR-phase jitter that anchor guarded against was disproven (0
+                // affected notes at ±1ms), and the spin wasted the real-time budget
+                // that 200Hz tunes need. See docs/superpowers/specs/
+                // 2026-06-15-remove-paced-replay-anchor-design.md.
                 for w in pb.cpu.memory.writes.iter() {
-                    if !bailed {
-                        let target = base + w.cycle * 60; // sync ticks from anchor
-                        loop {
-                            let c = timer.counter();
-                            if c > t0 {
-                                // Counter reloaded: crossed the period boundary.
-                                // Issue this and all remaining writes immediately
-                                // (unpaced) so none are lost, and stop spinning.
-                                bailed = true;
-                                break;
-                            }
-                            if t0 - c >= target { break; }
-                        }
-                    }
-                    sid_write(w.reg, w.val);
+                    sid_write_bp(w.reg, w.val);
                 }
             }
         }
@@ -429,7 +401,7 @@ fn main() -> ! {
     // The RISC-V is the only master of this PSRAM window, so no cache thrashing
     // or coherency hacks are needed. The non-generic PsidBus makes the CPU a
     // nameable type shareable with the timer ISR; its `writes` Vec captures each
-    // frame's SID writes for paced replay (see play_tick).
+    // frame's SID writes for backpressured replay (see play_tick).
     let image: &'static mut [u8; 0x10000] =
         unsafe { &mut *(0x2080_0000 as *mut [u8; 0x10000]) };
     let mut cpu: PlayerCpu =
