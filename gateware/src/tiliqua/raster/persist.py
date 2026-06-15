@@ -218,9 +218,10 @@ class Peripheral(wiring.Component):
     class SkipReg(csr.Register, access="w"):
         skip: csr.Field(csr.action.W, unsigned(8))
 
-    def __init__(self, bus_dma):
+    def __init__(self, bus_dma, freeze_rows=0):
         self.en = Signal()
-        self.persist = Persistance(bus_signature=bus_dma.bus.signature.flip())
+        self.persist = Persistance(bus_signature=bus_dma.bus.signature.flip(),
+                                   freeze_rows=freeze_rows)
         bus_dma.add_master(self.persist.bus)
 
         regs = csr.Builder(addr_width=5, data_width=8)
