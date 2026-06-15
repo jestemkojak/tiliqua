@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn fallback_tune_init_and_play_complete() {
         use crate::psid::PsidHeader;
-        static SID: &[u8] = include_bytes!("../Gyroscope_3.sid");
+        static SID: &[u8] = include_bytes!("../cracktro_vblank.sid");
 
         let mem = boxed_mem();
         let hdr = PsidHeader::parse(SID).expect("parse");
@@ -1113,7 +1113,7 @@ mod tests {
 
         struct Tune { name: &'static str, data: &'static [u8] }
         let tunes = [
-            Tune { name: "Gyroscope_3", data: include_bytes!("../Gyroscope_3.sid") },
+            Tune { name: "cracktro_vblank", data: include_bytes!("../cracktro_vblank.sid") },
             Tune { name: "Commando",    data: include_bytes!("../../../../../../docs/Commando.sid") },
         ];
 

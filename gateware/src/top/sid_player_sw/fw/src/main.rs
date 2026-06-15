@@ -314,7 +314,7 @@ fn main() -> ! {
     }
     scope.set_enabled(true, true);
 
-    static FALLBACK_SID: &[u8] = include_bytes!("../Gyroscope_3.sid");
+    static FALLBACK_SID: &[u8] = include_bytes!("../cracktro_vblank.sid");
 
     let style     = MonoTextStyle::new(&FONT_9X15_BOLD, HI8::new(0, 0xB));
     let style_dim = MonoTextStyle::new(&FONT_9X15_BOLD, HI8::new(0, 0x7));
