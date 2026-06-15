@@ -43,6 +43,16 @@ fn trim_ascii(s: &[u8]) -> &str {
     core::str::from_utf8(&s[..end]).unwrap_or("?")
 }
 
+/// Snapshot the PSID name ($16) + author ($36) fields (32 bytes each) of the
+/// tune currently in `tune_buf` into owned strings. The title line is painted
+/// from these, NOT live from `tune_buf`: a failed load clobbers `tune_buf` with
+/// the rejected file's bytes while the old tune keeps playing, so reading live
+/// would garble the title/author until the next good load.
+fn snapshot_meta(tune_buf: &[u8], name: &mut String<32>, author: &mut String<32>) {
+    name.clear();   let _ = name.push_str(trim_ascii(&tune_buf[0x16..0x36]));
+    author.clear(); let _ = author.push_str(trim_ascii(&tune_buf[0x36..0x56]));
+}
+
 /// Write the tune payload into the 6502 memory image and zero CIA Timer A.
 /// Returns Err (without touching `mem`/`hdr`) for unsupported/corrupt files so
 /// callers can skip them gracefully instead of crashing.
@@ -441,6 +451,11 @@ fn main() -> ! {
     let mut timer = Timer0::new(peripherals.TIMER0, CLOCK_SYNC_HZ);
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
+    // Title/author of the *playing* tune, snapshotted on each good load so a
+    // later failed load (which clobbers tune_buf) can't garble them.
+    let mut cur_name:   String<32> = String::new();
+    let mut cur_author: String<32> = String::new();
+    snapshot_meta(tune_buf, &mut cur_name, &mut cur_author);
     let mut unsupported = false; // last file selection was an unsupported .SID
     let mut redraw   = true;          // redraw all menu rows (page switch / refresh)
     let mut redraw_title = false;     // also clear title/author (tune load: name changed)
@@ -520,6 +535,7 @@ fn main() -> ! {
                             play_period = p; play_hz = hz;
                             set_play_period(&mut timer, play_period);
                             redraw_title = true; // new tune: name/author changed
+                            snapshot_meta(tune_buf, &mut cur_name, &mut cur_author);
                         } else {
                             unsupported = true; // stay on the built-in tune
                         }
@@ -633,6 +649,7 @@ fn main() -> ! {
                                             // New tune: name/author/meta + every
                                             // row change -> clear title + rows.
                                             redraw_title = true;
+                                            snapshot_meta(tune_buf, &mut cur_name, &mut cur_author);
                                         } else {
                                             // Unsupported file: keep playing the
                                             // current tune, flag it in the UI.
@@ -688,6 +705,7 @@ fn main() -> ! {
                                     play_period = p; play_hz = hz;
                                     set_play_period(&mut timer, play_period);
                                     redraw_title = true; // new tune: name changed
+                                    snapshot_meta(tune_buf, &mut cur_name, &mut cur_author);
                                 } else {
                                     // First file unsupported: keep current tune.
                                     unsupported = true;
@@ -783,14 +801,13 @@ fn main() -> ! {
                 }
             }
 
-            let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
-            let author_str = trim_ascii(&tune_buf[0x36..0x56]);
-
+            // Painted from the snapshot, not live tune_buf (which a failed load
+            // clobbers with the rejected file while the old tune plays on).
             let mut line1: String<80> = String::new();
-            write!(line1, "SID PLAYER ({})  {}", build_model_str, name_str).ok();
+            write!(line1, "SID PLAYER ({})  {}", build_model_str, cur_name.as_str()).ok();
             Text::with_alignment(line1.as_str(), Point::new(cx, 34), style, Alignment::Center)
                 .draw(&mut display).ok();
-            Text::with_alignment(author_str, Point::new(cx, 54), style_dim, Alignment::Center)
+            Text::with_alignment(cur_author.as_str(), Point::new(cx, 54), style_dim, Alignment::Center)
                 .draw(&mut display).ok();
 
             let label_x  = cx - 100;
