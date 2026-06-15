@@ -92,6 +92,13 @@ tunes use them); revisit if a future tune requires them.
   PSID `speed` (offset $12) is VBI(0) vs CIA(1) — **not** PAL/NTSC.
 - CIA timer value is read from `cpu.memory.mem[0xDC04/0xDC05]` directly after INIT
   (the RISC-V is the only PSRAM master of the image, so no cache-thrash needed).
+- PLAY-frame SID writes are captured into `cpu.memory.writes` by `call()` and
+  drained to the chip **backpressured** (`sid_write_bp`, polling the FIFO's
+  `writable`) at the end of `play_tick` — NOT paced to a fixed per-frame anchor.
+  The depth-16 transaction FIFO + its 1-per-phi2 drain supply the spacing; the
+  old fixed-anchor busy-wait was removed (it burned ISR budget to defeat an
+  ADSR-jitter that was disproven). See
+  `docs/superpowers/specs/2026-06-15-remove-paced-replay-anchor-design.md`.
 
 ## Gotchas (firmware)
 - **VexiiRiscv has no `mcycle`/perf-counter CSR** (`vexiiriscv.py`: no perf-counter
