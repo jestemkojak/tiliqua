@@ -6,6 +6,29 @@
 
 # ⮕[Documentation](https://apfaudio.github.io/tiliqua/)⬅
 
+# About this fork
+
+This is a personal fork of [apfaudio/tiliqua](https://github.com/apfaudio/tiliqua) that adds a
+MOS 6581/8580 SID music player on top of upstream's reDIP-SID emulation gateware. It is
+**not part of upstream Tiliqua** and lives only here.
+
+## SID Player (`sid_player_sw`)
+
+A standalone player for `.SID` (PSID) C64 music files, browsable from a USB stick.
+
+- **Software 6502.** The original tune's 6502 code runs on the VexiiRiscv softcore via the
+  `mos6502` emulator (the 64 KB C64 image lives in PSRAM); `$D400-$D41F` writes are redirected to
+  the SID emulation. `play()` is driven by a hardware timer interrupt at the tune's true replay
+  rate (PAL/NTSC VBlank or CIA multispeed). An earlier hardware-6502 variant lives in the
+  `sid_player` target.
+- **USB file browser + menu UI** for selecting tunes and subtunes, with a built-in oscilloscope
+  view of the three SID voices.
+- **Anti-aliased audio.** The ~1 MHz reSID output is resampled to 48 kHz through a polyphase FIR
+  (true C64 pitch, no aliasing "grit").
+- **6581 vs 8580** chip model selectable at build time
+  (`pdm sid_player_sw build --sid-model {6581,8580}`); the tune's declared model is shown in the UI
+  so you can flash the build that matches your library.
+
 # Updates / Community
 
 For updates, subscribe to the [Crowd Supply page](https://www.crowdsupply.com/apfaudio/tiliqua), join the [matrix chatroom](https://matrix.to/#/#apfaudio:matrix.org), or my own [mailing list](https://apf.audio/).
