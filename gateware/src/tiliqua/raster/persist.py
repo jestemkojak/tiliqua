@@ -56,10 +56,20 @@ class Persistance(wiring.Component):
                         (self.bus.data_width // pixel_bits))
 
         # Length (in bus words) of the top band frozen from decay. Derived from
-        # the runtime modeline h_active (video is modeline-driven). freeze_rows=0
-        # -> header_words=0 -> no pixel is ever frozen (identical to before).
-        header_words = ((self.freeze_rows * self.fbp.timings.h_active) //
-                        (self.bus.data_width // pixel_bits))
+        # the runtime modeline h_active (video is modeline-driven), so the
+        # freeze_rows*h_active multiply becomes a hardware multiplier. REGISTER
+        # it to keep that multiplier off the sync critical path that feeds the
+        # dma_offs_out comparator below (h_active only changes on a modeline
+        # switch, so a 1-cycle-stale header_words is harmless). freeze_rows=0 ->
+        # header_words is a constant 0 (no multiplier/register/comparator at
+        # all): byte-for-byte identical to before for every other consumer.
+        if self.freeze_rows:
+            header_words = Signal(self.bus.addr_width)
+            m.d.sync += header_words.eq(
+                (self.freeze_rows * self.fbp.timings.h_active) //
+                (self.bus.data_width // pixel_bits))
+        else:
+            header_words = Const(0)
 
         # Track framebuffer position by tracking fifo reads/writes
         dma_offs_in = Signal(self.bus.addr_width, init=0)
