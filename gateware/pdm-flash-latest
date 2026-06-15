@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "Usage: pdm-flash-latest <gatewarename> <slotnumber> [--commit <hash>]"
+    echo "  Finds the latest .tar.gz build in build/<gatewarename>-r5/ and flashes it."
+    echo "  --commit <hash>  Only consider files whose name contains <hash>."
+    exit 1
+}
+
+COMMIT_FILTER=""
+
+# Parse arguments
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --commit)
+            [[ $# -lt 2 ]] && { echo "Error: --commit requires a hash argument." >&2; usage; }
+            COMMIT_FILTER="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[[ ${#POSITIONAL[@]} -ne 2 ]] && usage
+
+GATEWARE="${POSITIONAL[0]}"
+SLOT="${POSITIONAL[1]}"
+BUILD_DIR="build/${GATEWARE}-r5"
+
+if [[ ! -d "$BUILD_DIR" ]]; then
+    echo "Error: Directory '$BUILD_DIR' not found. Are you in the gateware directory?" >&2
+    exit 1
+fi
+
+if [[ -n "$COMMIT_FILTER" ]]; then
+    LATEST=$(ls -t "${BUILD_DIR}/${GATEWARE}"*.tar.gz 2>/dev/null | grep -- "$COMMIT_FILTER" | head -n1)
+else
+    LATEST=$(ls -t "${BUILD_DIR}/${GATEWARE}"*.tar.gz 2>/dev/null | head -n1)
+fi
+
+if [[ -z "$LATEST" ]]; then
+    if [[ -n "$COMMIT_FILTER" ]]; then
+        echo "Error: No matching .tar.gz files containing '$COMMIT_FILTER' found in '$BUILD_DIR'." >&2
+    else
+        echo "Error: No matching .tar.gz files found in '$BUILD_DIR'." >&2
+    fi
+    exit 1
+fi
+
+FILE_DATE=$(date -r "$LATEST" "+%Y-%m-%d %H:%M:%S")
+echo "Flashing: $LATEST"
+echo "  Date:  $FILE_DATE"
+[[ -n "$COMMIT_FILTER" ]] && echo "  Commit: $COMMIT_FILTER"
+echo "  Slot:  $SLOT"
+pdm flash archive "$LATEST" --slot "$SLOT"
