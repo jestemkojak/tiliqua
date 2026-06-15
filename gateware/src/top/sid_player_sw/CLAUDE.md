@@ -87,6 +87,18 @@ tunes use them); revisit if a future tune requires them.
   const arrays. Scope settings are not persisted across reboots.
 - `HEADER_H` bounds the menu region; rows past it overlap the waveform — grow it if you add rows.
 
+### File-browser limits (`sid_scan.rs`)
+- **Only the first 64 root `.SID` files are browsable.** `SidList = heapless::Vec<SidName,
+  MAX_SIDS>` with `MAX_SIDS = 64` (`sid_scan.rs:12`): `list_root_sids` stops pushing once the
+  Vec is full (`out.push(...).is_err() -> break`), and `browse_idx` is clamped to
+  `file_list.len()-1`, so the 65th+ file (in FAT directory order) can't be reached from the UI.
+  The cap is a fixed-capacity heapless allocation — no heap in this `no_std` firmware, so the
+  list must be statically sized; cost is `MAX_SIDS × 16 B ≈ 1 KB` RAM. To raise it, bump
+  `MAX_SIDS` (RAM scales linearly). Not currently a problem; documented so it's findable.
+- **Root directory only, non-recursive** — subdirectories are skipped (`entry.is_dir()`), and
+  names are FAT **8.3 short names** (`SidName = String<16>`, e.g. `GYROSC~1.SID`), not LFNs.
+  `Rescan USB` (Config card) and the boot/hot-plug paths all share this same enumeration.
+
 ## Play rate (VBlank / CIA multispeed)
 - Rate computed by `psid::play_period_cycles` from `hdr.clock()` / `hdr.is_cia(subtune)`.
   PSID `speed` (offset $12) is VBI(0) vs CIA(1) — **not** PAL/NTSC.
