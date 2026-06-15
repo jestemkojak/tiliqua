@@ -23,17 +23,17 @@ class DSPTests(unittest.TestCase):
 
 
     @parameterized.expand([
-        ["dual_sine_small",          100, 16, 1, 17, 0.005, lambda n: 0.4*(math.sin(n*0.2) + math.sin(n))],
-        ["dual_sine_large",          100, 64, 1, 65, 0.005, lambda n: 0.4*(math.sin(n*0.2) + math.sin(n))],
-        ["dual_sine_odd",            100, 59, 1, 60, 0.005, lambda n: 0.4*(math.sin(n*0.2) + math.sin(n))],
-        ["impulse_small_9",          100,  9, 1, 10, 0.005, lambda n: 0.95 if n == 0 else 0.0],
-        ["impulse_small_10",         100, 10, 1, 11, 0.005, lambda n: 0.95 if n == 0 else 0.0],
-        ["impulse_small_16",         100, 16, 1, 17, 0.005, lambda n: 0.95 if n == 0 else 0.0],
-        ["sine_interpolator_s1_n16", 100, 16, 1, 17, 0.005, lambda n: 0.9*math.sin(n*0.2) if n % 4 == 0 else 0.0],
-        ["sine_interpolator_s2_n16", 100, 16, 2, 9,  0.005, lambda n: 0.9*math.sin(n*0.2) if n % 4 == 0 else 0.0],
-        ["sine_interpolator_s4_n16", 100, 16, 4, 5,  0.005, lambda n: 0.9*math.sin(n*0.2) if n % 4 == 0 else 0.0],
-        ["sine_interpolator_s2_n10", 100, 10, 2, 6,  0.005, lambda n: 0.9*math.sin(n*0.2) if n % 2 == 0 else 0.0],
-        ["sine_interpolator_s3_n9",  100,  9, 3, 4,  0.005, lambda n: 0.9*math.sin(n*0.2) if n % 3 == 0 else 0.0],
+        ["dual_sine_small",          100, 16, 1, 18, 0.005, lambda n: 0.4*(math.sin(n*0.2) + math.sin(n))],
+        ["dual_sine_large",          100, 64, 1, 66, 0.005, lambda n: 0.4*(math.sin(n*0.2) + math.sin(n))],
+        ["dual_sine_odd",            100, 59, 1, 61, 0.005, lambda n: 0.4*(math.sin(n*0.2) + math.sin(n))],
+        ["impulse_small_9",          100,  9, 1, 11, 0.005, lambda n: 0.95 if n == 0 else 0.0],
+        ["impulse_small_10",         100, 10, 1, 12, 0.005, lambda n: 0.95 if n == 0 else 0.0],
+        ["impulse_small_16",         100, 16, 1, 18, 0.005, lambda n: 0.95 if n == 0 else 0.0],
+        ["sine_interpolator_s1_n16", 100, 16, 1, 18, 0.005, lambda n: 0.9*math.sin(n*0.2) if n % 4 == 0 else 0.0],
+        ["sine_interpolator_s2_n16", 100, 16, 2, 10, 0.005, lambda n: 0.9*math.sin(n*0.2) if n % 4 == 0 else 0.0],
+        ["sine_interpolator_s4_n16", 100, 16, 4, 6,  0.005, lambda n: 0.9*math.sin(n*0.2) if n % 4 == 0 else 0.0],
+        ["sine_interpolator_s2_n10", 100, 10, 2, 7,  0.005, lambda n: 0.9*math.sin(n*0.2) if n % 2 == 0 else 0.0],
+        ["sine_interpolator_s3_n9",  100,  9, 3, 5,  0.005, lambda n: 0.9*math.sin(n*0.2) if n % 3 == 0 else 0.0],
     ])
     def test_fir(self, name, n_samples, n_order, stride_i, expected_latency, tolerance, stimulus_function):
 

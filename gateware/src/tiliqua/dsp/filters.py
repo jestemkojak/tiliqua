@@ -379,6 +379,12 @@ class FIR(wiring.Component):
         a  = Signal(self.ctype)
         b  = Signal(self.ctype)
         y  = Signal(self.ctype)
+        # Pipeline register for the multiplier output. Registering the product
+        # here splits the long combinational BRAM-read -> MULT -> accumulate path
+        # into two (engaging the MULT18X18D PREG): `p <- a*b` one cycle, then
+        # `y <- y + p` the next. Declared at the full a*b width so `y += p`
+        # truncates into `ctype` bit-identically to the original `y + (a * b)`.
+        p  = Signal(fixed.SQ(4, 2 * self.shape.f_bits))
 
         m.d.comb += taps_rport.en.eq(1)
         m.d.comb += taps_rport.addr.eq(ix_tap)
@@ -407,6 +413,7 @@ class FIR(wiring.Component):
                         ix_rd.eq(w_pos),
                         ix_tap.eq(stride_i_pos + self.stride_i),
                         y.eq(0),
+                        p.eq(0),
                         macs.eq(0),
                     ]
 
@@ -421,7 +428,8 @@ class FIR(wiring.Component):
                     b.eq(taps_rport.data),
                 ]
                 m.d.sync += [
-                    y.eq(y + (a * b)),
+                    p.eq(a * b),        # register this cycle's product (MULT PREG)
+                    y.eq(y + p),        # accumulate the PREVIOUS cycle's product
                     macs.eq(macs+1),
                 ]
                 # next tap read position
@@ -431,9 +439,16 @@ class FIR(wiring.Component):
                     m.d.sync += ix_rd.eq((n//self.stride_i - 1))
                 with m.Else():
                     m.d.sync += ix_rd.eq(ix_rd - 1),
-                # done?
+                # done? the final product is still in `p`; flush it in DRAIN.
                 with m.If(macs == (n//self.stride_i - 1)):
-                    m.next = "WAIT-READY"
+                    m.next = "DRAIN"
+
+            with m.State("DRAIN"):
+                # Accumulate the last product registered on the final MAC cycle,
+                # then present `y`. Reached only from MAC (the produce path) -- the
+                # stride_o discard path goes WAIT-VALID -> WAIT-READY directly.
+                m.d.sync += y.eq(y + p)
+                m.next = "WAIT-READY"
 
             with m.State('WAIT-READY'):
 
