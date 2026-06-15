@@ -86,6 +86,16 @@ tunes use them); revisit if a future tune requires them.
   `Copy`+`IntoStaticStr` (`.into()` → "10ms/d"/"2V/d"); step them via the `TIMEBASES`/`VSCALES`
   const arrays. Scope settings are not persisted across reboots.
 - `HEADER_H` bounds the menu region; rows past it overlap the waveform — grow it if you add rows.
+- Ghost-text discipline (band is frozen → no decay erases stale pixels): a changed
+  displayed value MUST clear the region that actually changed. `redraw_row = Some(selected)`
+  only clears the *pressed* row — if the change lands on a different row (e.g. an unsupported
+  pick flips the State row while you're on the File row), use full `redraw`. Title/author
+  shrink needs `redraw_title` (full-width); rows use a narrow centred strip (`band_x`/`band_w`,
+  widen if long text ghosts at the edges); `first_paint` does the one full clear (boot splash).
+- `fat::load_sid` fills `tune_buf` *before* `reload_tune` validates, so a failed/unsupported
+  load leaves the rejected file in `tune_buf` while the old tune plays on. Never paint display
+  data live from `tune_buf` (name $16 / author $36) — snapshot it into owned strings
+  (`cur_name`/`cur_author`) on each *good* load (`snapshot_meta`).
 
 ### File-browser limits (`sid_scan.rs`)
 - **Only the first 64 root `.SID` files are browsable.** `SidList = heapless::Vec<SidName,
