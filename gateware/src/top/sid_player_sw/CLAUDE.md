@@ -116,9 +116,20 @@ tunes use them); revisit if a future tune requires them.
 - **VexiiRiscv has no `mcycle`/perf-counter CSR** (`vexiiriscv.py`: no perf-counter
   plugin). Reading `mcycle`/`cycle` traps → freezes the whole SoC. Use the gateware
   `Timer0` for any firmware timing (counter is a down-counter; ISR via `enable_tick_isr`).
-- **Real-time work must run in the TIMER0 ISR, not the UI loop.** The `persist`
-  peripheral decays the framebuffer, so the menu must be repainted every frame —
-  too slow to also host `play()`. Coupling them throttles/jitters playback.
+- **Real-time work must run in the TIMER0 ISR, not the UI loop.** The UI loop
+  repaints the menu and (best-effort) handles input; it's too slow to also host
+  `play()` — coupling them throttles/jitters playback.
+- **The menu band (`y < HEADER_H`) is frozen from `persist` decay in gateware**
+  (`persist_freeze_rows=200` in `top.py` → `Persistance.freeze_rows`, which skips
+  decay for framebuffer rows above the band). So the UI loop repaints the menu
+  **only on change** (input / `redraw` / `redraw_row`), NOT every frame — this
+  keeps it off the PSRAM bus between interactions (more bandwidth for 6502
+  fetches). `HEADER_H` (main.rs) and `persist_freeze_rows` (top.py) MUST stay
+  equal. The scope region below the band still decays normally. NB: `freeze_rows`
+  is **registered** in `persist.py` — `freeze_rows*h_active` is a runtime multiply
+  and an unregistered version lands a MULT18X18D on the sync critical path
+  (regressed sync Fmax 57→50 MHz). `freeze_rows=0` is a const-0 no-op for all
+  other tops.
 - **`mos6502` emits a `debug!` per emulated instruction** → at Trace level it floods
   UART and (blocking on UART) throttles playback. `log::set_max_level_racy(Info)` early.
 - **`mos6502` panics on an unimplemented opcode** (`cpu.rs:1159`); a *decode* miss
