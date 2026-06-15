@@ -469,6 +469,17 @@ fn main() -> ! {
     handler!(timer0 = || play_tick());
     irq::scope(|s| {
         s.register(tiliqua_fw::handlers::Interrupt::TIMER0, timer0);
+        // Boot grace period: when starting on the built-in tune (no USB drive
+        // present yet), hold silent for ~1s before the play ISR begins. Mute
+        // across the wait so the post-INIT chip state can't make a sound; the
+        // delay is a OneShot busy-wait on TIMER0, which is fine here since the
+        // tick ISR isn't armed yet. USB-loaded tunes start immediately.
+        if playing_fallback {
+            use embedded_hal::delay::DelayNs;
+            output_mute(true);
+            timer.delay_ms(1000);
+            output_mute(false);
+        }
         // enable_tick_isr sets periodic mode + listen + enables interrupts;
         // then override the reload with the cycle-accurate play period.
         timer.enable_tick_isr(20, pac::Interrupt::TIMER0);
