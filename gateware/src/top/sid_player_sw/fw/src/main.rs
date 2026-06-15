@@ -442,7 +442,9 @@ fn main() -> ! {
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
     let mut unsupported = false; // last file selection was an unsupported .SID
-    let mut redraw   = true;          // full-header clear (page switch / tune load)
+    let mut redraw   = true;          // redraw all menu rows (page switch / refresh)
+    let mut redraw_title = false;     // also clear title/author (tune load: name changed)
+    let mut first_paint  = true;      // one-time full clear to wipe the boot splash
     let mut redraw_row: Option<usize> = None; // cheap single-row clear (one value edited)
     let mut page     = Page::Player;
     let mut selected: usize = 0;
@@ -517,6 +519,7 @@ fn main() -> ! {
                             output_mute(false);
                             play_period = p; play_hz = hz;
                             set_play_period(&mut timer, play_period);
+                            redraw_title = true; // new tune: name/author changed
                         } else {
                             unsupported = true; // stay on the built-in tune
                         }
@@ -628,8 +631,8 @@ fn main() -> ! {
                                             play_period = p; play_hz = hz;
                                             set_play_period(&mut timer, play_period);
                                             // New tune: name/author/meta + every
-                                            // row change at once -> full clear.
-                                            redraw = true;
+                                            // row change -> clear title + rows.
+                                            redraw_title = true;
                                         } else {
                                             // Unsupported file: keep playing the
                                             // current tune, flag it in the UI.
@@ -678,13 +681,14 @@ fn main() -> ! {
                                     output_mute(false);
                                     play_period = p; play_hz = hz;
                                     set_play_period(&mut timer, play_period);
+                                    redraw_title = true; // new tune: name changed
                                 } else {
                                     // First file unsupported: keep current tune.
                                     unsupported = true;
                                 }
                             }
                         }
-                        // File list + every row may change -> full clear.
+                        // File list + every row may change -> redraw rows.
                         redraw = true;
                     }
                     // All other Config rows (scope params): press toggles modify,
@@ -693,8 +697,8 @@ fn main() -> ! {
                     _ => {}
                 }
                 // Most button actions toggle a marker or one row's text; clear
-                // just that row. Loading a new tune (above) sets full `redraw`.
-                if !redraw { redraw_row = Some(selected); }
+                // just that row. Loading a new tune (above) sets redraw/title.
+                if !redraw && !redraw_title { redraw_row = Some(selected); }
             }
 
             // The menu band (y < HEADER_H) is frozen from persist phosphor
@@ -704,50 +708,78 @@ fn main() -> ! {
             // set by every value/page/tune change above). This keeps the UI
             // loop off the PSRAM bus between interactions, leaving bandwidth
             // for the 6502's tune fetches (audio > visuals).
-            if !(ticks != 0 || btn || redraw || redraw_row.is_some()) {
+            if !(ticks != 0 || btn || redraw || redraw_title || redraw_row.is_some()) {
                 continue;
             }
 
             // Menu text below is re-blitted only when the gate above passes
             // (input or a pending clear). Navigation (rotate without modify)
-            // passes via `ticks != 0` and re-blits each row's font (selected
-            // vs dim) over identical glyphs, so it needs no clear. Clears
-            // erase ghosts left when text shrinks (long filename ->
-            // short, "PLAYING" -> "PAUSED"). They are per-pixel `draw_iter`
-            // fills (no accelerated fill_solid in the HAL) that blank whatever
-            // they cover for the fill's duration under PSRAM contention, so we
-            // clear as little as possible:
-            //   `redraw`     -> whole header (page switch / tune load: every row
-            //                   plus name/author/meta change at once).
-            //   `redraw_row` -> one row's band (a single value was edited).
-            // Plain row navigation sets neither.
+            // passes via `ticks != 0` and re-blits each row's font (selected vs
+            // dim) over identical glyphs, so it needs no clear. Clears erase
+            // ghosts when text shrinks (long filename -> short, "PLAYING" ->
+            // "PAUSED"); they are per-pixel `draw_iter` fills (no accelerated
+            // fill_solid in the HAL), slow under PSRAM contention — so we clear
+            // as little as possible and NEVER the whole header at once:
+            //   `first_paint`  -> one full clear to wipe the boot splash.
+            //   `redraw`       -> each row band, cleared just-in-time in the
+            //                     draw loop (row-by-row, no global blank) + the
+            //                     taller card's trailing rows. NARROW centred
+            //                     strip (rows live near cx), not full width.
+            //   `redraw_title` -> additionally the full-width title/author bands
+            //                     (only a tune load changes the 32-char name).
+            //   `redraw_row`   -> one row's band (a single value was edited).
             let vy0    = 72i32;
             let vspace = 18i32;
-            if redraw {
-                redraw = false;
-                redraw_row = None; // full clear supersedes any pending row clear
+            let cx     = h_active as i32 / 2;
+            // Row text spans labels at cx-100 .. values right-aligned at cx+100
+            // (+ marker), and the centred metadata line reaches ~cx±105; a
+            // centred strip covers both without the full-width clear cost.
+            let band_x = cx - 130;
+            let band_w = 290u32;
+            let first  = first_paint;            // wipe the boot splash, once
+            let title  = redraw_title;           // tune load: name/author changed
+            let rows   = redraw || redraw_title; // page switch / refresh / tune load
+            first_paint  = false;
+            redraw_title = false;
+            redraw       = false;
+            let single = if first || rows { redraw_row = None; None }
+                         else { redraw_row.take() };
+            if first {
+                // Full one-time clear: the boot splash is left-aligned (x=20),
+                // outside the centred strip, so the whole header must be wiped.
                 Rectangle::new(Point::new(0, 0), Size::new(h_active as u32, HEADER_H as u32))
-                    .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
-                    .draw(&mut display)
-                    .ok();
-            } else if let Some(row) = redraw_row.take() {
-                // Clear only the changed row's text band (full width: long
-                // filenames span the line). The Player "Song" row (2) also
-                // drives the metadata line at y=162, so extend the band to it.
-                let y   = vy0 + vspace * row as i32;
-                let top = y - 15;
-                let bot = if page == Page::Player && row == 2 { 167 } else { y + 5 };
-                Rectangle::new(Point::new(0, top),
-                               Size::new(h_active as u32, (bot - top) as u32))
-                    .into_styled(PrimitiveStyle::with_fill(HI8::BLACK))
-                    .draw(&mut display)
-                    .ok();
+                    .into_styled(PrimitiveStyle::with_fill(HI8::BLACK)).draw(&mut display).ok();
+            } else {
+                if title {
+                    // Title/author are centred and can be wide (32-char PSID
+                    // name) -> full width.
+                    for &ty in &[34i32, 54i32] {
+                        Rectangle::new(Point::new(0, ty - 15), Size::new(h_active as u32, 20))
+                            .into_styled(PrimitiveStyle::with_fill(HI8::BLACK)).draw(&mut display).ok();
+                    }
+                }
+                if rows {
+                    // Trailing rows of the taller (Config) card, plus the Player
+                    // metadata line (y=162 == Config row 5). Current rows are
+                    // cleared in the draw loop below.
+                    for n in rows_in(page)..rows_in(Page::Config) {
+                        let y = vy0 + vspace * n as i32;
+                        Rectangle::new(Point::new(band_x, y - 15), Size::new(band_w, 20))
+                            .into_styled(PrimitiveStyle::with_fill(HI8::BLACK)).draw(&mut display).ok();
+                    }
+                } else if let Some(row) = single {
+                    // Single edited row. The Player "Song" row (2) also drives
+                    // the metadata line at y=162, so extend the band to it.
+                    let y   = vy0 + vspace * row as i32;
+                    let bot = if page == Page::Player && row == 2 { 167 } else { y + 5 };
+                    Rectangle::new(Point::new(band_x, y - 15), Size::new(band_w, (bot - (y - 15)) as u32))
+                        .into_styled(PrimitiveStyle::with_fill(HI8::BLACK)).draw(&mut display).ok();
+                }
             }
 
             let name_str   = trim_ascii(&tune_buf[0x16..0x36]);
             let author_str = trim_ascii(&tune_buf[0x36..0x56]);
 
-            let cx = h_active as i32 / 2;
             let mut line1: String<80> = String::new();
             write!(line1, "SID PLAYER ({})  {}", build_model_str, name_str).ok();
             Text::with_alignment(line1.as_str(), Point::new(cx, 34), style, Alignment::Center)
@@ -762,6 +794,13 @@ fn main() -> ! {
             for n in 0..rows_in(page) {
                 let font = if selected == n { style } else { style_dim };
                 let y = vy0 + vspace * n as i32;
+                // Full row redraw: clear this row's band just before drawing it
+                // (the boot-splash full clear already blanked everything on the
+                // first paint). Row-by-row keeps the menu from blanking at once.
+                if rows && !first {
+                    Rectangle::new(Point::new(band_x, y - 15), Size::new(band_w, 20))
+                        .into_styled(PrimitiveStyle::with_fill(HI8::BLACK)).draw(&mut display).ok();
+                }
                 let label = match (page, n) {
                     (_, 0)            => "Menu",
                     (Page::Player, 1) => "File",
