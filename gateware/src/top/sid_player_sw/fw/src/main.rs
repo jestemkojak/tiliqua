@@ -144,9 +144,9 @@ struct Playback {
 
 static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
 
-/// Play ticks since boot (ISR-incremented; wraps). The UI loop divides by
-/// play_hz to pace repaints — blits are PSRAM traffic that competes with the
-/// 6502's tune fetches, and the framebuffer only refreshes ~60 Hz.
+/// Free-running play-frame counter since boot (ISR-incremented; wraps). One
+/// increment per PLAY frame in the TIMER0 ISR. No longer read by the UI loop
+/// (the per-frame menu repaint that used it was removed); kept as a counter.
 static PLAY_TICKS: AtomicU32 = AtomicU32::new(0);
 
 /// Set the play rate: program the TIMER0 reload (`period` sync cycles; the timer
@@ -158,9 +158,8 @@ fn set_play_period(timer: &mut Timer0, period: u32) {
 /// TIMER0 ISR body: run one PLAY frame on the software 6502. Real-time work
 /// lives here (not the UI loop) so menu redraws can never starve the audio.
 fn play_tick() {
-    // Count every tick (even while paused — the timer keeps firing) so the UI
-    // loop can pace its repaints. load/store, not fetch_add: riscv32im has no
-    // atomic RMW; single-writer (this ISR).
+    // Count every tick (even while paused — the timer keeps firing). load/store,
+    // not fetch_add: riscv32im has no atomic RMW; single-writer (this ISR).
     PLAY_TICKS.store(PLAY_TICKS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
@@ -453,6 +452,7 @@ fn main() -> ! {
     // drive goes away so re-insertion is detected; left false while the list is
     // empty so the boot-time read race keeps retrying until files appear.
     let mut usb_listed = false;
+    let mut prev_usb_present = false; // edge-detect USB plug/unplug for the Config row
 
     // Scope-card state (mirrors the initial scope/persist config above).
     let mut decay: u8     = 10;   // persistence 1..80
@@ -481,6 +481,13 @@ fn main() -> ! {
             // a drive going away re-arms it.
             let usb_present = msc.ready() && msc.block_size() == 512;
             if !usb_present { usb_listed = false; }
+            // USB presence is shown live on the Config "Rescan USB" row
+            // ("N files" / "NO DRIVE"). With the per-frame repaint gone, a
+            // plug/unplug sets no other dirty flag, so refresh once on the edge.
+            if usb_present != prev_usb_present {
+                prev_usb_present = usb_present;
+                redraw = true;
+            }
             if playing_fallback && usb_present && !usb_listed {
                 file_list.clear();
                 fat::list_sids(&msc, &mut file_list);
