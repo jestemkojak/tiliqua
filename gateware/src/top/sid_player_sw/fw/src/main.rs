@@ -433,8 +433,9 @@ fn main() -> ! {
 
     // Real-time playback runs in the TIMER0 interrupt at the tune's exact rate
     // (reload = play_period sys-clk cycles). The UI loop below is best-effort:
-    // it must repaint the menu every frame (the persist/scope effect decays the
-    // framebuffer), which is too slow to also host play() — hence the ISR.
+    // it repaints the menu on input only (the menu band is frozen from persist
+    // decay in gateware), while the scope region keeps decaying — too slow to
+    // also host play() from this loop, hence the ISR.
     let mut timer = Timer0::new(peripherals.TIMER0, CLOCK_SYNC_HZ);
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
     let mut paused   = false;
@@ -445,7 +446,6 @@ fn main() -> ! {
     let mut selected: usize = 0;
     let mut modify   = false;
     let mut browse_idx: usize = 0;
-    let mut last_paint_ticks: u32 = 0; // play-tick of the last menu repaint
     // Hot-plug enumeration latch: once a drive's files are listed we attempt a
     // single load. Without this the block re-lists + re-loads file 0 every loop
     // iteration while `playing_fallback` stays set (e.g. file 0 is unsupported),
@@ -676,21 +676,16 @@ fn main() -> ! {
                 if !redraw { redraw_row = Some(selected); }
             }
 
-            // Pace repaints to ~the play rate (~50-60 Hz; the framebuffer
-            // refresh rate): the loop otherwise free-runs and re-blits the whole
-            // menu thousands of times/sec, and every blit is PSRAM traffic
-            // competing with the 6502's tune fetches (audio > visuals — this is
-            // what made Commando's dense "fast part" drop notes/stutter). Inputs
-            // and pending clears force an immediate repaint so navigation never
-            // lags; everything above this gate (encoder, hot-plug) is CSR-only
-            // and stays per-iteration.
-            let now_ticks = PLAY_TICKS.load(Ordering::Relaxed);
-            let elapsed = now_ticks.wrapping_sub(last_paint_ticks);
-            if !(ticks != 0 || btn || redraw || redraw_row.is_some()
-                 || elapsed.saturating_mul(60) >= play_hz) {
+            // The menu band (y < HEADER_H) is frozen from persist phosphor
+            // decay in gateware (persist_freeze_rows, see top.py), so the text
+            // persists without re-blitting. Repaint only on an actual change:
+            // encoder rotate/press, or a pending clear (redraw / redraw_row,
+            // set by every value/page/tune change above). This keeps the UI
+            // loop off the PSRAM bus between interactions, leaving bandwidth
+            // for the 6502's tune fetches (audio > visuals).
+            if !(ticks != 0 || btn || redraw || redraw_row.is_some()) {
                 continue;
             }
-            last_paint_ticks = now_ticks;
 
             // Menu text is re-blitted every frame below (the persist/scope
             // effect decays the framebuffer), so navigation needs no clear.
