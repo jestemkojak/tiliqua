@@ -26,8 +26,9 @@ class Persistance(wiring.Component):
     """
 
     def __init__(self, *, bus_signature,
-                 fifo_depth=16, holdoff_default=256):
+                 fifo_depth=16, holdoff_default=256, freeze_rows=0):
         self.fifo_depth = fifo_depth
+        self.freeze_rows = freeze_rows
         super().__init__({
             # Tweakables
             "holdoff": In(16, init=holdoff_default),
@@ -52,6 +53,12 @@ class Persistance(wiring.Component):
 
         # Length of framebuffer in bus words
         fb_len_words = ((self.fbp.timings.active_pixels * pixel_bytes) //
+                        (self.bus.data_width // pixel_bits))
+
+        # Length (in bus words) of the top band frozen from decay. Derived from
+        # the runtime modeline h_active (video is modeline-driven). freeze_rows=0
+        # -> header_words=0 -> no pixel is ever frozen (identical to before).
+        header_words = ((self.freeze_rows * self.fbp.timings.h_active) //
                         (self.bus.data_width // pixel_bits))
 
         # Track framebuffer position by tracking fifo reads/writes
@@ -151,9 +158,16 @@ class Persistance(wiring.Component):
                 # Per-pixel LFSR comparison decides whether to decay or
                 # write back unchanged (probabilistic skip).
                 pixels_w = Signal(data.ArrayLayout(Pixel, 4))
+                # Pixels written this cycle are at word offset (dma_offs_out - 1).
+                # Freeze (skip decay) when that offset is in the top band. Exclude
+                # the wrap write (dma_offs_out == 0 -> last word of frame).
+                in_header = Signal()
+                m.d.comb += in_header.eq((dma_offs_out != 0) &
+                                         (dma_offs_out <= header_words))
                 for n in range(4):
                     skip_this = Signal(name=f"skip_{n}")
-                    m.d.comb += skip_this.eq(lfsr1[n*8:(n*8)+8] < skip_latch)
+                    m.d.comb += skip_this.eq(
+                        (lfsr1[n*8:(n*8)+8] < skip_latch) | in_header)
                     m.d.comb += pixels_w[n].color.eq(pixels_r[n].color)
                     with m.If(skip_this):
                         m.d.comb += pixels_w[n].intensity.eq(pixels_r[n].intensity)

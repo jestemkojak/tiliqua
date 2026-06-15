@@ -61,6 +61,41 @@ class RasterTests(unittest.TestCase):
         with sim.write_vcd(vcd_file=open("test_persist.vcd", "w")):
             sim.run()
 
+    def test_persist_freeze(self):
+
+        m = Module()
+        fb = framebuffer.DMAFramebuffer(
+            fixed_modeline=self.MODELINE, palette=palette.ColorPalette())
+        # freeze_rows=4 -> header_words = 4*h_active/4 = h_active = 1280 words.
+        # The handful of bursts below stay well under that offset, so every
+        # written pixel is inside the frozen band and must be unchanged.
+        dut = persist.Persistance(bus_signature=fb.bus.signature, freeze_rows=4)
+        wiring.connect(m, wiring.flipped(fb.fbp), dut.fbp)
+        check = wishbone.BusChecker(dut.bus, prefix='[bus] ')
+        m.submodules += [dut, fb, fb.palette, check]
+
+        async def testbench(ctx):
+            ctx.set(fb.fbp.enable, 1)
+            for _ in range(4):
+                while not ctx.get(dut.bus.stb):
+                    await ctx.tick()
+                await ctx.tick().repeat(8)
+                ctx.set(dut.bus.ack, 1)
+                while ctx.get(dut.bus.stb):
+                    # Constant full-intensity pixels (intensity nibble = 0xf).
+                    ctx.set(dut.bus.dat_r, 0xffffffff)
+                    if ctx.get(dut.bus.we):
+                        # Frozen band: written back unchanged (NOT decayed to 0xef).
+                        self.assertEqual(ctx.get(dut.bus.dat_w), 0xffffffff)
+                    await ctx.tick()
+                ctx.set(dut.bus.ack, 0)
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        with sim.write_vcd(vcd_file=open("test_persist_freeze.vcd", "w")):
+            sim.run()
+
     def test_stroke(self):
 
         m = Module()
