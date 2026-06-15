@@ -636,7 +636,13 @@ fn main() -> ! {
                                         } else {
                                             // Unsupported file: keep playing the
                                             // current tune, flag it in the UI.
+                                            // The State row (4) flips to
+                                            // UNSUPPORTED! while `selected` is the
+                                            // File row (1), so a single-row clear
+                                            // would leave the old State text under
+                                            // it (band is frozen). Redraw all rows.
                                             unsupported = true;
+                                            redraw = true;
                                         }
                                     }
                                 }
