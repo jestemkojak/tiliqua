@@ -694,9 +694,11 @@ fn main() -> ! {
                 continue;
             }
 
-            // Menu text is re-blitted every frame below (the persist/scope
-            // effect decays the framebuffer), so navigation needs no clear.
-            // Clears erase ghosts left when text shrinks (long filename ->
+            // Menu text below is re-blitted only when the gate above passes
+            // (input or a pending clear). Navigation (rotate without modify)
+            // passes via `ticks != 0` and re-blits each row's font (selected
+            // vs dim) over identical glyphs, so it needs no clear. Clears
+            // erase ghosts left when text shrinks (long filename ->
             // short, "PLAYING" -> "PAUSED"). They are per-pixel `draw_iter`
             // fills (no accelerated fill_solid in the HAL) that blank whatever
             // they cover for the fill's duration under PSRAM contention, so we
