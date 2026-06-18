@@ -10,7 +10,7 @@ use mos6502::cpu::CPU;
 use mos6502::instruction::Nmos6502;
 
 use tiliqua_pac as pac;
-use tiliqua_fw::{fat, player, psid, usb_msc::UsbMsc};
+use tiliqua_fw::{cvmod, fat, player, psid, usb_msc::UsbMsc};
 use tiliqua_fw::*;
 
 use tiliqua_lib::*;
@@ -150,6 +150,8 @@ struct Playback {
     cpu: PlayerCpu,
     play_addr: u16,
     paused: bool,
+    shadow: cvmod::SidShadow,
+    cv: cvmod::CvMod,
 }
 
 static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
@@ -184,8 +186,28 @@ fn play_tick() {
                 // affected notes at ±1ms), and the spin wasted the real-time budget
                 // that 200Hz tunes need. See docs/superpowers/specs/
                 // 2026-06-15-remove-paced-replay-anchor-design.md.
+                //
+                // Mirror each write into the shadow and record which registers the
+                // tune touched this frame (dirty mask) for CV change-detection.
+                let mut dirty: u32 = 0;
                 for w in pb.cpu.memory.writes.iter() {
                     sid_write_bp(w.reg, w.val);
+                    pb.shadow[(w.reg & 0x1F) as usize] = w.val;
+                    dirty |= 1 << (w.reg & 0x1F);
+                }
+                // Read the 3 CV inputs + jack-detect, then apply CV modulation
+                // on top of the tune's writes (override wins until the next
+                // tune write to the same register).
+                let p = unsafe { pac::Peripherals::steal() };
+                let cv_raw = [
+                    p.PMOD0_PERIPH.sample_i0().read().bits() as i16 as i32,
+                    p.PMOD0_PERIPH.sample_i1().read().bits() as i16 as i32,
+                    p.PMOD0_PERIPH.sample_i2().read().bits() as i16 as i32,
+                ];
+                let jacks = p.PMOD0_PERIPH.jack().read().bits();
+                let writes = pb.cv.compute(&pb.shadow, dirty, cv_raw, jacks);
+                for (reg, val) in writes.iter() {
+                    sid_write_bp(*reg, *val);
                 }
             }
         }
@@ -227,8 +249,15 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
         // Only after the load is known-good: an unsupported file must leave
         // the still-playing current tune's SID state untouched.
         sid_reset();
+        pb.shadow = [0; cvmod::SID_REGS];
+        pb.cv.reset();
         pb.cpu.registers.stack_pointer.0 = 0xFD;
         player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000);
+        // Mirror INIT-time SID writes into the shadow so CV offsets start from
+        // the tune's real post-INIT register values (drain_sid_writes clears them).
+        for w in pb.cpu.memory.writes.iter() {
+            pb.shadow[(w.reg & 0x1F) as usize] = w.val;
+        }
         drain_sid_writes(&mut pb.cpu.memory); // INIT setup (volume/filter) -> SID now
         let cia = (pb.cpu.memory.mem[0xDC04] as u16) | ((pb.cpu.memory.mem[0xDC05] as u16) << 8);
         period = Some(psid::play_period_cycles(
@@ -440,6 +469,8 @@ fn main() -> ! {
     critical_section::with(|cs| {
         PLAYBACK.borrow_ref_mut(cs).replace(Playback {
             cpu, play_addr: hdr.play_addr, paused: false,
+            shadow: [0; cvmod::SID_REGS],
+            cv: cvmod::CvMod::new(),
         });
     });
 
