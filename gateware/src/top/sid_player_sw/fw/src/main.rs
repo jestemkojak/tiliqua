@@ -456,6 +456,14 @@ fn main() -> ! {
     let _ = load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
     sid_reset();
     player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+    // Seed the CV shadow with INIT-time register writes before draining clears
+    // them, so CV offsets start from the tune's real post-INIT values (mirrors
+    // reload_tune; otherwise the first boot frame with a CV patched would
+    // offset/restore against an all-zero base).
+    let mut shadow: cvmod::SidShadow = [0; cvmod::SID_REGS];
+    for w in cpu.memory.writes.iter() {
+        shadow[(w.reg & 0x1F) as usize] = w.val;
+    }
     drain_sid_writes(&mut cpu.memory); // INIT setup (volume/filter) -> SID now
     let cia = (cpu.memory.mem[0xDC04] as u16) | ((cpu.memory.mem[0xDC05] as u16) << 8);
     let period = psid::play_period_cycles(CLOCK_SYNC_HZ, hdr.clock(), hdr.is_cia(current_subtune), cia);
@@ -469,7 +477,7 @@ fn main() -> ! {
     critical_section::with(|cs| {
         PLAYBACK.borrow_ref_mut(cs).replace(Playback {
             cpu, play_addr: hdr.play_addr, paused: false,
-            shadow: [0; cvmod::SID_REGS],
+            shadow,
             cv: cvmod::CvMod::new(),
         });
     });
