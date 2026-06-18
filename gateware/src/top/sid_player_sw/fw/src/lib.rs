@@ -18,6 +18,7 @@ hal::impl_scope! {
 pub mod handlers;
 
 // Host-testable pure modules (no pac dependency)
+pub mod cvmod;
 pub mod partition;
 pub mod player;
 pub mod psid;
