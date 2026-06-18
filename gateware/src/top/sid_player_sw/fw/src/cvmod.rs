@@ -45,6 +45,15 @@ pub fn pw_base(shadow: &SidShadow, voice: usize) -> i32 {
     (shadow[lo] as i32) | (((shadow[hi] & 0x0F) as i32) << 8)
 }
 
+/// CV3 mute zone (0..3) from slewed CV counts, with hysteresis around the
+/// 5000/10000/15000-count boundaries so a noisy input doesn't chatter.
+pub fn zone_with_hyst(v: i32, prev: u8) -> u8 {
+    let mut z = prev as i32;
+    while z < 3 && v >= (z + 1) * ZONE_WIDTH + ZONE_HYST { z += 1; }
+    while z > 0 && v <  z * ZONE_WIDTH - ZONE_HYST { z -= 1; }
+    z as u8
+}
+
 /// Per-feature modulation state, owned by the playback struct.
 pub struct CvMod {
     /// EMA accumulators for the 3 CV inputs (raw counts).
@@ -133,8 +142,26 @@ impl CvMod {
             // falling edge: restore (Task 5)
         }
 
+        // --- CV3: progressive voice mute (unipolar, 4 zones, hysteresis) ---
+        if patched[2] {
+            let rising = !self.prev_patched[2];
+            let cv = self.slew_update(2, cv_raw[2], rising);
+            let zone = zone_with_hyst(cv, self.prev_zone);
+            self.prev_zone = zone;
+            for v in 0..3 {
+                let ctrl = CTRL_REGS[v];
+                let muted = v >= (3 - zone as usize); // zone N mutes the N highest voices
+                let val = if muted { shadow[ctrl] & 0x0F } else { shadow[ctrl] };
+                self.emit(&mut out, shadow, dirty, ctrl, val);
+            }
+        } else if self.prev_patched[2] {
+            // falling edge: restore (Task 5)
+            self.prev_zone = 0;
+        }
+
         self.prev_patched[0] = patched[0];
         self.prev_patched[1] = patched[1];
+        self.prev_patched[2] = patched[2];
         out
     }
 }
@@ -262,5 +289,42 @@ mod tests {
             }
             assert_eq!(got, 4095);
         }
+    }
+
+    #[test]
+    fn cv3_zone_hysteresis() {
+        // boundaries at 5000/10000/15000 counts, deadband +/-480.
+        // rising past a boundary needs +HYST; falling needs -HYST.
+        assert_eq!(zone_with_hyst(0, 0), 0);
+        assert_eq!(zone_with_hyst(ZONE_WIDTH - 1, 0), 0);          // just below b1
+        assert_eq!(zone_with_hyst(ZONE_WIDTH + ZONE_HYST, 0), 1);  // crosses up
+        assert_eq!(zone_with_hyst(ZONE_WIDTH + ZONE_HYST - 1, 0), 0); // inside deadband, stays
+        // already in zone 1, drop only when below b1 - HYST
+        assert_eq!(zone_with_hyst(ZONE_WIDTH - ZONE_HYST + 1, 1), 1); // inside deadband, stays
+        assert_eq!(zone_with_hyst(ZONE_WIDTH - ZONE_HYST - 1, 1), 0); // drops
+        // clamps and negatives
+        assert_eq!(zone_with_hyst(-9999, 2), 0);
+        assert_eq!(zone_with_hyst(3 * ZONE_WIDTH + ZONE_HYST + 1, 0), 3);
+        assert_eq!(zone_with_hyst(99 * ZONE_WIDTH, 0), 3);
+    }
+
+    #[test]
+    fn cv3_mutes_high_voices_first() {
+        // zone N mutes the N highest voice indices (V3=idx2 first).
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        // each voice ctrl: pulse waveform (0x40) + gate (0x01) = 0x41
+        for &c in CTRL_REGS.iter() { s[c] = 0x41; }
+
+        // ~1.25*1 + margin volts -> zone 1 -> mute idx2 only.
+        let v = ZONE_WIDTH + ZONE_HYST + 1;
+        let out = cv.compute(&s, 0, [0, 0, v], 0b100);
+        // idx2 ctrl forced to low nibble (0x01); idx0/idx1 untouched (== shadow,
+        // and dirty=0 with last_emit unknown -> emitted as shadow, harmless).
+        let mut muted2 = None;
+        for &(r, val) in out.iter() {
+            if r as usize == CTRL_REGS[2] { muted2 = Some(val); }
+        }
+        assert_eq!(muted2, Some(0x01), "voice 3 (idx2) waveform bits cleared, gate kept");
     }
 }
