@@ -76,10 +76,50 @@ impl CvMod {
         self.last_emit = [UNKNOWN; SID_REGS];
     }
 
-    /// Produce this frame's override writes. Stub — filled in by later tasks.
-    pub fn compute(&mut self, _shadow: &SidShadow, _dirty: u32,
-                   _cv_raw: [i32; 3], _jacks: u8) -> WriteList {
-        WriteList::new()
+    fn slew_update(&mut self, i: usize, raw: i32, rising: bool) -> i32 {
+        if rising {
+            self.slew[i] = raw; // snap for instant response on patch-in
+        } else {
+            self.slew[i] += (raw - self.slew[i]) >> SLEW_K;
+        }
+        self.slew[i]
+    }
+
+    fn emit(&mut self, out: &mut WriteList, shadow: &SidShadow,
+            dirty: u32, reg: usize, val: u8) {
+        // The chip currently holds: the tune's base (shadow) if the tune wrote
+        // this reg this frame, else whatever we last emitted.
+        let current = if dirty & (1 << reg) != 0 {
+            shadow[reg] as i16
+        } else {
+            self.last_emit[reg]
+        };
+        if current != val as i16 {
+            let _ = out.push((reg as u8, val)); // capacity proven by MAX_WRITES
+        }
+        self.last_emit[reg] = val as i16;
+    }
+
+    /// Produce this frame's override writes.
+    pub fn compute(&mut self, shadow: &SidShadow, dirty: u32,
+                   cv_raw: [i32; 3], jacks: u8) -> WriteList {
+        let mut out = WriteList::new();
+        let patched = [jacks & 1 != 0, jacks & 2 != 0, jacks & 4 != 0];
+
+        // --- CV1: filter cutoff offset (bipolar) ---
+        if patched[0] {
+            let rising = !self.prev_patched[0];
+            let cv = self.slew_update(0, cv_raw[0], rising);
+            let off = cv * CUTOFF_CTS_PER_V / COUNTS_PER_VOLT;
+            let fin = (cutoff_base(shadow) + off).clamp(0, 2047);
+            self.emit(&mut out, shadow, dirty, FC_LO, (fin & 7) as u8);
+            self.emit(&mut out, shadow, dirty, FC_HI, (fin >> 3) as u8);
+        } else if self.prev_patched[0] {
+            // falling edge: restore base (handled fully in Task 5)
+        }
+
+        self.prev_patched[0] = patched[0];
+        out
     }
 }
 
@@ -112,6 +152,59 @@ mod tests {
         let s: SidShadow = [0; SID_REGS];
         // nothing patched -> no writes
         let out = { let mut cv = cv; cv.compute(&s, 0, [0, 0, 0], 0) };
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cv1_cutoff_offset_and_clamp() {
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        // tune base cutoff = 1000
+        let base = 1000;
+        s[FC_LO] = (base & 7) as u8;
+        s[FC_HI] = (base >> 3) as u8;
+
+        // CV1 patched (jack bit 0), +5V => +~2050 -> clamps at 2047.
+        // First frame snaps the slew to the raw value (rising edge).
+        let out = cv.compute(&s, 0, [5 * COUNTS_PER_VOLT, 0, 0], 0b001);
+        // Expect two writes for cutoff regs reconstructing the clamped value 2047.
+        let mut got = 0i32;
+        for &(r, v) in out.iter() {
+            if r as usize == FC_LO { got |= (v as i32) & 7; }
+            if r as usize == FC_HI { got |= (v as i32) << 3; }
+        }
+        assert_eq!(got, 2047, "cutoff should clamp to 11-bit max");
+
+        // Negative CV pushes below base; -5V => 1000-2050 -> clamp 0.
+        let mut cv2 = CvMod::new();
+        let out = cv2.compute(&s, 0, [-5 * COUNTS_PER_VOLT, 0, 0], 0b001);
+        let mut got = 0i32;
+        for &(r, v) in out.iter() {
+            if r as usize == FC_LO { got |= (v as i32) & 7; }
+            if r as usize == FC_HI { got |= (v as i32) << 3; }
+        }
+        assert_eq!(got, 0, "cutoff should clamp to 0");
+    }
+
+    #[test]
+    fn cv1_zero_volts_is_passthrough() {
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        let base = 1234;
+        s[FC_LO] = (base & 7) as u8;
+        s[FC_HI] = (base >> 3) as u8;
+        // 0V, patched: offset 0 -> final == base. The tune already wrote these regs
+        // this frame (dirty), so the chip holds base -> compute emits nothing.
+        let dirty = (1 << FC_LO) | (1 << FC_HI);
+        let out = cv.compute(&s, dirty, [0, 0, 0], 0b001);
+        assert!(out.is_empty(), "0V on a dirty cutoff = no extra writes");
+    }
+
+    #[test]
+    fn cv1_unpatched_emits_nothing() {
+        let mut cv = CvMod::new();
+        let s: SidShadow = [0; SID_REGS];
+        let out = cv.compute(&s, 0, [5 * COUNTS_PER_VOLT, 0, 0], 0b000);
         assert!(out.is_empty());
     }
 }
