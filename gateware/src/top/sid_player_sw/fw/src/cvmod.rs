@@ -94,6 +94,16 @@ impl CvMod {
         self.slew[i]
     }
 
+    /// One-shot restore of `regs` to their tune base (shadow). After restoring,
+    /// mark each as UNKNOWN so a future re-patch re-forces the override.
+    fn restore(&mut self, out: &mut WriteList, shadow: &SidShadow,
+               dirty: u32, regs: &[usize]) {
+        for &r in regs {
+            self.emit(out, shadow, dirty, r, shadow[r]);
+            self.last_emit[r] = UNKNOWN;
+        }
+    }
+
     fn emit(&mut self, out: &mut WriteList, shadow: &SidShadow,
             dirty: u32, reg: usize, val: u8) {
         // The chip currently holds: the tune's base (shadow) if the tune wrote
@@ -124,7 +134,7 @@ impl CvMod {
             self.emit(&mut out, shadow, dirty, FC_LO, (fin & 7) as u8);
             self.emit(&mut out, shadow, dirty, FC_HI, (fin >> 3) as u8);
         } else if self.prev_patched[0] {
-            // falling edge: restore base (handled fully in Task 5)
+            self.restore(&mut out, shadow, dirty, &[FC_LO, FC_HI]);
         }
 
         // --- CV2: pulse-width offset (bipolar), all 3 voices ---
@@ -139,7 +149,9 @@ impl CvMod {
                 self.emit(&mut out, shadow, dirty, hi, ((fin >> 8) & 0x0F) as u8);
             }
         } else if self.prev_patched[1] {
-            // falling edge: restore (Task 5)
+            let regs = [PW_REGS[0].0, PW_REGS[0].1, PW_REGS[1].0, PW_REGS[1].1,
+                        PW_REGS[2].0, PW_REGS[2].1];
+            self.restore(&mut out, shadow, dirty, &regs);
         }
 
         // --- CV3: progressive voice mute (unipolar, 4 zones, hysteresis) ---
@@ -155,8 +167,8 @@ impl CvMod {
                 self.emit(&mut out, shadow, dirty, ctrl, val);
             }
         } else if self.prev_patched[2] {
-            // falling edge: restore (Task 5)
             self.prev_zone = 0;
+            self.restore(&mut out, shadow, dirty, &CTRL_REGS);
         }
 
         self.prev_patched[0] = patched[0];
@@ -326,5 +338,117 @@ mod tests {
             if r as usize == CTRL_REGS[2] { muted2 = Some(val); }
         }
         assert_eq!(muted2, Some(0x01), "voice 3 (idx2) waveform bits cleared, gate kept");
+    }
+
+    #[test]
+    fn unpatch_restores_base_once() {
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        s[FC_LO] = 2; s[FC_HI] = 100; // base cutoff
+        // frame 1: patched, +5V -> cutoff overridden.
+        let _ = cv.compute(&s, 0, [5 * COUNTS_PER_VOLT, 0, 0], 0b001);
+        // frame 2: unpatched -> one-shot restore of FC_LO/FC_HI to base.
+        let out = cv.compute(&s, 0, [5 * COUNTS_PER_VOLT, 0, 0], 0b000);
+        let mut lo = None; let mut hi = None;
+        for &(r, v) in out.iter() {
+            if r as usize == FC_LO { lo = Some(v); }
+            if r as usize == FC_HI { hi = Some(v); }
+        }
+        assert_eq!(lo, Some(2)); assert_eq!(hi, Some(100));
+        // frame 3: still unpatched -> nothing.
+        let out = cv.compute(&s, 0, [5 * COUNTS_PER_VOLT, 0, 0], 0b000);
+        assert!(out.is_empty(), "restore is one-shot");
+    }
+
+    #[test]
+    fn unpatch_unmutes_voices() {
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        for &c in CTRL_REGS.iter() { s[c] = 0x41; }
+        // patched, zone 3 -> all muted.
+        let _ = cv.compute(&s, 0, [0, 0, 3 * ZONE_WIDTH + ZONE_HYST + 1], 0b100);
+        // unpatch -> all ctrl restored to 0x41.
+        let out = cv.compute(&s, 0, [0, 0, 0], 0b000);
+        for &c in CTRL_REGS.iter() {
+            let v = out.iter().find(|&&(r, _)| r as usize == c).map(|&(_, v)| v);
+            assert_eq!(v, Some(0x41), "voice ctrl {c:#x} restored");
+        }
+    }
+
+    #[test]
+    fn static_cv_costs_no_writes_after_first() {
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        s[FC_LO] = 0; s[FC_HI] = 50;
+        let cvv = 2 * COUNTS_PER_VOLT;
+        // frame 1: emits the override.
+        let out1 = cv.compute(&s, 0, [cvv, 0, 0], 0b001);
+        assert!(!out1.is_empty());
+        // frames 2+: same CV, tune did NOT rewrite cutoff (dirty=0) -> 0 writes.
+        let out2 = cv.compute(&s, 0, [cvv, 0, 0], 0b001);
+        assert!(out2.is_empty(), "steady CV + clean regs = no rewrites");
+        // but if the tune rewrites cutoff this frame (dirty), re-assert.
+        let dirty = (1 << FC_LO) | (1 << FC_HI);
+        let out3 = cv.compute(&s, dirty, [cvv, 0, 0], 0b001);
+        assert!(!out3.is_empty(), "tune clobbered cutoff -> re-assert override");
+    }
+
+    #[test]
+    fn cv1_negative_offset_clamps_low() {
+        // CV1 patched, large negative cv_raw drives cutoff below 0 -> clamp at 0.
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        // small base cutoff ~100
+        let base = 100i32;
+        s[FC_LO] = (base & 7) as u8;
+        s[FC_HI] = (base >> 3) as u8;
+        // -5V offset: 100 - 5*410 = 100 - 2050 = -1950 -> clamp 0
+        let out = cv.compute(&s, 0, [-5 * COUNTS_PER_VOLT, 0, 0], 0b001);
+        let mut got = 0i32;
+        for &(r, v) in out.iter() {
+            if r as usize == FC_LO { got |= (v as i32) & 7; }
+            if r as usize == FC_HI { got |= (v as i32) << 3; }
+        }
+        assert_eq!(got, 0, "cutoff should clamp to 0 for large negative offset");
+    }
+
+    #[test]
+    fn cv2_negative_offset_clamps_low() {
+        // CV2 patched, large negative cv_raw drives PW below 0 -> clamp at 0.
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        // small base PW ~100 for all voices
+        for &(lo, hi) in PW_REGS.iter() {
+            s[lo] = 100u8;
+            s[hi] = 0u8;
+        }
+        // -5V offset: 100 - 5*400 = 100 - 2000 = -1900 -> clamp 0
+        let out = cv.compute(&s, 0, [0, -5 * COUNTS_PER_VOLT, 0], 0b010);
+        for &(lo, hi) in PW_REGS.iter() {
+            let mut got = 0i32;
+            for &(r, val) in out.iter() {
+                if r as usize == lo { got |= val as i32; }
+                if r as usize == hi { got |= ((val as i32) & 0x0F) << 8; }
+            }
+            assert_eq!(got, 0, "PW should clamp to 0 for large negative offset");
+        }
+    }
+
+    #[test]
+    fn cv3_zone1_leaves_low_voices() {
+        // Zone 1 mutes only the HIGHEST voice (idx2). idx0 and idx1 must stay unmuted.
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        for &c in CTRL_REGS.iter() { s[c] = 0x41; }
+        // zone 1: just above ZONE_WIDTH + ZONE_HYST boundary
+        let v = ZONE_WIDTH + ZONE_HYST + 1;
+        let out = cv.compute(&s, 0, [0, 0, v], 0b100);
+        // idx0 and idx1 must be 0x41 (unmuted); idx2 must be 0x01 (muted)
+        let val = |idx: usize| out.iter()
+            .find(|&&(r, _)| r as usize == CTRL_REGS[idx])
+            .map(|&(_, v)| v);
+        assert_eq!(val(0), Some(0x41), "voice 0 (idx0) should be unmuted in zone 1");
+        assert_eq!(val(1), Some(0x41), "voice 1 (idx1) should be unmuted in zone 1");
+        assert_eq!(val(2), Some(0x01), "voice 2 (idx2) should be muted in zone 1");
     }
 }
