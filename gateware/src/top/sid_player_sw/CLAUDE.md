@@ -122,6 +122,20 @@ tunes use them); revisit if a future tune requires them.
   ADSR-jitter that was disproven). See
   `docs/superpowers/specs/2026-06-15-remove-paced-replay-anchor-design.md`.
 
+## CV / eurorack inputs (firmware)
+- Read a calibrated CV input: `PMOD0_PERIPH.sample_iN().read().bits() as i16 as i32` — the
+  **double cast** sign-extends the signed ASQ (Q1.15) out of the unsigned register word (a bare
+  `as i32` zero-extends and corrupts negative CV). **4000 counts = 1 volt.**
+- Per-jack patch-detect: `PMOD0_PERIPH.jack().read().bits()` is a `u8`, one bit per input jack
+  (set = patched). Used to auto-engage CV features only when a cable is present.
+- CV modulation of live playback (CV1 cutoff / CV2 PW / CV3 progressive mute) is the `cvmod.rs`
+  module: a pure, host-tested `compute(&shadow, dirty, cv_raw, jacks) -> WriteList` called from
+  the `play_tick` ISR after the tune-write drain. The 6502's per-frame SID writes are mirrored
+  into a `shadow` + a `dirty` mask so the override re-asserts only on change (steady CV ≈ 0 extra
+  writes/frame). Reset the shadow + `CvMod` on every (re)load AND seed it with the INIT writes
+  before `drain_sid_writes` clears them (boot + `reload_tune` both). Spec/plan:
+  `docs/superpowers/{specs,plans}/2026-06-18-cv-modulation*.md`.
+
 ## Gotchas (firmware)
 - **VexiiRiscv has no `mcycle`/perf-counter CSR** (`vexiiriscv.py`: no perf-counter
   plugin). Reading `mcycle`/`cycle` traps → freezes the whole SoC. Use the gateware
