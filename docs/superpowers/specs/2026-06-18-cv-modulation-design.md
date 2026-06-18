@@ -53,8 +53,8 @@ Per frame:
 
 ## `CvMod::compute` — the mapping (pure function, host-testable)
 
-`compute(&sid_shadow, cv_raw: [i32; 3], jacks: u8) -> heapless::Vec<(u8, u8), N>`
-has **no hardware access**, so the entire mapping is unit-testable on the host.
+`compute(&sid_shadow, dirty: u32, cv_raw: [i32; 3], jacks: u8) -> heapless::Vec<(u8,
+u8), N>` has **no hardware access**, so the entire mapping is unit-testable on the host.
 `CvMod` owns the mutable state (slew accumulators, per-register last-emitted
 cache, per-CV prev-patched flags).
 
@@ -90,12 +90,22 @@ counts; depth constants are expressed per-volt and converted once
   to forcing the **TEST bit (bit 3)** on the muted voice instead.
 
 ### Change-detection (real-time guard)
-`compute` caches the last value it emitted per register and only emits a write
-when the new value differs. A static CV into a tune holding that register steady
-costs **0 writes/frame**. Worst case (all 3 sweeping) ≤ 2 (cutoff) + 6 (PW) +
-3 (mute) = 11 writes/frame — small, and only while actively moving. Combined with
-patch-gating, the feature is ~free when nothing is plugged in (protects the
-fast-CIA-tune real-time budget).
+`compute` only emits a write when the register's desired final value differs from
+what the chip currently holds. The catch: the tune's own writes drain to the chip
+**before** the override each frame, so a register the tune wrote this frame holds
+the tune's base value, not compute's last override. So compute is told which
+registers the tune wrote this frame via a **dirty mask** (`u32`, bit r set if the
+tune wrote SID reg r): the "current chip value" of reg r is `shadow[r]` (base) if
+dirty, else compute's own `last_emit[r]`. It emits iff desired ≠ current. A static
+CV into a tune that holds that register steady costs **0 writes/frame**; a CV that
+modulates a register the tune also rewrites every frame re-asserts every frame
+(correct). Worst case (all 3 sweeping) ≤ 2 (cutoff) + 6 (PW) + 3 (mute) = 11
+writes/frame — small, and only while actively moving. Combined with patch-gating,
+the feature is ~free when nothing is plugged in (protects the fast-CIA-tune
+real-time budget).
+
+The dirty mask is built in `play_tick` from this frame's `cpu.memory.writes`
+(the same loop that mirrors writes into `sid_shadow`), then passed to `compute`.
 
 ## Edge cases & restore
 
