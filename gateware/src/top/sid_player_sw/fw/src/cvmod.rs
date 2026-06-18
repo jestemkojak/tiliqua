@@ -118,7 +118,23 @@ impl CvMod {
             // falling edge: restore base (handled fully in Task 5)
         }
 
+        // --- CV2: pulse-width offset (bipolar), all 3 voices ---
+        if patched[1] {
+            let rising = !self.prev_patched[1];
+            let cv = self.slew_update(1, cv_raw[1], rising);
+            let off = cv * PW_CTS_PER_V / COUNTS_PER_VOLT;
+            for v in 0..3 {
+                let (lo, hi) = PW_REGS[v];
+                let fin = (pw_base(shadow, v) + off).clamp(0, 4095);
+                self.emit(&mut out, shadow, dirty, lo, (fin & 0xFF) as u8);
+                self.emit(&mut out, shadow, dirty, hi, ((fin >> 8) & 0x0F) as u8);
+            }
+        } else if self.prev_patched[1] {
+            // falling edge: restore (Task 5)
+        }
+
         self.prev_patched[0] = patched[0];
+        self.prev_patched[1] = patched[1];
         out
     }
 }
@@ -206,5 +222,45 @@ mod tests {
         let s: SidShadow = [0; SID_REGS];
         let out = cv.compute(&s, 0, [5 * COUNTS_PER_VOLT, 0, 0], 0b000);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cv2_pw_offset_all_voices() {
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        // distinct PW bases per voice
+        for (v, &(lo, hi)) in PW_REGS.iter().enumerate() {
+            let base = 1000 + (v as i32) * 100; // 1000,1100,1200
+            s[lo] = (base & 0xFF) as u8;
+            s[hi] = ((base >> 8) & 0x0F) as u8;
+        }
+        // CV2 patched (jack bit 1), +2.5V => +1000 PW (2.5*400).
+        let out = cv.compute(&s, 0, [0, 2500 * COUNTS_PER_VOLT / 1000, 0], 0b010);
+
+        for (v, &(lo, hi)) in PW_REGS.iter().enumerate() {
+            let mut got = 0i32;
+            for &(r, val) in out.iter() {
+                if r as usize == lo { got |= val as i32; }
+                if r as usize == hi { got |= ((val as i32) & 0x0F) << 8; }
+            }
+            let want = (1000 + (v as i32) * 100 + 1000).min(4095);
+            assert_eq!(got, want, "voice {v} PW offset");
+        }
+    }
+
+    #[test]
+    fn cv2_clamps_to_12bit() {
+        let mut cv = CvMod::new();
+        let mut s: SidShadow = [0; SID_REGS];
+        for &(lo, hi) in PW_REGS.iter() { s[lo] = 0xF0; s[hi] = 0x0F; } // base 4080
+        let out = cv.compute(&s, 0, [0, 5 * COUNTS_PER_VOLT, 0], 0b010); // +2000 -> clamp 4095
+        for &(lo, hi) in PW_REGS.iter() {
+            let mut got = 0i32;
+            for &(r, val) in out.iter() {
+                if r as usize == lo { got |= val as i32; }
+                if r as usize == hi { got |= ((val as i32) & 0x0F) << 8; }
+            }
+            assert_eq!(got, 4095);
+        }
     }
 }
