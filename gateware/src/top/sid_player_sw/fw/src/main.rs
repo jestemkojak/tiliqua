@@ -59,9 +59,7 @@ fn snapshot_meta(tune_buf: &[u8], name: &mut String<32>, author: &mut String<32>
 fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
                     mem: &mut [u8; 0x10000]) -> Result<(), psid::PsidError> {
     *hdr = psid::PsidHeader::parse(&tune_buf[..len])?;
-    let payload_raw = &tune_buf[hdr.data_offset as usize..len];
-    let load_addr = hdr.effective_load_addr(payload_raw) as usize;
-    let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+    let (load_addr, payload) = hdr.resolve_payload(tune_buf, len, mem.len())?;
     mem[load_addr..load_addr + payload.len()].copy_from_slice(payload);
     // Zero CIA #1 Timer A so we can detect if INIT programs it (multispeed).
     mem[0xDC04] = 0;
@@ -453,7 +451,18 @@ fn main() -> ! {
     // sid_reset is redundant right after bitstream load (the gateware holds SID
     // reset for the first 24 phi2 edges) but kept for uniformity with
     // reload_tune — it also covers warm relaunches from the bootloader.
-    let _ = load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+    if load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem).is_err() {
+        // Header parsed OK above but offset fields are corrupt — fall back to
+        // the built-in tune (always valid).
+        info!("load_psid_to_mem failed (bad offsets) — using built-in tune");
+        tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
+        len = FALLBACK_SID.len();
+        playing_fallback = true;
+        hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("built-in PSID loads");
+        current_subtune = hdr.start_song;
+        load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem)
+            .expect("built-in PSID loads");
+    }
     sid_reset();
     player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
     // Seed the CV shadow with INIT-time register writes before draining clears

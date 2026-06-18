@@ -15,7 +15,7 @@ pub struct PsidHeader {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum PsidError { TooShort, BadMagic, UnsupportedVersion }
+pub enum PsidError { TooShort, BadMagic, UnsupportedVersion, BadOffsets }
 
 /// Video standard the tune was composed for (PSID `flags` bits 2-3).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,6 +127,24 @@ impl PsidHeader {
     pub fn effective_load_addr(&self, payload: &[u8]) -> u16 {
         if self.load_addr != 0 { self.load_addr }
         else { u16::from_le_bytes([payload[0], payload[1]]) }
+    }
+
+    /// Resolve the tune payload's load address + byte slice, validating the
+    /// untrusted `data_offset`/`load_addr` fields against the in-buffer length
+    /// `len` and the target image size `mem_len`. Never indexes out of bounds.
+    pub fn resolve_payload<'a>(&self, tune: &'a [u8], len: usize, mem_len: usize)
+        -> Result<(usize, &'a [u8]), PsidError>
+    {
+        let off = self.data_offset as usize;
+        if len > tune.len() || off > len { return Err(PsidError::BadOffsets); }
+        let payload_raw = &tune[off..len];
+        if self.load_addr == 0 && payload_raw.len() < 2 {
+            return Err(PsidError::BadOffsets);
+        }
+        let load_addr = self.effective_load_addr(payload_raw) as usize;
+        let payload = if self.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+        if load_addr + payload.len() > mem_len { return Err(PsidError::BadOffsets); }
+        Ok((load_addr, payload))
     }
 }
 
@@ -244,5 +262,82 @@ mod tests {
         hb[0x08..0x0A].copy_from_slice(&be16(0));
         let h = PsidHeader::parse(&hb).unwrap();
         assert_eq!(h.effective_load_addr(&[0x00, 0x20]), 0x2000);
+    }
+
+    // --- resolve_payload tests ---
+
+    #[test]
+    fn resolve_payload_rejects_data_offset_beyond_len() {
+        // data_offset (0x7C) > len (0x7B) → BadOffsets
+        let h = PsidHeader::parse(&make_header()).unwrap(); // data_offset = 0x7C
+        let tune = make_header();
+        let mem_len = 0x10000;
+        assert_eq!(h.resolve_payload(&tune, 0x7B, mem_len), Err(PsidError::BadOffsets));
+    }
+
+    #[test]
+    fn resolve_payload_rejects_tiny_payload_when_load_addr_zero() {
+        // load_addr == 0, payload_raw.len() < 2 → BadOffsets
+        let mut hb = make_header();
+        hb[0x08..0x0A].copy_from_slice(&be16(0)); // load_addr = 0
+        // data_offset = 0x7C; len = 0x7D → payload_raw.len() = 1 < 2
+        let h = PsidHeader::parse(&hb).unwrap();
+        let mut tune = [0u8; 0x7D];
+        tune[..0x7C].copy_from_slice(&hb[..0x7C]);
+        tune[0x7C] = 0xAA; // only 1 byte of payload
+        let mem_len = 0x10000;
+        assert_eq!(h.resolve_payload(&tune, 0x7D, mem_len), Err(PsidError::BadOffsets));
+    }
+
+    #[test]
+    fn resolve_payload_rejects_payload_exceeding_mem() {
+        // load_addr = 0xFF00, large payload → load_addr + payload.len() > 0x10000
+        let mut hb = make_header();
+        hb[0x08..0x0A].copy_from_slice(&be16(0xFF00)); // explicit load_addr
+        let h = PsidHeader::parse(&hb).unwrap();
+        // data_offset = 0x7C; make tune large enough: 0x7C + 0x200 = 0x27C bytes
+        let tune_len = 0x7C + 0x200;
+        let mut tune = vec![0u8; tune_len];
+        tune[..0x7C].copy_from_slice(&hb[..0x7C]);
+        let mem_len = 0x10000;
+        // load_addr (0xFF00) + payload.len (0x200) = 0x10100 > 0x10000
+        assert_eq!(h.resolve_payload(&tune, tune_len, mem_len), Err(PsidError::BadOffsets));
+    }
+
+    #[test]
+    fn resolve_payload_ok_explicit_load_addr() {
+        // load_addr = 0x1000 (explicit, from header), payload at data_offset..len
+        let h = PsidHeader::parse(&make_header()).unwrap();
+        // data_offset = 0x7C; make a tune of 0x7C + 4 bytes
+        let tune_len = 0x7C + 4;
+        let mut tune = [0u8; 0x80];
+        tune[..0x7C].copy_from_slice(&make_header());
+        tune[0x7C] = 0x01; tune[0x7D] = 0x02; tune[0x7E] = 0x03; tune[0x7F] = 0x04;
+        let mem_len = 0x10000;
+        let result = h.resolve_payload(&tune, tune_len, mem_len);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let (load_addr, payload) = result.unwrap();
+        assert_eq!(load_addr, 0x1000);
+        assert_eq!(payload, &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn resolve_payload_ok_embedded_load_addr() {
+        // load_addr == 0 → first 2 bytes of payload_raw give the address
+        let mut hb = make_header();
+        hb[0x08..0x0A].copy_from_slice(&be16(0)); // load_addr = 0
+        let h = PsidHeader::parse(&hb).unwrap();
+        // data_offset = 0x7C; payload_raw = [0x00, 0x20, 0xAA, 0xBB]
+        let tune_len = 0x7C + 4;
+        let mut tune = [0u8; 0x80];
+        tune[..0x7C].copy_from_slice(&hb[..0x7C]);
+        tune[0x7C] = 0x00; tune[0x7D] = 0x20; // LE load addr = 0x2000
+        tune[0x7E] = 0xAA; tune[0x7F] = 0xBB;
+        let mem_len = 0x10000;
+        let result = h.resolve_payload(&tune, tune_len, mem_len);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let (load_addr, payload) = result.unwrap();
+        assert_eq!(load_addr, 0x2000);
+        assert_eq!(payload, &[0xAA, 0xBB]); // leading 2 bytes stripped
     }
 }
