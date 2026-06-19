@@ -23,20 +23,21 @@ from tiliqua.tiliqua_soc import TiliquaSoc
 from amaranth_soc import csr
 
 
-def _import_smooth():
-    """Load smooth.py by path to avoid 'top' namespace collision
-    when running as a script (Python adds src/top/sid_player_sw/ to sys.path,
-    shadowing the top package with the current top.py script)."""
+def _load_by_path(relpath, modname):
+    """Load a sibling .py by path to avoid the 'top' namespace collision when
+    running as a script (src/top/sid_player_sw/ on sys.path shadows the top
+    package with this top.py)."""
     import importlib.util
-    _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "smooth.py")
-    spec = importlib.util.spec_from_file_location("_smooth", os.path.realpath(_p))
+    p = os.path.realpath(os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), relpath))
+    spec = importlib.util.spec_from_file_location(modname, p)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["_smooth"] = mod
+    sys.modules[modname] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-_smooth = _import_smooth()
+_smooth = _load_by_path("smooth.py", "_smooth")
 VoiceSmoother = _smooth.VoiceSmoother
 LinearUpsampler = _smooth.LinearUpsampler
 StreamThrottle = _smooth.StreamThrottle
@@ -185,34 +186,9 @@ class SIDPlayerSwSoc(TiliquaSoc):
     # System PSRAM base = 0x20000000; 6502 base = 0x20800000 → offset 8MB.
     CPU6502_PSRAM_BASE_BYTES = 0x00800000
 
-    @staticmethod
-    def _import_sid_top():
-        """Load src/top/sid/top.py by path to avoid 'top' namespace collision
-        when running as a script (Python adds src/top/sid_player_sw/ to sys.path,
-        shadowing the top package with the current top.py script)."""
-        import importlib.util
-        _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../sid/top.py")
-        spec = importlib.util.spec_from_file_location("_sid_top", os.path.realpath(_p))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["_sid_top"] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
-    @staticmethod
-    def _import_sid_audio():
-        """Load src/top/sid/audio.py by path (same 'top' collision avoidance as
-        _import_sid_top)."""
-        import importlib.util
-        _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../sid/audio.py")
-        spec = importlib.util.spec_from_file_location("_sid_audio", os.path.realpath(_p))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["_sid_audio"] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
     def __init__(self, **kwargs):
         self.sid_model = kwargs.pop("sid_model", "8580")  # build-time SID chip
-        _sid = self._import_sid_top()
+        _sid = _load_by_path("../sid/top.py", "_sid_top")
         SIDPeripheral = _sid.SIDPeripheral
         # Bigger L1 caches (2KB each): the software 6502 thrashes the default
         # 512B caches against the 64KB PSRAM image -> ~10x too slow -> SID write
@@ -256,7 +232,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         self.finalize_csr_bridge()
 
     def elaborate(self, platform):
-        _sid = self._import_sid_top()
+        _sid = _load_by_path("../sid/top.py", "_sid_top")
         SID = _sid.SID
         m = Module()
 
@@ -296,7 +272,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # 1MHz stream at 48kHz (as a bare assignment would) folds all SID content
         # above 24kHz into the audible band as broadband grit; the polyphase FIR
         # band-limits it first. See top/sid/audio.py.
-        AudioDecimator = self._import_sid_audio().AudioDecimator
+        AudioDecimator = _load_by_path("../sid/audio.py", "_sid_audio").AudioDecimator
         fs_out = self.clock_settings.audio_clock.fs()
         # One decimator per phi2 standard (the FIR ratio is fixed at
         # elaboration by fs_in); both always run off the same strobe, the
