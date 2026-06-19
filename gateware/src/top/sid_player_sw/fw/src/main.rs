@@ -33,7 +33,6 @@ use tiliqua_hal::embedded_graphics::{
 use heapless::String;
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU32, Ordering};
 use critical_section::Mutex;
 use irq::handler;
 
@@ -154,11 +153,6 @@ struct Playback {
 
 static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
 
-/// Free-running play-frame counter since boot (ISR-incremented; wraps). One
-/// increment per PLAY frame in the TIMER0 ISR. No longer read by the UI loop
-/// (the per-frame menu repaint that used it was removed); kept as a counter.
-static PLAY_TICKS: AtomicU32 = AtomicU32::new(0);
-
 /// Set the play rate: program the TIMER0 reload (`period` sync cycles; the timer
 /// is a down-counter). Called on tune/subtune (re)load.
 fn set_play_period(timer: &mut Timer0, period: u32) {
@@ -168,14 +162,11 @@ fn set_play_period(timer: &mut Timer0, period: u32) {
 /// TIMER0 ISR body: run one PLAY frame on the software 6502. Real-time work
 /// lives here (not the UI loop) so menu redraws can never starve the audio.
 fn play_tick() {
-    // Count every tick (even while paused — the timer keeps firing). load/store,
-    // not fetch_add: riscv32im has no atomic RMW; single-writer (this ISR).
-    PLAY_TICKS.store(PLAY_TICKS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
         if let Some(pb) = g.as_mut() {
             if !pb.paused && pb.play_addr != 0 {
-                let _ = player::call(&mut pb.cpu, pb.play_addr, 2_000_000);
+                let _ = player::call(&mut pb.cpu, pb.play_addr, player::MAX_6502_STEPS);
                 // Drain this frame's captured writes to the SID, backpressured so
                 // a >16-write burst cannot overflow the depth-16 transaction FIFO.
                 // The FIFO's 1-per-phi2 (~1MHz) drain provides the inter-write
@@ -250,7 +241,7 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
         pb.shadow = [0; cvmod::SID_REGS];
         pb.cv.reset();
         pb.cpu.registers.stack_pointer.0 = 0xFD;
-        player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000);
+        player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, player::MAX_6502_STEPS);
         // Mirror INIT-time SID writes into the shadow so CV offsets start from
         // the tune's real post-INIT register values (drain_sid_writes clears them).
         for w in pb.cpu.memory.writes.iter() {
@@ -480,8 +471,10 @@ fn main() -> ! {
     // or coherency hacks are needed. The non-generic PsidBus makes the CPU a
     // nameable type shareable with the timer ISR; its `writes` Vec captures each
     // frame's SID writes for backpressured replay (see play_tick).
+    // Offset 0x0080_0000 MUST equal top.py's CPU6502_PSRAM_BASE_BYTES = 0x00800000,
+    // so the combined address is 0x20000000 + 0x00800000 = 0x20800000 (unchanged).
     let image: &'static mut [u8; 0x10000] =
-        unsafe { &mut *(0x2080_0000 as *mut [u8; 0x10000]) };
+        unsafe { &mut *((PSRAM_BASE + 0x0080_0000) as *mut [u8; 0x10000]) };
     let mut cpu: PlayerCpu =
         CPU::new(player::PsidBus { mem: image, writes: heapless::Vec::new(), dropped: 0 }, Nmos6502);
     cpu.registers.stack_pointer.0 = 0xFD;
@@ -503,7 +496,7 @@ fn main() -> ! {
             .expect("built-in PSID loads");
     }
     sid_reset();
-    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, player::MAX_6502_STEPS);
     // Seed the CV shadow with INIT-time register writes before draining clears
     // them, so CV offsets start from the tune's real post-INIT values (mirrors
     // reload_tune; otherwise the first boot frame with a CV patched would

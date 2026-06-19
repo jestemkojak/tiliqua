@@ -6,6 +6,11 @@ use mos6502::memory::Bus;
 /// ~160 writes/frame; 256 entries × 8 B ≤ 2 KB, fits in the 16 KB stack BRAM).
 pub const SID_WRITE_CAP: usize = 256;
 
+/// Maximum 6502 single-step iterations per PLAY frame (or INIT call). Bounds
+/// the ISR budget: a stuck PC (unsupported opcode) stalls the ISR for at most
+/// this many steps rather than hanging forever.
+pub const MAX_6502_STEPS: u64 = 2_000_000;
+
 /// One SID register write with a frame-relative 6502-cycle stamp.
 /// `cycle` is set by `call()` after each `single_step()`, not inside `set_byte`,
 /// because the bus cannot see `cpu.cycles` mid-instruction.

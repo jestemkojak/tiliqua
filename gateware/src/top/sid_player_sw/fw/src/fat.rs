@@ -40,8 +40,6 @@ pub struct MscStorage<'a> {
     msc: &'a UsbMsc,
     /// Current byte position within the FAT *volume* (partition-relative).
     pos: u64,
-    /// Block size in bytes (from the MSC device).
-    block_size: u32,
     /// LBA of the FAT volume's first sector (0 for an unpartitioned drive).
     base_lba: u32,
     /// LBA currently held in `cache`, or None if cache is cold.
@@ -52,8 +50,6 @@ pub struct MscStorage<'a> {
 
 impl<'a> MscStorage<'a> {
     pub fn new(msc: &'a UsbMsc) -> Self {
-        let block_size = msc.block_size() as u32;
-        let block_size = if block_size == 0 { 512 } else { block_size };
         // The FAT BPB lives at the start of the partition, not at LBA 0 on a
         // partitioned (MBR/GPT) stick. Parse the partition table to find it.
         let base_lba = crate::partition::first_partition_lba(|lba, buf| {
@@ -62,7 +58,6 @@ impl<'a> MscStorage<'a> {
         Self {
             msc,
             pos: 0,
-            block_size,
             base_lba,
             cache_lba: None,
             cache: [0u8; 512],
@@ -97,9 +92,8 @@ impl<'a> Read for MscStorage<'a> {
         if buf.is_empty() {
             return Ok(0);
         }
-        // Cache and read_block are always 512-byte — use that regardless of
-        // self.block_size (which may differ on exotic drives but read_block
-        // always transfers exactly 512 bytes).
+        // Cache and read_block are always 512-byte — read_block always transfers
+        // exactly 512 bytes regardless of the drive's reported block size.
         let lba = self.base_lba + (self.pos / 512) as u32;
         let offset_in_block = (self.pos % 512) as usize;
         self.ensure_block(lba)?;
@@ -173,7 +167,3 @@ pub fn list_sids(msc: &UsbMsc, out: &mut crate::sid_scan::SidList) -> usize {
     crate::sid_scan::list_root_sids(&fs, out)
 }
 
-/// Back-compat shim: load the first root `*.SID`.
-pub fn load_first_sid(msc: &UsbMsc, dst: &mut [u8]) -> Result<usize, StorageError> {
-    load_sid(msc, 0, dst)
-}
