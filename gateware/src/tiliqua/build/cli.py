@@ -38,7 +38,9 @@ def top_level_cli(
     sim_harness=None,       # project has a .cpp simulation harness at this path
     argparse_callback=None, # project needs extra CLI flags before argparse.parse()
     argparse_fragment=None, # project needs to check args.<custom_flag> after argparse.parse()
-    archiver_callback=None  # project can customize the archiver (called with archiver instance)
+    archiver_callback=None, # project can customize the archiver (called with archiver instance)
+    display_name=None       # override only the user-visible name (bootloader + on-screen);
+                            # build dir / archive filename stay derived from the dir name
     ):
 
     # Get some repository properties
@@ -194,7 +196,7 @@ def top_level_cli(
                           f"using default: {hex(kwargs['fw_offset'])}")
         else:
             kwargs["fw_offset"] = int(args.fw_offset, 16)
-        kwargs["ui_name"] = args.name
+        kwargs["ui_name"] = display_name or args.name
         kwargs["ui_tag"]  = repo_tag
         kwargs["platform_class"] = platform_class
 
@@ -223,6 +225,7 @@ def top_level_cli(
     archiver = ArchiveBuilder(
         build_path=build_path,
         name=args.name,
+        display_name=display_name or args.name,
         tag=repo_tag,
         hw_rev=args.hw,
         bitstream_help=bitstream_help

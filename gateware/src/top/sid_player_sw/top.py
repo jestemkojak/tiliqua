@@ -178,7 +178,8 @@ class SIDPlayerSwSoc(TiliquaSoc):
 
     bitstream_help = BitstreamHelp(
         brief="PSID music player from USB mass storage.",
-        io_left=["", "", "", "", "voice0", "voice1", "voice2", "voice mix"],
+        io_left=["cutoff cv", "pulse-width cv", "voice-mute cv", "",
+                 "voice0", "voice1", "voice2", "voice mix"],
         io_right=["navigate menu", "USB drive", "video out", "", "", ""],
     )
 
@@ -396,6 +397,8 @@ class SIDPlayerSwSoc(TiliquaSoc):
 if __name__ == "__main__":
     this_path = os.path.dirname(os.path.realpath(__file__))
     top_level_cli(SIDPlayerSwSoc, path=this_path,
+                  display_name="SID-PLAYER",  # user-visible name (no "-SW" suffix);
+                                              # build dir / archive stay "sid-player-sw"
                   archiver_callback=lambda a: a.with_option_storage(),
                   argparse_callback=lambda p: p.add_argument(
                       "--sid-model", choices=["6581", "8580"], default="8580",

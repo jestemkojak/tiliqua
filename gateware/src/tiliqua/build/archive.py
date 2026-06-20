@@ -28,11 +28,13 @@ class ArchiveBuilder:
     """Class for building and writing bitstream archives."""
 
     build_path: str
-    name: str
+    name: str            # build identity: archive filename + build dir basename
     tag: str
     hw_rev: TiliquaRevision
     external_pll_config: Optional[ExternalPLLConfig] = None
     bitstream_help: Optional[BitstreamHelp] = None
+    # user-visible name shown by the bootloader / on-screen (defaults to `name`)
+    display_name: Optional[str] = None
 
     _regions: List[MemoryRegion] = field(default_factory=list)
     _manifest: Optional[BitstreamManifest] = None
@@ -162,7 +164,7 @@ class ArchiveBuilder:
             self.with_manifest()
 
         self._manifest = BitstreamManifest(
-            name=self.name,
+            name=self.display_name or self.name,
             hw_rev=self.hw_rev.platform_class().version_major,
             tag=self.tag,
             regions=self._regions,
