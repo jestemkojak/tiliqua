@@ -9,6 +9,7 @@ from amaranth import *
 from amaranth.lib import data, stream, wiring
 from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered
 from amaranth.lib.wiring import In, Out, connect, flipped
+from amaranth import ResetInserter
 
 from luna.gateware.stream.future import Packet
 
@@ -22,20 +23,21 @@ from tiliqua.tiliqua_soc import TiliquaSoc
 from amaranth_soc import csr
 
 
-def _import_smooth():
-    """Load smooth.py by path to avoid 'top' namespace collision
-    when running as a script (Python adds src/top/sid_player_sw/ to sys.path,
-    shadowing the top package with the current top.py script)."""
+def _load_by_path(relpath, modname):
+    """Load a sibling .py by path to avoid the 'top' namespace collision when
+    running as a script (src/top/sid_player_sw/ on sys.path shadows the top
+    package with this top.py)."""
     import importlib.util
-    _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "smooth.py")
-    spec = importlib.util.spec_from_file_location("_smooth", os.path.realpath(_p))
+    p = os.path.realpath(os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), relpath))
+    spec = importlib.util.spec_from_file_location(modname, p)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["_smooth"] = mod
+    sys.modules[modname] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-_smooth = _import_smooth()
+_smooth = _load_by_path("smooth.py", "_smooth")
 VoiceSmoother = _smooth.VoiceSmoother
 LinearUpsampler = _smooth.LinearUpsampler
 StreamThrottle = _smooth.StreamThrottle
@@ -82,7 +84,6 @@ class USBMSCPeripheral(wiring.Component):
         word: csr.Field(csr.action.R, unsigned(32))
 
     class Resp(csr.Register, access="r"):
-        done:  csr.Field(csr.action.R, unsigned(1))
         error: csr.Field(csr.action.R, unsigned(1))
 
     # Ports — all class-level so no dict/annotation conflict.
@@ -92,8 +93,6 @@ class USBMSCPeripheral(wiring.Component):
     start_o:   Out(1)
     status_i:  In(_USB_STATUS_LAYOUT)
     resp_i:    In(_USB_RESP_LAYOUT)
-    dbg_word_level: Out(8)
-    dbg_word_data:  Out(32)
 
     def __init__(self, *, word_fifo_depth=256):
         self._word_fifo = SyncFIFOBuffered(width=32, depth=word_fifo_depth)
@@ -113,7 +112,13 @@ class USBMSCPeripheral(wiring.Component):
         m = Module()
         m.submodules.bridge = self._bridge
         wiring.connect(m, wiring.flipped(self.bus), self._bridge.bus)
-        m.submodules.word_fifo = wf = self._word_fifo
+
+        # start_strobe: high for one cycle when firmware writes start.strobe=1.
+        start_strobe = self._start.f.strobe.w_stb & self._start.f.strobe.w_data
+
+        # Wrap the word FIFO with ResetInserter so start_strobe flushes it in
+        # one cycle (idiomatic Amaranth sync-domain flush).
+        m.submodules.word_fifo = wf = ResetInserter(start_strobe)(self._word_fifo)
 
         # Pack incoming bytes (little-endian) into 32-bit words.
         byte_ix = Signal(2)
@@ -142,8 +147,7 @@ class USBMSCPeripheral(wiring.Component):
         # Command: latch LBA, pulse start.
         with m.If(self._lba.f.value.w_stb):
             m.d.sync += self.lba_o.eq(self._lba.f.value.w_data)
-        m.d.comb += self.start_o.eq(
-            self._start.f.strobe.w_stb & self._start.f.strobe.w_data)
+        m.d.comb += self.start_o.eq(start_strobe)
 
         # Drain word FIFO on rx_data CSR read.
         m.d.comb += wf.r_en.eq(self._rx_data_reg.f.word.r_stb)
@@ -153,20 +157,16 @@ class USBMSCPeripheral(wiring.Component):
             m.d.comb += self._rx_data_reg.f.word.r_data.eq(0)
 
         # Sticky response latch (set on resp_i.done).
-        resp_done_r = Signal()
+        # Reset on start_strobe so a new command never sees a stale error.
         resp_error_r = Signal()
         with m.If(self.resp_i.done):
-            m.d.sync += [resp_done_r.eq(1),
-                         resp_error_r.eq(self.resp_i.error)]
-        m.d.comb += [
-            self._resp.f.done.r_data.eq(resp_done_r),
-            self._resp.f.error.r_data.eq(resp_error_r),
-        ]
+            m.d.sync += resp_error_r.eq(self.resp_i.error)
+        # start_strobe wins: placed AFTER the done block so a simultaneous
+        # start+done clears rather than latches (new command takes priority).
+        with m.If(start_strobe):
+            m.d.sync += [byte_ix.eq(0), acc.eq(0), resp_error_r.eq(0)]
+        m.d.comb += self._resp.f.error.r_data.eq(resp_error_r)
 
-        m.d.comb += [
-            self.dbg_word_level.eq(wf.r_level),
-            self.dbg_word_data.eq(wf.r_data),
-        ]
         return m
 
 
@@ -187,34 +187,9 @@ class SIDPlayerSwSoc(TiliquaSoc):
     # System PSRAM base = 0x20000000; 6502 base = 0x20800000 → offset 8MB.
     CPU6502_PSRAM_BASE_BYTES = 0x00800000
 
-    @staticmethod
-    def _import_sid_top():
-        """Load src/top/sid/top.py by path to avoid 'top' namespace collision
-        when running as a script (Python adds src/top/sid_player_sw/ to sys.path,
-        shadowing the top package with the current top.py script)."""
-        import importlib.util
-        _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../sid/top.py")
-        spec = importlib.util.spec_from_file_location("_sid_top", os.path.realpath(_p))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["_sid_top"] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
-    @staticmethod
-    def _import_sid_audio():
-        """Load src/top/sid/audio.py by path (same 'top' collision avoidance as
-        _import_sid_top)."""
-        import importlib.util
-        _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../sid/audio.py")
-        spec = importlib.util.spec_from_file_location("_sid_audio", os.path.realpath(_p))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["_sid_audio"] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
     def __init__(self, **kwargs):
         self.sid_model = kwargs.pop("sid_model", "8580")  # build-time SID chip
-        _sid = self._import_sid_top()
+        _sid = _load_by_path("../sid/top.py", "_sid_top")
         SIDPeripheral = _sid.SIDPeripheral
         # Bigger L1 caches (2KB each): the software 6502 thrashes the default
         # 512B caches against the 64KB PSRAM image -> ~10x too slow -> SID write
@@ -258,7 +233,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         self.finalize_csr_bridge()
 
     def elaborate(self, platform):
-        _sid = self._import_sid_top()
+        _sid = _load_by_path("../sid/top.py", "_sid_top")
         SID = _sid.SID
         m = Module()
 
@@ -298,7 +273,7 @@ class SIDPlayerSwSoc(TiliquaSoc):
         # 1MHz stream at 48kHz (as a bare assignment would) folds all SID content
         # above 24kHz into the audible band as broadband grit; the polyphase FIR
         # band-limits it first. See top/sid/audio.py.
-        AudioDecimator = self._import_sid_audio().AudioDecimator
+        AudioDecimator = _load_by_path("../sid/audio.py", "_sid_audio").AudioDecimator
         fs_out = self.clock_settings.audio_clock.fs()
         # One decimator per phi2 standard (the FIR ratio is fixed at
         # elaboration by fs_in); both always run off the same strobe, the

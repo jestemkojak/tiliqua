@@ -33,7 +33,6 @@ use tiliqua_hal::embedded_graphics::{
 use heapless::String;
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU32, Ordering};
 use critical_section::Mutex;
 use irq::handler;
 
@@ -59,9 +58,7 @@ fn snapshot_meta(tune_buf: &[u8], name: &mut String<32>, author: &mut String<32>
 fn load_psid_to_mem(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
                     mem: &mut [u8; 0x10000]) -> Result<(), psid::PsidError> {
     *hdr = psid::PsidHeader::parse(&tune_buf[..len])?;
-    let payload_raw = &tune_buf[hdr.data_offset as usize..len];
-    let load_addr = hdr.effective_load_addr(payload_raw) as usize;
-    let payload = if hdr.load_addr == 0 { &payload_raw[2..] } else { payload_raw };
+    let (load_addr, payload) = hdr.resolve_payload(tune_buf, len, mem.len())?;
     mem[load_addr..load_addr + payload.len()].copy_from_slice(payload);
     // Zero CIA #1 Timer A so we can detect if INIT programs it (multispeed).
     mem[0xDC04] = 0;
@@ -156,11 +153,6 @@ struct Playback {
 
 static PLAYBACK: Mutex<RefCell<Option<Playback>>> = Mutex::new(RefCell::new(None));
 
-/// Free-running play-frame counter since boot (ISR-incremented; wraps). One
-/// increment per PLAY frame in the TIMER0 ISR. No longer read by the UI loop
-/// (the per-frame menu repaint that used it was removed); kept as a counter.
-static PLAY_TICKS: AtomicU32 = AtomicU32::new(0);
-
 /// Set the play rate: program the TIMER0 reload (`period` sync cycles; the timer
 /// is a down-counter). Called on tune/subtune (re)load.
 fn set_play_period(timer: &mut Timer0, period: u32) {
@@ -170,14 +162,11 @@ fn set_play_period(timer: &mut Timer0, period: u32) {
 /// TIMER0 ISR body: run one PLAY frame on the software 6502. Real-time work
 /// lives here (not the UI loop) so menu redraws can never starve the audio.
 fn play_tick() {
-    // Count every tick (even while paused — the timer keeps firing). load/store,
-    // not fetch_add: riscv32im has no atomic RMW; single-writer (this ISR).
-    PLAY_TICKS.store(PLAY_TICKS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     critical_section::with(|cs| {
         let mut g = PLAYBACK.borrow_ref_mut(cs);
         if let Some(pb) = g.as_mut() {
             if !pb.paused && pb.play_addr != 0 {
-                let _ = player::call(&mut pb.cpu, pb.play_addr, 2_000_000);
+                let _ = player::call(&mut pb.cpu, pb.play_addr, player::MAX_6502_STEPS);
                 // Drain this frame's captured writes to the SID, backpressured so
                 // a >16-write burst cannot overflow the depth-16 transaction FIFO.
                 // The FIFO's 1-per-phi2 (~1MHz) drain provides the inter-write
@@ -252,7 +241,7 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
         pb.shadow = [0; cvmod::SID_REGS];
         pb.cv.reset();
         pb.cpu.registers.stack_pointer.0 = 0xFD;
-        player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, 2_000_000);
+        player::init(&mut pb.cpu, hdr.init_addr, subtune.saturating_sub(1) as u8, player::MAX_6502_STEPS);
         // Mirror INIT-time SID writes into the shadow so CV offsets start from
         // the tune's real post-INIT register values (drain_sid_writes clears them).
         for w in pb.cpu.memory.writes.iter() {
@@ -272,6 +261,45 @@ fn reload_tune(tune_buf: &[u8], len: usize, hdr: &mut psid::PsidHeader,
         set_phi2(effective_clock(clock_sel, hdr));
     }
     period.map(|p| (p as u32, (CLOCK_SYNC_HZ as u64 / p) as u32))
+}
+
+/// Parse the PSID start_song from a tune buffer, run `reload_tune`, and on
+/// success apply all common player-state fields. Returns `true` on success,
+/// `false` when the file is unsupported/corrupt (sets `unsupported = true`).
+///
+/// **Per-site differences that remain at each call site:**
+/// - `playing_fallback = false`: only hot-plug (A) and rescan (C) set it on
+///   success; file-select (B) deliberately does NOT touch it — reproduce that
+///   omission by checking `apply_loaded_tune`'s return value at the call site.
+/// - `redraw = true` placement: A sets it whenever `load_sid` succeeded (after
+///   this call); B sets it only when this returns `false`; C has it
+///   unconditionally at line 764, outside any block — keep all three at their
+///   call sites, do NOT move them here.
+#[allow(clippy::too_many_arguments)]
+fn apply_loaded_tune(
+    tune_buf: &[u8], n: usize,
+    hdr: &mut psid::PsidHeader, clock_sel: usize,
+    file_idx: usize, timer: &mut Timer0,
+    len: &mut usize, current_file: &mut usize, current_subtune: &mut u16,
+    paused: &mut bool, unsupported: &mut bool,
+    play_period: &mut u32, play_hz: &mut u32, redraw_title: &mut bool,
+    cur_name: &mut String<32>, cur_author: &mut String<32>,
+) -> bool {
+    let start = psid::PsidHeader::parse(&tune_buf[..n])
+        .map(|h| h.start_song).unwrap_or(1);
+    if let Some((p, hz)) = reload_tune(tune_buf, n, hdr, start, clock_sel) {
+        *len = n; *current_file = file_idx; *current_subtune = start;
+        *paused = false; *unsupported = false;
+        output_mute(false);
+        *play_period = p; *play_hz = hz;
+        set_play_period(timer, *play_period);
+        *redraw_title = true;
+        snapshot_meta(tune_buf, cur_name, cur_author);
+        true
+    } else {
+        *unsupported = true;
+        false
+    }
 }
 
 /// Top-level menu card. Row 0 of every card is the "Page" selector.
@@ -443,8 +471,10 @@ fn main() -> ! {
     // or coherency hacks are needed. The non-generic PsidBus makes the CPU a
     // nameable type shareable with the timer ISR; its `writes` Vec captures each
     // frame's SID writes for backpressured replay (see play_tick).
+    // Offset 0x0080_0000 MUST equal top.py's CPU6502_PSRAM_BASE_BYTES = 0x00800000,
+    // so the combined address is 0x20000000 + 0x00800000 = 0x20800000 (unchanged).
     let image: &'static mut [u8; 0x10000] =
-        unsafe { &mut *(0x2080_0000 as *mut [u8; 0x10000]) };
+        unsafe { &mut *((PSRAM_BASE + 0x0080_0000) as *mut [u8; 0x10000]) };
     let mut cpu: PlayerCpu =
         CPU::new(player::PsidBus { mem: image, writes: heapless::Vec::new(), dropped: 0 }, Nmos6502);
     cpu.registers.stack_pointer.0 = 0xFD;
@@ -453,9 +483,20 @@ fn main() -> ! {
     // sid_reset is redundant right after bitstream load (the gateware holds SID
     // reset for the first 24 phi2 edges) but kept for uniformity with
     // reload_tune — it also covers warm relaunches from the bootloader.
-    let _ = load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem);
+    if load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem).is_err() {
+        // Header parsed OK above but offset fields are corrupt — fall back to
+        // the built-in tune (always valid).
+        info!("load_psid_to_mem failed (bad offsets) — using built-in tune");
+        tune_buf[..FALLBACK_SID.len()].copy_from_slice(FALLBACK_SID);
+        len = FALLBACK_SID.len();
+        playing_fallback = true;
+        hdr = psid::PsidHeader::parse(&tune_buf[..len]).expect("built-in PSID loads");
+        current_subtune = hdr.start_song;
+        load_psid_to_mem(tune_buf, len, &mut hdr, cpu.memory.mem)
+            .expect("built-in PSID loads");
+    }
     sid_reset();
-    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, 2_000_000);
+    player::init(&mut cpu, hdr.init_addr, (current_subtune.saturating_sub(1)) as u8, player::MAX_6502_STEPS);
     // Seed the CV shadow with INIT-time register writes before draining clears
     // them, so CV offsets start from the tune's real post-INIT values (mirrors
     // reload_tune; otherwise the first boot frame with a CV patched would
@@ -565,20 +606,16 @@ fn main() -> ! {
                     usb_listed = true; // enumerated: don't re-list/re-load every frame
                     if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
                         info!("Hot-plug: loaded {} bytes from USB", n);
-                        let start = psid::PsidHeader::parse(&tune_buf[..n])
-                            .map(|h| h.start_song).unwrap_or(1);
-                        if let Some((p, hz)) = reload_tune(tune_buf, n, &mut hdr, start, clock_sel) {
-                            len = n; current_file = 0; current_subtune = start;
-                            paused = false; playing_fallback = false; unsupported = false;
-                            output_mute(false);
-                            play_period = p; play_hz = hz;
-                            set_play_period(&mut timer, play_period);
-                            redraw_title = true; // new tune: name/author changed
-                            snapshot_meta(tune_buf, &mut cur_name, &mut cur_author);
-                        } else {
-                            unsupported = true; // stay on the built-in tune
+                        if apply_loaded_tune(
+                            tune_buf, n, &mut hdr, clock_sel, 0, &mut timer,
+                            &mut len, &mut current_file, &mut current_subtune,
+                            &mut paused, &mut unsupported,
+                            &mut play_period, &mut play_hz, &mut redraw_title,
+                            &mut cur_name, &mut cur_author,
+                        ) {
+                            playing_fallback = false; // A only
                         }
-                        redraw = true;
+                        redraw = true; // A: set whenever load_sid was Ok
                     }
                 }
             }
@@ -675,30 +712,19 @@ fn main() -> ! {
                             } else {
                                 if browse_idx != current_file {
                                     if let Ok(n) = fat::load_sid(&msc, browse_idx, tune_buf) {
-                                        let start = psid::PsidHeader::parse(&tune_buf[..n])
-                                            .map(|h| h.start_song).unwrap_or(1);
-                                        if let Some((p, hz)) =
-                                            reload_tune(tune_buf, n, &mut hdr, start, clock_sel) {
-                                            len = n; current_file = browse_idx;
-                                            current_subtune = start;
-                                            paused = false; unsupported = false;
-                                            output_mute(false);
-                                            play_period = p; play_hz = hz;
-                                            set_play_period(&mut timer, play_period);
-                                            // New tune: name/author/meta + every
-                                            // row change -> clear title + rows.
-                                            redraw_title = true;
-                                            snapshot_meta(tune_buf, &mut cur_name, &mut cur_author);
-                                        } else {
-                                            // Unsupported file: keep playing the
-                                            // current tune, flag it in the UI.
-                                            // The State row (4) flips to
-                                            // UNSUPPORTED! while `selected` is the
-                                            // File row (1), so a single-row clear
-                                            // would leave the old State text under
-                                            // it (band is frozen). Redraw all rows.
-                                            unsupported = true;
-                                            redraw = true;
+                                        // B: playing_fallback is NOT touched on success
+                                        // (reproduced exactly; flag as CONCERN if bug).
+                                        // B: redraw only on failure (State row flips to
+                                        // UNSUPPORTED! while selected is File row (1)).
+                                        if !apply_loaded_tune(
+                                            tune_buf, n, &mut hdr, clock_sel,
+                                            browse_idx, &mut timer,
+                                            &mut len, &mut current_file, &mut current_subtune,
+                                            &mut paused, &mut unsupported,
+                                            &mut play_period, &mut play_hz, &mut redraw_title,
+                                            &mut cur_name, &mut cur_author,
+                                        ) {
+                                            redraw = true; // B: only on None
                                         }
                                     }
                                 }
@@ -734,21 +760,16 @@ fn main() -> ! {
                             usb_listed = !file_list.is_empty();
                             browse_idx = 0;
                             if let Ok(n) = fat::load_sid(&msc, 0, tune_buf) {
-                                let start = psid::PsidHeader::parse(&tune_buf[..n])
-                                    .map(|h| h.start_song).unwrap_or(1);
-                                if let Some((p, hz)) =
-                                    reload_tune(tune_buf, n, &mut hdr, start, clock_sel) {
-                                    len = n; current_file = 0; current_subtune = start;
-                                    paused = false; playing_fallback = false; unsupported = false;
-                                    output_mute(false);
-                                    play_period = p; play_hz = hz;
-                                    set_play_period(&mut timer, play_period);
-                                    redraw_title = true; // new tune: name changed
-                                    snapshot_meta(tune_buf, &mut cur_name, &mut cur_author);
-                                } else {
-                                    // First file unsupported: keep current tune.
-                                    unsupported = true;
+                                if apply_loaded_tune(
+                                    tune_buf, n, &mut hdr, clock_sel, 0, &mut timer,
+                                    &mut len, &mut current_file, &mut current_subtune,
+                                    &mut paused, &mut unsupported,
+                                    &mut play_period, &mut play_hz, &mut redraw_title,
+                                    &mut cur_name, &mut cur_author,
+                                ) {
+                                    playing_fallback = false; // C only
                                 }
+                                // C: redraw=true is set unconditionally below (line 764)
                             }
                         }
                         // File list + every row may change -> redraw rows.
