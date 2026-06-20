@@ -8,9 +8,23 @@
 
 # About this fork
 
-This is a personal fork of [apfaudio/tiliqua](https://github.com/apfaudio/tiliqua) that adds a
-MOS 6581/8580 SID music player on top of upstream's reDIP-SID emulation gateware. It is
-**not part of upstream Tiliqua** and lives only here.
+This is a personal fork of [apfaudio/tiliqua](https://github.com/apfaudio/tiliqua) that adds
+MOS 6581/8580 SID gateware on top of upstream's reDIP-SID emulation. It is **not part of
+upstream Tiliqua** and lives only here.
+
+## Bitstreams
+
+| Bitstream | Description |
+|-----------|-------------|
+| [SID MIDI Synthesizer](gateware/src/top/sid/README.md) | 3-voice SID synth controlled from CV or MIDI (TRS / USB host); polyphony and unison modes |
+| [SID Player](gateware/src/top/sid_player_sw/README.md) | Standalone `.SID` (PSID) C64 music player from USB stick, with oscilloscope display and Eurorack CV modulation |
+
+## SID MIDI Synthesizer (`sid`)
+
+Play the MOS 6581/8580 SID chip as a polyphonic synthesizer. CV inputs assign to
+pitch/gate per voice via the menu; a MIDI source (TRS or USB host) can replace CV
+for note input with round-robin voice stealing. Unison mode stacks all 3 voices
+with configurable detune. Each voice is available as a separate Eurorack output.
 
 ## SID Player (`sid_player_sw`)
 
