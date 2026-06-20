@@ -1,6 +1,13 @@
 # For PCBs designed using KiCad: https://www.kicad.org/
 # Format documentation: https://kicad.org/help/file-formats/
 
+# assets
+*.sid
+*.wav
+*.jpg
+*.mp4
+*.png
+
 # Temporary files
 *.000
 *.bak
@@ -32,3 +39,6 @@ fp-info-cache
 docs/superpowers/
 docs/notes.md
 docs/code-review-kojak.md
+docs/stress_400hz.sid
+docs/debug-artifacts/
+gateware/src/top/zfilter/
