@@ -130,22 +130,22 @@ the C64 CPU **in software** on the SoC's RISC-V core. The RISC-V handles USB,
 the file system, the menu and the display; the SID chip itself is real gateware.
 
 ```
-   USB stick (.SID)                                Eurorack CV in
-        │                                               │
-        ▼                                               ▼
- ┌─────────────────────────────────────────────┐   (CV1/2/3 jacks)
- │            RISC-V SoC (VexiiRiscv)            │       │
- │                                              │       │
- │  USB MSC ─► FAT32 ─► PSID parse              │       │
- │                       │                      │       │
- │        load 64 KB C64 image into PSRAM ◄─────┼───────┘
- │                       │                      │
- │   ┌───────────────────▼──────────────────┐   │
- │   │  TIMER0 ISR  (fires at the tune rate) │   │
- │   │                                       │   │
- │   │   software 6502 runs PLAY frame       │   │
- │   │   $D400-$D41F writes ──► captured     │   │
- │   │   + CV modulation overlay             │   │
+   USB stick (.SID)                            Eurorack CV in
+        │                                      (CV1/2/3 jacks)
+        ▼                                             │
+ ┌─────────────────────────────────────────────┐     │
+ │            RISC-V SoC (VexiiRiscv)            │     │
+ │                                              │     │
+ │  USB MSC ─► FAT32 ─► PSID parse              │     │
+ │                       │                      │     │
+ │        load 64 KB C64 image into PSRAM       │     │
+ │                       │                      │     │
+ │   ┌───────────────────▼──────────────────┐   │     │
+ │   │  TIMER0 ISR  (fires at the tune rate) │   │     │
+ │   │                                       │   │     │
+ │   │   software 6502 runs PLAY frame       │   │     │
+ │   │   $D400-$D41F writes ──► captured     │   │     │
+ │   │   + CV modulation overlay  ◄──────────┼───┼─────┘
  │   └───────────────────┬──────────────────┘   │
  │                       │ SID register writes   │
  └───────────────────────┼──────────────────────┘
