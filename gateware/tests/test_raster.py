@@ -12,6 +12,7 @@ from amaranth.lib import wiring
 from tiliqua.test import wishbone, stream, csr as csr_util
 from tiliqua.raster import persist, stroke, plot, blit, line
 from tiliqua.video import framebuffer, modeline, palette
+from tiliqua.video.types import Rotation
 
 from amaranth_soc import csr
 from amaranth_soc.csr import wishbone as csr_wishbone
@@ -102,6 +103,71 @@ class RasterTests(unittest.TestCase):
         sim.add_clock(1e-6)
         sim.add_testbench(testbench)
         with sim.write_vcd(vcd_file=open("test_persist_freeze.vcd", "w")):
+            sim.run()
+
+    def test_persist_freeze_left(self):
+        # At 720x720 the framebuffer HAL forces Rotate::Left (round-screen
+        # hack), so the firmware's logical top menu band (y < freeze_rows) is
+        # written to the *last* freeze_rows COLUMNS of every memory row, not the
+        # first freeze_rows rows. The frozen band must follow the rotation:
+        # freeze the trailing column band, decay the leading columns.
+        MODELINE = modeline.DVIModeline.all_timings()["720x720p60r2"]
+        freeze_rows = 200
+        row_words = MODELINE.h_active // 4               # 180 words / memory row
+        col_threshold = (MODELINE.h_active - freeze_rows) // 4  # 130
+
+        m = Module()
+        fb = framebuffer.DMAFramebuffer(
+            fixed_modeline=MODELINE, palette=palette.ColorPalette())
+        dut = persist.Persistance(bus_signature=fb.bus.signature,
+                                  freeze_rows=freeze_rows)
+        wiring.connect(m, wiring.flipped(fb.fbp), dut.fbp)
+        check = wishbone.BusChecker(dut.bus, prefix='[bus] ')
+        m.submodules += [dut, fb, fb.palette, check]
+
+        frozen_seen = 0
+        decayed_seen = 0
+
+        async def testbench(ctx):
+            nonlocal frozen_seen, decayed_seen
+            ctx.set(fb.fbp.enable, 1)
+            ctx.set(fb.fbp.rotation, Rotation.LEFT)
+            # Enough bus cycles to sweep past one full memory row (180 words):
+            # read- and write-bursts alternate (~16 words each), so we need
+            # plenty to cross col_threshold (130) and the row wrap and thus
+            # exercise both the leading (decayed) and trailing (frozen) columns.
+            for _ in range(48):
+                while not ctx.get(dut.bus.stb):
+                    await ctx.tick()
+                await ctx.tick().repeat(8)
+                ctx.set(dut.bus.ack, 1)
+                while ctx.get(dut.bus.stb):
+                    # Constant full-intensity pixels (intensity nibble = 0xf).
+                    ctx.set(dut.bus.dat_r, 0xffffffff)
+                    if ctx.get(dut.bus.we):
+                        # Write offset == dma_offs_out-1 (fbp.base == 0 in sim);
+                        # the freeze decision uses col_word == dma_offs_out mod
+                        # row_words == (adr+1) mod row_words.
+                        adr = ctx.get(dut.bus.adr)
+                        col = (adr + 1) % row_words
+                        if col >= col_threshold:
+                            # Trailing column band: frozen (NOT decayed).
+                            self.assertEqual(ctx.get(dut.bus.dat_w), 0xffffffff)
+                            frozen_seen += 1
+                        else:
+                            # Leading columns: decayed (0xf -> 0xe intensity).
+                            self.assertEqual(ctx.get(dut.bus.dat_w), 0xefefefef)
+                            decayed_seen += 1
+                    await ctx.tick()
+                ctx.set(dut.bus.ack, 0)
+            # Both arms must actually execute, else a false green.
+            self.assertGreater(frozen_seen, 0)
+            self.assertGreater(decayed_seen, 0)
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        with sim.write_vcd(vcd_file=open("test_persist_freeze_left.vcd", "w")):
             sim.run()
 
     def test_stroke(self):
