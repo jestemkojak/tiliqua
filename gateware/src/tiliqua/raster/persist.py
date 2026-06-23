@@ -12,7 +12,7 @@ from amaranth.lib.wiring import In, Out
 from amaranth_soc import csr, wishbone
 
 from ..video.framebuffer import DMAFramebuffer
-from ..video.types import Pixel
+from ..video.types import Pixel, Rotation
 
 
 class Persistance(wiring.Component):
@@ -55,6 +55,9 @@ class Persistance(wiring.Component):
         fb_len_words = ((self.fbp.timings.active_pixels * pixel_bytes) //
                         (self.bus.data_width // pixel_bits))
 
+        # Pixels packed per bus word (=4: 8-bit pixels in a 32-bit word).
+        pixels_per_word = self.bus.data_width // pixel_bits
+
         # Length (in bus words) of the top band frozen from decay. Derived from
         # the runtime modeline h_active (video is modeline-driven), so the
         # freeze_rows*h_active multiply becomes a hardware multiplier. REGISTER
@@ -63,13 +66,34 @@ class Persistance(wiring.Component):
         # switch, so a 1-cycle-stale header_words is harmless). freeze_rows=0 ->
         # header_words is a constant 0 (no multiplier/register/comparator at
         # all): byte-for-byte identical to before for every other consumer.
+        #
+        # Rotation-aware freeze: at 720x720 the framebuffer HAL forces
+        # Rotate::Left (round-screen hack, see rs/hal/dma_framebuffer.rs), so
+        # the plotter writes the firmware's logical top menu band (y <
+        # freeze_rows) to the *last* freeze_rows COLUMNS of every memory row,
+        # not the first freeze_rows rows. Under LEFT we therefore freeze that
+        # trailing column band (col_word >= col_threshold) instead of the
+        # leading word band. row_words / col_threshold are also modeline-derived
+        # runtime divides-by-constant (shifts), so register them too. Other
+        # rotations (NORMAL on external monitors; INVERTED/RIGHT unused on real
+        # hardware) keep the leading-row band.
         if self.freeze_rows:
             header_words = Signal(self.bus.addr_width)
             m.d.sync += header_words.eq(
                 (self.freeze_rows * self.fbp.timings.h_active) //
-                (self.bus.data_width // pixel_bits))
+                pixels_per_word)
+            # Words per memory row, and the trailing-column freeze threshold
+            # (in words) for the LEFT-rotated round screen.
+            row_words = Signal(self.bus.addr_width)
+            m.d.sync += row_words.eq(self.fbp.timings.h_active // pixels_per_word)
+            col_threshold = Signal(self.bus.addr_width)
+            m.d.sync += col_threshold.eq(
+                (self.fbp.timings.h_active - self.freeze_rows) //
+                pixels_per_word)
         else:
             header_words = Const(0)
+            row_words = Const(0)
+            col_threshold = Const(0)
 
         # Track framebuffer position by tracking fifo reads/writes
         dma_offs_in = Signal(self.bus.addr_width, init=0)
@@ -80,11 +104,23 @@ class Persistance(wiring.Component):
                 m.d.sync += dma_offs_in.eq(0)
 
         dma_offs_out = Signal.like(dma_offs_in)
+        # Per-memory-row word column of dma_offs_out, for the LEFT-rotation
+        # column-band freeze. Tracked in lockstep with dma_offs_out (wraps at
+        # row_words; fb_len_words is a multiple of row_words so the frame wrap
+        # lands cleanly at a row boundary). freeze_rows=0 -> no counter.
+        col_word = Signal(self.bus.addr_width) if self.freeze_rows else None
         with m.If(self.fifo.r_en & self.fifo.r_rdy):
             with m.If(dma_offs_out < (fb_len_words-1)):
                 m.d.sync += dma_offs_out.eq(dma_offs_out + 1)
+                if self.freeze_rows:
+                    with m.If(col_word < (row_words - 1)):
+                        m.d.sync += col_word.eq(col_word + 1)
+                    with m.Else():
+                        m.d.sync += col_word.eq(0)
             with m.Else():
                 m.d.sync += dma_offs_out.eq(0)
+                if self.freeze_rows:
+                    m.d.sync += col_word.eq(0)
 
         # Latched version of decay speed control input
         decay_latch = Signal.like(self.decay)
@@ -172,8 +208,21 @@ class Persistance(wiring.Component):
                 # Freeze (skip decay) when that offset is in the top band. Exclude
                 # the wrap write (dma_offs_out == 0 -> last word of frame).
                 in_header = Signal()
-                m.d.comb += in_header.eq((dma_offs_out != 0) &
-                                         (dma_offs_out <= header_words))
+                if self.freeze_rows:
+                    with m.Switch(self.fbp.rotation):
+                        with m.Case(Rotation.LEFT):
+                            # Round screen: menu maps to the trailing columns of
+                            # every memory row.
+                            m.d.comb += in_header.eq((dma_offs_out != 0) &
+                                                     (col_word >= col_threshold))
+                        with m.Default():
+                            # NORMAL (external monitor); INVERTED/RIGHT fall back
+                            # to the leading-row band.
+                            m.d.comb += in_header.eq((dma_offs_out != 0) &
+                                                     (dma_offs_out <= header_words))
+                else:
+                    m.d.comb += in_header.eq((dma_offs_out != 0) &
+                                             (dma_offs_out <= header_words))
                 for n in range(4):
                     skip_this = Signal(name=f"skip_{n}")
                     m.d.comb += skip_this.eq(

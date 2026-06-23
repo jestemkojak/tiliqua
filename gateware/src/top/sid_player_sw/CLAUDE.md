@@ -154,6 +154,19 @@ tunes use them); revisit if a future tune requires them.
   and an unregistered version lands a MULT18X18D on the sync critical path
   (regressed sync Fmax 57→50 MHz). `freeze_rows=0` is a const-0 no-op for all
   other tops.
+  - **The freeze is rotation-aware** (`persist.py`). The firmware draws the menu in
+    *logical* screen coordinates, but the plot backend (`raster/plot.py`) rotates
+    writes into *framebuffer-memory* space. At 720×720 the HAL forces `Rotate::Left`
+    (round-screen hack, `rs/hal/dma_framebuffer.rs`), so the logical top band lands
+    in the **last `freeze_rows` columns of every memory row**, NOT the first
+    `freeze_rows` memory rows. `Persistance` therefore reads `fbp.rotation` and
+    freezes the trailing-column band under `LEFT` (a wrapping `col_word` counter),
+    the leading-row band under `NORMAL` (external monitors); `INVERTED`/`RIGHT` fall
+    back to `NORMAL` (unused on real HW). A rotation-blind freeze (the original)
+    leaves the menu in the decaying region → it flashes on encoder input then
+    vanishes. Regression test: `tests/test_raster.py::test_persist_freeze_left`.
+    General lesson: any gateware effect reasoning in framebuffer memory space must
+    account for the round screen's `LEFT` rotation.
 - **`mos6502` emits a `debug!` per emulated instruction** → at Trace level it floods
   UART and (blocking on UART) throttles playback. `log::set_max_level_racy(Info)` early.
 - **`mos6502` panics on an unimplemented opcode** (`cpu.rs:1159`); a *decode* miss
