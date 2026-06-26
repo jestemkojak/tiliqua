@@ -47,15 +47,16 @@ def top_level_cli(
     repo = git.Repo(search_parent_directories=True)
 
     try:
-        repo_tag = repo.git.describe('--tags', '--exact-match', '--dirty')
+        repo_tag_full = repo.git.describe('--tags', '--exact-match', '--dirty')
     except git.exc.GitCommandError:
-        repo_tag = repo.git.describe('--always', '--dirty')
+        repo_tag_full = repo.git.describe('--always', '--dirty')
     if repo.is_dirty():
-        print(f"WARNING: repo is dirty (tag: {repo_tag})")
+        print(f"WARNING: repo is dirty (tag: {repo_tag_full})")
         print(repo.git.status())
         print(repo.git.diff('--stat'))
-    # Only keep what the bootloader / bitstreams can display
-    repo_tag = repo_tag[:BitstreamManifest.BITSTREAM_TAG_LEN]
+    # The bootloader / bitstream version field is fixed-width, so truncate for it;
+    # the archive filename keeps the full describe string (e.g. sp-0.2.1-5-g617e595).
+    repo_tag = repo_tag_full[:BitstreamManifest.BITSTREAM_TAG_LEN]
 
     # Configure logging.
     logging.getLogger().setLevel(logging.DEBUG)
@@ -113,6 +114,10 @@ def top_level_cli(
                         help="Bitstream name to display in bootloader and bottom of screen.")
     parser.add_argument('--brief', type=str, default=None,
                         help="Brief description to display in bootloader.")
+    parser.add_argument('--build-tag', type=str, default=None,
+                        help=f"Override the auto (git-derived) build tag (max "
+                             f"{BitstreamManifest.BITSTREAM_TAG_LEN} chars). Used for both the "
+                             f"bitstream manifest version field and the archive filename.")
     parser.add_argument("--hw",
                         type=TiliquaRevision,
                         default=TiliquaRevision.default(),
@@ -141,6 +146,14 @@ def top_level_cli(
 
     # Print help if no arguments are passed.
     args = parser.parse_args(args=None if sys.argv[1:] else ["--help"])
+
+    # A one-off --build-tag overrides both the (truncated) manifest tag and the archive
+    # filename tag. It must fit the fixed-width manifest field.
+    if args.build_tag is not None:
+        if len(args.build_tag) > BitstreamManifest.BITSTREAM_TAG_LEN:
+            parser.error(f"--build-tag '{args.build_tag}' is too long "
+                         f"(max {BitstreamManifest.BITSTREAM_TAG_LEN} chars).")
+        repo_tag = repo_tag_full = args.build_tag
 
     if argparse_fragment:
         kwargs = argparse_fragment(args)
@@ -227,6 +240,7 @@ def top_level_cli(
         name=args.name,
         display_name=display_name or args.name,
         tag=repo_tag,
+        archive_tag=repo_tag_full,
         hw_rev=args.hw,
         bitstream_help=bitstream_help
     )

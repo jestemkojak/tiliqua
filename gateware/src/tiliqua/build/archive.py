@@ -29,8 +29,10 @@ class ArchiveBuilder:
 
     build_path: str
     name: str            # build identity: archive filename + build dir basename
-    tag: str
+    tag: str             # truncated tag written into the (fixed-width) bitstream manifest
     hw_rev: TiliquaRevision
+    # full, untruncated describe string for the archive filename (defaults to `tag`)
+    archive_tag: Optional[str] = None
     external_pll_config: Optional[ExternalPLLConfig] = None
     bitstream_help: Optional[BitstreamHelp] = None
     # user-visible name shown by the bootloader / on-screen (defaults to `name`)
@@ -47,7 +49,7 @@ class ArchiveBuilder:
 
     @property
     def archive_name(self) -> str:
-        return f"{self.name.lower()}-{self.tag}-{self.hw_rev.value}.tar.gz"
+        return f"{self.name.lower()}-{self.archive_tag or self.tag}-{self.hw_rev.value}.tar.gz"
 
     @property
     def archive_path(self) -> str:
