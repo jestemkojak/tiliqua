@@ -466,7 +466,7 @@ class SIDSoc(TiliquaSoc):
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 
-    def __init__(self, *, with_scope=True, **kwargs):
+    def __init__(self, *, with_scope=True, n_sids=1, **kwargs):
         # Don't finalize CSR bridge yet. Default mainram (BRAM) is 0x4000 — the big
         # opts struct eats stack. Subclasses (e.g. top/mbsid, whose by-value C++
         # engine state needs more .bss) may override via the mainram_size kwarg.
@@ -475,10 +475,17 @@ class SIDSoc(TiliquaSoc):
                          **kwargs)
 
         self.with_scope = with_scope
+        self.n_sids = n_sids
 
         # Add SID peripheral
         self.sid_periph = SIDPeripheral()
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
+
+        if self.n_sids > 1:
+            # Second SID for the R register image (stereo). Own AsyncFIFO +
+            # 30MHz phi2 divider; MIDI-in CSRs unused on this instance.
+            self.sid_periph_r = SIDPeripheral()
+            self.csr_decoder.add(self.sid_periph_r.bus, addr=0x1200, name="sid_periph_r")
 
         if self.with_scope:
             # Dedicated framebuffer plotter for scope (4 channels)
@@ -527,13 +534,31 @@ class SIDSoc(TiliquaSoc):
         # ext_w_* unused in SIDSoc (RISC-V uses CSR path); drive to 0.
         m.d.comb += [self.sid_periph.ext_w_en.eq(0), self.sid_periph.ext_w_data.eq(0)]
 
-        m.d.comb += [
-            pmod0.i_cal.valid.eq(1),
-            pmod0.i_cal.payload[0].as_value().eq(self.sid_periph.voice0_dca_o),
-            pmod0.i_cal.payload[1].as_value().eq(self.sid_periph.voice1_dca_o),
-            pmod0.i_cal.payload[2].as_value().eq(self.sid_periph.voice2_dca_o),
-            pmod0.i_cal.payload[3].as_value().eq(self.sid_periph.last_audio_left>>8),
-        ]
+        if self.n_sids > 1:
+            m.submodules.sid_r = sid_r = SID()
+            m.submodules.sid_periph_r = self.sid_periph_r
+            self.sid_periph_r.sid = sid_r
+            m.d.comb += [self.sid_periph_r.ext_w_en.eq(0),
+                         self.sid_periph_r.ext_w_data.eq(0)]
+
+        if self.n_sids > 1:
+            # Stereo: SID0 mix -> LEFT, SID1 mix -> RIGHT. payload[2]/[3] carry
+            # a voice tap per SID for optional debug (no scope consumer in mbsid).
+            m.d.comb += [
+                pmod0.i_cal.valid.eq(1),
+                pmod0.i_cal.payload[0].as_value().eq(self.sid_periph.last_audio_left>>8),
+                pmod0.i_cal.payload[1].as_value().eq(self.sid_periph_r.last_audio_left>>8),
+                pmod0.i_cal.payload[2].as_value().eq(self.sid_periph.voice0_dca_o),
+                pmod0.i_cal.payload[3].as_value().eq(self.sid_periph_r.voice0_dca_o),
+            ]
+        else:
+            m.d.comb += [
+                pmod0.i_cal.valid.eq(1),
+                pmod0.i_cal.payload[0].as_value().eq(self.sid_periph.voice0_dca_o),
+                pmod0.i_cal.payload[1].as_value().eq(self.sid_periph.voice1_dca_o),
+                pmod0.i_cal.payload[2].as_value().eq(self.sid_periph.voice2_dca_o),
+                pmod0.i_cal.payload[3].as_value().eq(self.sid_periph.last_audio_left>>8),
+            ]
 
         if self.with_scope:
             m.d.comb += [
