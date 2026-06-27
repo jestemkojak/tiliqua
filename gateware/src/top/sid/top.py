@@ -466,7 +466,7 @@ class SIDSoc(TiliquaSoc):
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, with_scope=True, **kwargs):
         # Don't finalize CSR bridge yet. Default mainram (BRAM) is 0x4000 — the big
         # opts struct eats stack. Subclasses (e.g. top/mbsid, whose by-value C++
         # engine state needs more .bss) may override via the mainram_size kwarg.
@@ -474,21 +474,24 @@ class SIDSoc(TiliquaSoc):
         super().__init__(finalize_csr_bridge=False,
                          **kwargs)
 
+        self.with_scope = with_scope
+
         # Add SID peripheral
         self.sid_periph = SIDPeripheral()
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
 
-        # Dedicated framebuffer plotter for scope (4 channels)
-        self.plotter = FramebufferPlotter(
-            bus_signature=self.psram_periph.bus.signature.flip(), n_ports=4)
-        self.psram_periph.add_master(self.plotter.bus)
+        if self.with_scope:
+            # Dedicated framebuffer plotter for scope (4 channels)
+            self.plotter = FramebufferPlotter(
+                bus_signature=self.psram_periph.bus.signature.flip(), n_ports=4)
+            self.psram_periph.add_master(self.plotter.bus)
 
-        # Add scope peripheral
-        self.scope_periph = scope.ScopePeripheral(
-            fs=self.clock_settings.audio_clock.fs())
-        self.csr_decoder.add(self.scope_periph.bus, addr=0x1100, name="scope_periph")
+            # Add scope peripheral
+            self.scope_periph = scope.ScopePeripheral(
+                fs=self.clock_settings.audio_clock.fs())
+            self.csr_decoder.add(self.scope_periph.bus, addr=0x1100, name="scope_periph")
 
-        # Note: Arbiter is now built into the FramebufferPlotter
+            # Note: Arbiter is now built into the FramebufferPlotter
 
         # Now finalize the CSR bridge
         self.finalize_csr_bridge()
@@ -498,19 +501,22 @@ class SIDSoc(TiliquaSoc):
         m = Module()
 
         # Scope plotting infrastructure
-        m.submodules.plotter = self.plotter
+        if self.with_scope:
+            m.submodules.plotter = self.plotter
 
         # Main components
         m.submodules.sid = sid = SID()
         m.submodules.sid_periph = self.sid_periph
-        m.submodules.scope_periph = self.scope_periph
 
-        # Connect scope periph channels to plotter ports
-        for n in range(4):
-            wiring.connect(m, self.scope_periph.o[n], self.plotter.i[n])
+        if self.with_scope:
+            m.submodules.scope_periph = self.scope_periph
 
-        # Connect framebuffer propreties to plotter backend
-        wiring.connect(m, wiring.flipped(self.fb.fbp), self.plotter.fbp)
+            # Connect scope periph channels to plotter ports
+            for n in range(4):
+                wiring.connect(m, self.scope_periph.o[n], self.plotter.i[n])
+
+            # Connect framebuffer propreties to plotter backend
+            wiring.connect(m, wiring.flipped(self.fb.fbp), self.plotter.fbp)
 
         m.submodules += super().elaborate(platform)
 
@@ -529,15 +535,16 @@ class SIDSoc(TiliquaSoc):
             pmod0.i_cal.payload[3].as_value().eq(self.sid_periph.last_audio_left>>8),
         ]
 
-        m.d.comb += [
-            # TODO: we're actually overriding soc_en indirectly here because of the early elaboration.
-            # this signal should be split properly to avoid it.
-            self.scope_periph.i.valid.eq(pmod0.i_cal.valid & pmod0.i_cal.ready & self.scope_periph.soc_en),
-            self.scope_periph.i.payload[0].eq(pmod0.i_cal.payload[3]),
-            self.scope_periph.i.payload[1].eq(pmod0.i_cal.payload[0]),
-            self.scope_periph.i.payload[2].eq(pmod0.i_cal.payload[1]),
-            self.scope_periph.i.payload[3].eq(pmod0.i_cal.payload[2]),
-        ]
+        if self.with_scope:
+            m.d.comb += [
+                # TODO: we're actually overriding soc_en indirectly here because of the early elaboration.
+                # this signal should be split properly to avoid it.
+                self.scope_periph.i.valid.eq(pmod0.i_cal.valid & pmod0.i_cal.ready & self.scope_periph.soc_en),
+                self.scope_periph.i.payload[0].eq(pmod0.i_cal.payload[3]),
+                self.scope_periph.i.payload[1].eq(pmod0.i_cal.payload[0]),
+                self.scope_periph.i.payload[2].eq(pmod0.i_cal.payload[1]),
+                self.scope_periph.i.payload[3].eq(pmod0.i_cal.payload[2]),
+            ]
 
         if sim.is_hw(platform):
             # TRS MIDI (serial)
