@@ -178,6 +178,22 @@ int snprintf(char *str, size_t size, const char *fmt, ...);
 // the device id the firmware should answer to.
 static inline s32 MIOS32_MIDI_DeviceIDGet(void) { return 0; }
 
+/////////////////////////////////////////////////////////////////////////////
+// Link-time stubs: Task semaphore functions (provided by firmware)
+/////////////////////////////////////////////////////////////////////////////
+// All are extern void, safe to implement as no-ops (single-hart, no real RTOS).
+// The engine calls these to guard MIDI IN/OUT and SD card accesses, but on
+// a single-hart core with audio already in a critical section, these are
+// effectively disabled. Firmware must provide all six at link time:
+extern void TASKS_MIDIOUTSemaphoreTake(void);
+extern void TASKS_MIDIOUTSemaphoreGive(void);
+extern void TASKS_MIDIINSemaphoreTake(void);
+extern void TASKS_MIDIINSemaphoreGive(void);
+extern void TASKS_SDCardSemaphoreTake(void);
+extern void TASKS_SDCardSemaphoreGive(void);
+extern void TASKS_LCDTake(void);
+extern void TASKS_LCDGive(void);
+
 #ifdef __cplusplus
 }
 #endif
