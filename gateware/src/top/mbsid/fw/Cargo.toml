@@ -1,0 +1,12 @@
+# MINIMAL host-test scaffold — Task 4 supersedes with full firmware deps + cc build-dep.
+[package]
+name = "tiliqua-fw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heapless = "0.8.0"
+
+[lib]
+name = "tiliqua_fw"
+path = "src/lib.rs"
