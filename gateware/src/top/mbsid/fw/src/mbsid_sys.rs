@@ -22,8 +22,8 @@ pub fn init() {
 }
 
 #[cfg(target_arch = "riscv32")]
-pub fn tick(speed_factor: u8) -> bool {
-    unsafe { mbsid_tick(speed_factor) != 0 }
+pub fn tick() -> bool {
+    unsafe { mbsid_tick(0) != 0 }
 }
 
 #[cfg(target_arch = "riscv32")]
@@ -70,7 +70,7 @@ static HOST_REGS_STUB: [u8; 32] = [0u8; 32];
 pub fn init() {}
 
 #[cfg(not(target_arch = "riscv32"))]
-pub fn tick(_speed_factor: u8) -> bool { false }
+pub fn tick() -> bool { false }
 
 #[cfg(not(target_arch = "riscv32"))]
 pub fn regs_l() -> &'static [u8; 32] { &HOST_REGS_STUB }
@@ -79,7 +79,7 @@ pub fn regs_l() -> &'static [u8; 32] { &HOST_REGS_STUB }
 pub fn regs_r() -> &'static [u8; 32] { &HOST_REGS_STUB }
 
 #[cfg(not(target_arch = "riscv32"))]
-pub fn load_patch(_buf: &[u8; 512]) -> bool { false }
+pub fn load_patch(_buf: &[u8; 512]) -> bool { true }
 
 #[cfg(not(target_arch = "riscv32"))]
 pub fn note_on(_note: u8, _vel: u8) {}
