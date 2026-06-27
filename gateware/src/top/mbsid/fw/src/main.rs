@@ -65,32 +65,37 @@ fn default_isr_handler() {
     }
 }
 
-/// Engine-adjacent ISR state: the register-diff shadow and its scratch write
-/// list, shared with the Timer0 ISR via `static APP: Mutex<RefCell<App>>`.
+/// Engine-adjacent ISR state: per-SID register-diff shadows (L/R) and the
+/// shared scratch write list, shared with the Timer0 ISR via `static APP`.
 struct App {
-    diff: RegDiff,
-    wl:   WriteList,
+    diff_l: RegDiff,
+    diff_r: RegDiff,
+    wl:     WriteList,
 }
 
 impl App {
     fn new() -> Self {
-        Self { diff: RegDiff::new(), wl: WriteList::new() }
+        Self { diff_l: RegDiff::new(), diff_r: RegDiff::new(), wl: WriteList::new() }
     }
 }
 
-/// Write one (reg,val) to the SID peripheral, respecting FIFO backpressure
+/// Drain a write list to a SID peripheral, respecting FIFO backpressure
 /// (poll txn_status.writable). `(data<<5)|addr` encoding == `top/sid`.
-fn sid_write(sid: &pac::SID_PERIPH, reg: u8, val: u8) {
-    while !sid.txn_status().read().writable().bit() {}
-    sid.transaction_data().write(|w| unsafe {
-        w.transaction_data().bits(((val as u16) << 5) | (reg as u16))
-    });
+/// Closures abstract over the two distinct PAC peripheral types.
+fn drain_writelist(wl: &WriteList,
+                   writable: impl Fn() -> bool,
+                   write_word: impl Fn(u16)) {
+    for (reg, val) in wl.iter() {
+        while !writable() {}
+        write_word(((*val as u16) << 5) | (*reg as u16));
+    }
 }
 
 /// 1 kHz control ISR: MIDI in -> engine -> tick -> diff -> SID writes.
 fn timer0_handler(app: &Mutex<RefCell<App>>) {
     let peripherals = unsafe { pac::Peripherals::steal() };
-    let sid = peripherals.SID_PERIPH;
+    let sid   = peripherals.SID_PERIPH;
+    let sid_r = peripherals.SID_PERIPH_R;
 
     critical_section::with(|cs| {
         let mut app = app.borrow_ref_mut(cs);
@@ -136,15 +141,21 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             }
         }
 
-        // (b) Tick the engine; on a register change, diff L vs shadow and stream
-        //     only the changed regs. ≤25 regs change per tick; the depth-16 FIFO
-        //     drains 1/φ2 (~1 µs), so even a full image fits the 1 ms budget.
+        // (b) Tick the engine; on a register change, diff L and R vs their
+        //     shadows and stream only the changed regs to their SIDs.
         if mbsid_sys::tick() {
-            let App { diff, wl } = &mut *app;
-            diff.update(mbsid_sys::regs_l(), wl);
-            for (reg, val) in wl.iter() {
-                sid_write(&sid, *reg, *val);
-            }
+            let App { diff_l, diff_r, wl } = &mut *app;
+
+            diff_l.update(mbsid_sys::regs_l(), wl);
+            drain_writelist(wl,
+                || sid.txn_status().read().writable().bit(),
+                |w| { sid.transaction_data().write(|r| unsafe { r.transaction_data().bits(w) }); });
+            wl.clear();
+
+            diff_r.update(mbsid_sys::regs_r(), wl);
+            drain_writelist(wl,
+                || sid_r.txn_status().read().writable().bit(),
+                |w| { sid_r.transaction_data().write(|r| unsafe { r.transaction_data().bits(w) }); });
             wl.clear();
         }
     });
@@ -163,7 +174,8 @@ fn main() -> ! {
     mbsid_sys::load_patch(&PATCH);
 
     let mut app = App::new();
-    app.diff.reset();
+    app.diff_l.reset();
+    app.diff_r.reset();
     let app = Mutex::new(RefCell::new(app));
 
     // MIDI source: TRS-in by default (M1). The SIDPeripheral USB-MIDI host stays
