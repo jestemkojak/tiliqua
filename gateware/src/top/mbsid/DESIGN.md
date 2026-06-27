@@ -219,9 +219,10 @@ the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/
 **Gated on FPGA capacity** (the real M2 risk, not firmware or `sync` timing):
 - A second reSID adds ~7k LUTs (`DUAL_SID_PLAN.md`); the concern is **LUT area / routing
   congestion**, not `sync` Fmax (the filter is already at 30 MHz).
-- Mitigations if the 25F doesn't fit: strip mbsid's inherited-but-unused scope + framebuffer
-  plotter gateware (the firmware drives no display — `fw/src/main.rs:13`); else target the
-  **LFE5U-45F** (SoldierCrab R2, ~45k LUTs). See `M2_DUAL_SID.md §6`.
+- **Only the 25F (r5) is available** — no 45F board, so it must fit on the 25F via LUT
+  reduction. Levers (in order): strip mbsid's inherited-but-unused scope + scope-plotter
+  gateware (the firmware drives no scope — `fw/src/main.rs:13`); drop the optional voice-tap
+  codec channels; share one phi2 divider between the two SIDs. See `M2_DUAL_SID.md §6`.
 
 ### Further deferred (no plan doc yet)
 
@@ -234,8 +235,7 @@ the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/
 
 ### Suggested sequencing
 
-1. **30 MHz SID domain move** (or commit to 45F) — buys timing headroom and is a prerequisite
-   for stereo on the 25F either way.
-2. **M2 stereo** — restore the R image to a 2nd SID (re-validate `docs/DUAL_SID_PLAN.md`
-   against the current tree first; don't take its numbers/firmware model at face value).
-3. **Patch banks**, then **UI**, then **additional engines** as appetite allows.
+1. **M2 stereo** — restore the R image to a 2nd SID (the 30 MHz domain it needs is already in
+   place). Must fit on the 25F via LUT reduction (re-validate `docs/DUAL_SID_PLAN.md` against
+   the current tree first; don't take its numbers/firmware model at face value).
+2. **Patch banks**, then **UI**, then **additional engines** as appetite allows.
