@@ -1,7 +1,7 @@
 # MBSID-on-Tiliqua — Design Spec (Milestone 1: Lead, mono, MIDI-played)
 
 **Date:** 2026-06-26
-**Status:** Design approved; implementation pending in this branch (`mbsid-port`).
+**Status:** M1 complete and confirmed on hardware (`mbsid-port`). See §10 for the post-M1 roadmap.
 **Scope of this doc:** design only. It defines interfaces and acceptance tests so the
 implementation is mechanical. It does not change any existing tiliqua `top`.
 
@@ -186,3 +186,56 @@ mechanical regression test, runnable entirely on PC before any FPGA work.
 - Patch decode/encode + extracted patches: `zsid/zetasid_syx.py`,
   `zsid/extracted_patches/`.
 - Feasibility background: `zsid/MBSID_ON_TILIQUA.md`.
+
+---
+
+## 10. What's next (post-M1 roadmap)
+
+**M1 is complete and confirmed on hardware** (Lead, mono, MIDI-played; §7 milestones 0–3
+all done). This section summarises the deferred work, ordered the way the source docs frame
+it. None of these have a worked-out spec yet — they are scoped pointers, not commitments.
+
+### M2 — Stereo / dual-SID (the clear next step)
+
+**Now specced in `M2_DUAL_SID.md`** (full 6-osc / dual-filter stereo). Summary below.
+
+§2's mono-collapse was a deliberate fidelity reduction; restoring the discarded **R**
+register image to a **second** SID is the headline follow-up. `docs/DUAL_SID_PLAN.md` sketches
+the gateware shape (second `SIDPeripheral` + second φ2 divider; ~7k LUTs for 2×SID) — but it
+**predates this work and is likely stale** (it targets `top/sid`, assumes a unison/detune
+firmware model, and its LUT/timing numbers are unverified against the current tree). Treat it
+as a starting sketch to re-validate, not a spec.
+
+For MBSID specifically the firmware change is smaller than that doc's generic "unison/detune"
+options: the engine **already computes both L and R images** every tick (§2). M2 = stop
+discarding `mbsid_regs_r()`, diff it against a *second* 32-byte shadow, and enqueue to a
+second `SIDPeripheral`. No new engine work — purely gateware (2nd SID) + a second diff loop.
+
+**The 30 MHz SID domain is already done** (inherited from `top/sid`): the reSID core +
+`SIDPeripheral` already run in the 30 MHz `sid` domain (AsyncFIFO sync→sid, pulse-synced
+strobe), defined in `pll.py` across all PLL variants. So the reSID filter muladd is already off
+the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/CDC work.
+
+**Gated on FPGA capacity** (the real M2 risk, not firmware or `sync` timing):
+- A second reSID adds ~7k LUTs (`DUAL_SID_PLAN.md`); the concern is **LUT area / routing
+  congestion**, not `sync` Fmax (the filter is already at 30 MHz).
+- Mitigations if the 25F doesn't fit: strip mbsid's inherited-but-unused scope + framebuffer
+  plotter gateware (the firmware drives no display — `fw/src/main.rs:13`); else target the
+  **LFE5U-45F** (SoldierCrab R2, ~45k LUTs). See `M2_DUAL_SID.md §6`.
+
+### Further deferred (no plan doc yet)
+
+- **Bassline / Drum / Multi engines.** Already compiled into `libmbsid.a` and dead-stripped
+  by `--gc-sections` (the engine aggregates them by value). Enabling is firmware UI/routing +
+  RAM budget, not new vendoring or freestanding-port work.
+- **Patch bank storage** (flash-resident banks; M1 loads a single boot patch).
+- **Wave-sequencer / full MBSID UI** (the macro_osc `opts`/`ui`/`draw` pattern is the model).
+- **ASID** (`MbSidAsid` — currently excluded from the Lead subset, §3).
+
+### Suggested sequencing
+
+1. **30 MHz SID domain move** (or commit to 45F) — buys timing headroom and is a prerequisite
+   for stereo on the 25F either way.
+2. **M2 stereo** — restore the R image to a 2nd SID (re-validate `docs/DUAL_SID_PLAN.md`
+   against the current tree first; don't take its numbers/firmware model at face value).
+3. **Patch banks**, then **UI**, then **additional engines** as appetite allows.
