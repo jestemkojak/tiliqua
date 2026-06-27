@@ -22,6 +22,7 @@ struct ShimBackend {
     void bend(int val14)             { mbsid_pitch_bend((uint16_t)val14); }
     int  tick()                      { return mbsid_tick(2); }
     const uint8_t *regs()            { return mbsid_regs_l(); }
+    const uint8_t *regs_r()          { return mbsid_regs_r(); }
 };
 
 int main(int argc, char **argv) {
