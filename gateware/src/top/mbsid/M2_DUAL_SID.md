@@ -201,13 +201,19 @@ the same `__init__`/`elaborate` region — one coherent edit. (Alternative: over
 `SIDSoc.elaborate` wholesale in `MBSIDSoc` — avoids the upstream edit but duplicates ~70 lines
 of SID/pmod/MIDI wiring and drifts from `top/sid`; not recommended.)
 
+**Only the 25F (r5) is available — it must fit on the 25F.** There is no 45F board to fall back
+to, so capacity is solved by LUT reduction, not a device swap.
+
 **Plan of attack:**
 1. Record single-SID mbsid post-PnR utilisation as baseline (TRELLIS_COMB, Fmax both domains).
 2. Strip the dead scope/plotter (above); re-measure — establishes the real headroom.
-3. Build dual-SID on the default **25F** (r5). Check post-route: `sid` Fmax ≥ 30 MHz with
-   margin, `sync` Fmax ≥ 60 MHz, TRELLIS_COMB < ~90%.
-4. If it still won't fit: target **LFE5U-45F** (SoldierCrab R2, ~45k LUTs — "comfortable" per
-   `DUAL_SID_PLAN.md`).
+3. Build dual-SID on the **25F** (r5). Check post-route: `sid` Fmax ≥ 30 MHz with margin,
+   `sync` Fmax ≥ 60 MHz, TRELLIS_COMB < ~90%.
+4. If it still won't fit, reduce LUTs on the 25F (in order): drop the optional `payload[2]/[3]`
+   voice taps (tie to `0`); share **one** phi2 divider between the two SIDs (~50 LUT, refactor
+   `SIDPeripheral` to accept an external phi2, §9); trim other gateware (e.g. the persist
+   effect) if still over. If after all levers it cannot close, that is a hard finding — stereo
+   does not fit the 25F and M2 stalls until a larger device is available.
 
 Read post-route Fmax as the **second** `Max frequency for clock` occurrence per clock in
 `build/mbsid-r5/top.tim` (root `CLAUDE.md`).
@@ -235,16 +241,17 @@ M2 must validate the **R** path before hardware:
    register write reaches reSID1 (scope-verified tone on the RIGHT channel).
 3. **Stereo play.** A 6-oscillator / dual-filter Lead patch plays with audible stereo content
    (L≠R) on hardware; informal A/B against the emulator confirms both halves are present.
-4. **Capacity sign-off.** Post-route utilisation + both-domain Fmax pass on the chosen device
-   (25F if it fits, else 45F).
+4. **Capacity sign-off.** Post-route utilisation + both-domain Fmax pass on the **25F** (r5, the
+   only available board).
 
 ---
 
 ## 9. Risks / open items
 
-- **25F LUT/congestion** (§6) — primary risk. Mitigations designed: strip the inherited dead
-  scope gateware (the main lever); fall back to 45F. Overlaps the unresolved `sid_player_sw`
-  congestion work (`[[sid-player-sw-timing-critical-path]]`).
+- **25F LUT/congestion** (§6) — primary risk, and there is **no 45F fallback** (only r5/25F is
+  available). Levers are all LUT reduction on the 25F: strip the dead scope gateware (main
+  lever), drop voice taps, share one phi2 divider. If none close it, M2 stalls. Overlaps the
+  unresolved `sid_player_sw` congestion work (`[[sid-player-sw-timing-critical-path]]`).
 - **Two phi2 dividers vs one.** Spec uses two (one per `SIDPeripheral`, both in `sid`,
   phase-locked from common reset). If LUTs are tight, a single shared divider feeding both SIDs
   is a ~50-LUT saving but requires refactoring `SIDPeripheral` to accept an external phi2 —
