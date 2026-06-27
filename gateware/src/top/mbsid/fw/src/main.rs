@@ -1,16 +1,28 @@
-// main.rs — MINIMAL, THROWAWAY link-prover for the MBSID engine (Task 4 / M1
-// milestone 2). It exists to (a) force libmbsid.a to link into the firmware ELF
-// and (b) drive a real tone path: init engine -> load a Lead patch -> note_on ->
-// per-tick register diff -> SIDPeripheral writes -> reSID -> codec.
+// main.rs — MBSID-on-Tiliqua M1 firmware (Task 5).
 //
-// NO interrupt, NO MIDI input, NO UI/display — that is Task 5, which REPLACES this
-// file with the Timer0-ISR + MIDI-in version (mirroring top/sid/fw/src/main.rs).
-// The control loop here is a plain busy-delay at ~1 ms (the engine's control rate).
+// A 1 kHz Timer0 ISR is the whole engine. Each 1 ms tick it:
+//   1. drains the SIDPeripheral MIDI-in CSR FIFO and feeds events to the MBSID
+//      engine (note on/off, pitch bend, CC);
+//   2. ticks the engine (`mbsid_tick`) at the 1 kHz control rate the host oracle
+//      validated against;
+//   3. diffs the L register image vs a 32-byte shadow and streams only the
+//      changed `(data<<5)|addr` words to the SID peripheral (φ2 = 1 MHz reSID).
+//
+// Derived from `top/sid/fw/src/main.rs` but stripped to the bone: NO menu/opts UI,
+// NO CV modulation, NO per-note SID voice allocation (the engine owns voices),
+// NO display/scope. All real-time work is in the ISR (the VexiiRiscv has no
+// usable mcycle CSR; Timer0 is the only clock — see repo CLAUDE.md).
 
 #![no_std]
 #![no_main]
 
+use critical_section::Mutex;
+use core::cell::RefCell;
+
 use riscv_rt::entry;
+use irq::{handler, scoped_interrupts};
+use amaranth_soc_isr::return_as_is;
+
 use panic_halt as _;
 
 use tiliqua_pac as pac;
@@ -20,18 +32,121 @@ use tiliqua_fw::mbsid_sys;
 use tiliqua_fw::regdiff::{RegDiff, WriteList};
 use tiliqua_fw::patch::PATCH;
 
-use hal::hal::delay::DelayNs;
+use midi_types::MidiMessage;
+use midi_convert::parse::MidiTryParseSlice;
 
 // Generates Serial0/Timer0/etc. for this (binary-only) crate. Kept out of lib.rs
 // so the host `cargo test --lib` build stays pure-Rust (no pac/hal on x86_64).
 hal::impl_tiliqua_soc_pac!();
 
+// The engine's control rate is 1 kHz (DESIGN §8): the host oracle ticks the
+// engine every 1 ms, so a 1 ms ISR is the only apples-to-apples cadence. (Base
+// `top/sid` uses 5 ms — that is wrong for the engine; do not copy it.)
+pub const TIMER0_ISR_PERIOD_MS: u32 = 1;
+
+// Scoped TIMER0 interrupt + its dispatch from riscv-rt's DefaultHandler. This is
+// the minimal slice of `top/sid`'s handlers.rs we still need (no logger/UI).
+scoped_interrupts! {
+    #[allow(non_camel_case_types)]
+    enum Interrupt {
+        TIMER0,
+    }
+    use #[return_as_is];
+}
+
+#[export_name = "DefaultHandler"]
+fn default_isr_handler() {
+    let peripherals = unsafe { pac::Peripherals::steal() };
+    let sysclk = pac::clock::sysclk();
+    let timer = Timer0::new(peripherals.TIMER0, sysclk);
+    if timer.is_pending() {
+        unsafe { TIMER0(); }
+        timer.clear_pending();
+    }
+}
+
+/// Engine-adjacent ISR state: the register-diff shadow and its scratch write
+/// list, shared with the Timer0 ISR via `static APP: Mutex<RefCell<App>>`.
+struct App {
+    diff: RegDiff,
+    wl:   WriteList,
+}
+
+impl App {
+    fn new() -> Self {
+        Self { diff: RegDiff::new(), wl: WriteList::new() }
+    }
+}
+
 /// Write one (reg,val) to the SID peripheral, respecting FIFO backpressure
-/// (poll txn_status.writable). Mirrors top/sid's `(data<<5)|addr` encoding.
+/// (poll txn_status.writable). `(data<<5)|addr` encoding == `top/sid`.
 fn sid_write(sid: &pac::SID_PERIPH, reg: u8, val: u8) {
     while !sid.txn_status().read().writable().bit() {}
     sid.transaction_data().write(|w| unsafe {
         w.transaction_data().bits(((val as u16) << 5) | (reg as u16))
+    });
+}
+
+/// 1 kHz control ISR: MIDI in -> engine -> tick -> diff -> SID writes.
+fn timer0_handler(app: &Mutex<RefCell<App>>) {
+    let peripherals = unsafe { pac::Peripherals::steal() };
+    let sid = peripherals.SID_PERIPH;
+
+    critical_section::with(|cs| {
+        let mut app = app.borrow_ref_mut(cs);
+
+        // (a) Drain the MIDI-in CSR FIFO (read until 0, as top/sid does) and
+        //     dispatch each parsed message into the engine.
+        loop {
+            let word = sid.midi_read().read().bits();
+            if word == 0 { break; }
+            let bytes = [
+                (word & 0xFF) as u8,
+                ((word >> 8) & 0xFF) as u8,
+                ((word >> 16) & 0xFF) as u8,
+            ];
+            if let Ok(msg) = MidiMessage::try_parse_slice(&bytes) {
+                match msg {
+                    // Note-on with non-zero velocity -> engine note on.
+                    MidiMessage::NoteOn(_, note, vel) if u8::from(vel) > 0 => {
+                        mbsid_sys::note_on(u8::from(note), u8::from(vel));
+                    }
+                    // Note-on vel 0 (running-status note-off) or explicit note-off.
+                    MidiMessage::NoteOn(_, note, _) |
+                    MidiMessage::NoteOff(_, note, _) => {
+                        mbsid_sys::note_off(u8::from(note));
+                    }
+                    // Pitch bend: the engine wants the raw 14-bit MIDI value
+                    // (msb<<7)|lsb, range 0..16383, center 8192 — exactly what
+                    // MbSid.cpp reconstructs from the wire and feeds to
+                    // midiReceivePitchBend(). We rebuild it from the raw data
+                    // bytes (bytes[1]=LSB, bytes[2]=MSB) to avoid any signed/
+                    // centered re-interpretation by midi-types' PitchBend type.
+                    MidiMessage::PitchBendChange(_, _) => {
+                        let lsb = (bytes[1] & 0x7F) as u16;
+                        let msb = (bytes[2] & 0x7F) as u16;
+                        mbsid_sys::pitch_bend((msb << 7) | lsb);
+                    }
+                    // Control change -> engine CC.
+                    MidiMessage::ControlChange(_, ctrl, val) => {
+                        mbsid_sys::cc(u8::from(ctrl), u8::from(val));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // (b) Tick the engine; on a register change, diff L vs shadow and stream
+        //     only the changed regs. ≤25 regs change per tick; the depth-16 FIFO
+        //     drains 1/φ2 (~1 µs), so even a full image fits the 1 ms budget.
+        if mbsid_sys::tick() {
+            let App { diff, wl } = &mut *app;
+            diff.update(mbsid_sys::regs_l(), wl);
+            for (reg, val) in wl.iter() {
+                sid_write(&sid, *reg, *val);
+            }
+            wl.clear();
+        }
     });
 }
 
@@ -40,28 +155,29 @@ fn main() -> ! {
     let peripherals = pac::Peripherals::take().unwrap();
     let sysclk = pac::clock::sysclk();
     let mut timer = Timer0::new(peripherals.TIMER0, sysclk);
-    let sid = peripherals.SID_PERIPH;
 
-    // Bring up the engine and load the Lead patch, then sound a couple of notes
-    // so milestone-2 scope verification has a tone to look at.
+    // Bring up the engine and load the boot Lead patch so the SoC sounds from the
+    // first MIDI note (no UI patch-loading in M1). Reset the diff shadow so the
+    // first tick streams the full power-on register image.
     mbsid_sys::init();
     mbsid_sys::load_patch(&PATCH);
-    mbsid_sys::note_on(60, 100); // middle C
-    mbsid_sys::note_on(64, 100); // E (held chord; Lead is mono but proves the path)
 
-    let mut diff = RegDiff::new();
-    let mut wl = WriteList::new();
+    let mut app = App::new();
+    app.diff.reset();
+    let app = Mutex::new(RefCell::new(app));
 
-    loop {
-        // ~1 ms control rate (the engine's tick cadence). No ISR by design.
-        timer.delay_ns(1_000_000);
+    // MIDI source: TRS-in by default (M1). The SIDPeripheral USB-MIDI host stays
+    // disabled at reset, so no extra config is needed for the TRS path.
 
-        if mbsid_sys::tick() {
-            diff.update(mbsid_sys::regs_l(), &mut wl);
-            for (reg, val) in wl.iter() {
-                sid_write(&sid, *reg, *val);
-            }
-            wl.clear();
+    handler!(timer0 = || timer0_handler(&app));
+
+    irq::scope(|s| {
+        s.register(Interrupt::TIMER0, timer0);
+        timer.enable_tick_isr(TIMER0_ISR_PERIOD_MS, pac::Interrupt::TIMER0);
+
+        // All work happens in the ISR; idle the core between ticks.
+        loop {
+            unsafe { riscv::asm::wfi(); }
         }
-    }
+    })
 }
