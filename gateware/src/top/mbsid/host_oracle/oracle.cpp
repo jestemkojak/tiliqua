@@ -40,6 +40,7 @@ struct OracleBackend {
     void bend(int val14)             { env.mbSid[0].midiReceivePitchBend(MIDI_CHN, (u16)val14); }
     int  tick()                      { return env.tick() ? 1 : 0; }
     const uint8_t *regs()            { return sidRegs[0].ALL; }
+    const uint8_t *regs_r()          { return sidRegs[1].ALL; }
 };
 
 int main(int argc, char **argv) {

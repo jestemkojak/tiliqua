@@ -12,8 +12,8 @@
  *     <t_ms> bend  <val14>      0..16383, 8192 = centre
  *     <t_ms> end                stop the loop after this ms-tick
  *
- * Trace format emitted (L side only): "<t_ms> <reg> <hexval>\n" for every
- * changed register 0..31 after each tick.
+ * Trace format emitted: "<t_ms> <L|R> <reg> <hexval>\n" for every changed
+ * register 0..31 after each tick (L block then R block).
  */
 #ifndef HOST_ORACLE_SEQ_H
 #define HOST_ORACLE_SEQ_H
@@ -70,6 +70,7 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
  *   void          bend(int val14);
  *   int           tick();                 // advance one ms
  *   const uint8_t *regs();                // 32-byte L image
+ *   const uint8_t *regs_r();              // 32-byte R image
  */
 template <class Backend>
 static inline void run_sequence(const char *path, Backend &be, FILE *out) {
@@ -83,8 +84,10 @@ static inline void run_sequence(const char *path, Backend &be, FILE *out) {
     (void)have_end;
 
     be.init();
-    unsigned char shadow[32];
-    memset(shadow, 0, sizeof(shadow));
+    unsigned char shadow_l[32];
+    unsigned char shadow_r[32];
+    memset(shadow_l, 0, sizeof(shadow_l));
+    memset(shadow_r, 0, sizeof(shadow_r));
 
     size_t ei = 0;
     for (int t = 0; t <= last_t; ++t) {
@@ -103,11 +106,18 @@ static inline void run_sequence(const char *path, Backend &be, FILE *out) {
         }
         // one engine tick per ms (1 kHz control rate)
         be.tick();
-        const uint8_t *r = be.regs();
+        const uint8_t *l = be.regs();
+        const uint8_t *r = be.regs_r();
         for (int reg = 0; reg < 32; ++reg) {
-            if (r[reg] != shadow[reg]) {
-                shadow[reg] = r[reg];
-                fprintf(out, "%d %d %02x\n", t, reg, r[reg]);
+            if (l[reg] != shadow_l[reg]) {
+                shadow_l[reg] = l[reg];
+                fprintf(out, "%d L %d %02x\n", t, reg, l[reg]);
+            }
+        }
+        for (int reg = 0; reg < 32; ++reg) {
+            if (r[reg] != shadow_r[reg]) {
+                shadow_r[reg] = r[reg];
+                fprintf(out, "%d R %d %02x\n", t, reg, r[reg]);
             }
         }
         if (stop) break;
