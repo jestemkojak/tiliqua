@@ -4,7 +4,7 @@
 # Builds two x86 binaries from the SAME vendored MBSID Lead engine subset:
 #   oracle      — engine wired exactly like juce/PluginProcessor.cpp (reference)
 #   shim_driver — drives the flat mbsid_* ABI (fw/csrc/mbsid_shim.cpp)
-# then runs every sequence x patch through both and diffs the L-register
+# then runs every sequence x patch through both and diffs the L and R register
 # traces.  Byte-identical == the shim faithfully wraps the engine.
 set -euo pipefail
 
@@ -90,9 +90,9 @@ for seq in "$HERE"/sequences/*.txt; do
     for row in "${PATCHES[@]}"; do
         tmp="$BUILD/${seqname}_p${row}.seq"
         { echo "0 patch $row"; cat "$seq"; } > "$tmp"
-        "$BUILD/oracle"      "$tmp" > "$BUILD/oracle_L.trace"
-        "$BUILD/shim_driver" "$tmp" > "$BUILD/shim_L.trace"
-        if diff -u "$BUILD/oracle_L.trace" "$BUILD/shim_L.trace"; then
+        "$BUILD/oracle"      "$tmp" > "$BUILD/oracle.trace"
+        "$BUILD/shim_driver" "$tmp" > "$BUILD/shim.trace"
+        if diff -u "$BUILD/oracle.trace" "$BUILD/shim.trace"; then
             echo "OK: $seqname patch=$row"
         else
             echo "DIFF: $seqname patch=$row"
