@@ -1,6 +1,14 @@
-# MBSID "Lead" engine subset — vendored .cpp files to compile for riscv32im.
+# MBSID "Lead" engine subset — vendored .cpp files compiled for riscv32im.
 # Paths are relative to: mios32/apps/synthesizers/midibox_sid_v3/core/
-# Canonical list consumed by Tasks 1/4 (build.rs). Comments with '#'.
+#
+# DOCUMENTATION ONLY — build.rs no longer reads this file; it GLOBS the whole
+# core/ + components/ tree (every *.cpp except app.cpp, then --gc-sections drops
+# the dead non-Lead code). This file is kept as the human record of which TUs
+# the Lead path actually needs.
+#
+# Engine provenance: the mios32/ tree is GPL + gitignored. Populate it with
+# ./fetch-mios32.sh (shallow-clones github.com/midibox/mios32 at the pinned
+# commit). See gateware/src/top/mbsid/CLAUDE.md "Vendored engine".
 #
 # Required compile define: -DMIOS32_FAMILY_EMULATION (selects no-RTOS path;
 #   without it, tasks.h #includes FreeRTOS headers that do not exist here).

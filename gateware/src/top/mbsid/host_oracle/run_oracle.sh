@@ -26,7 +26,15 @@ DEFS="-DMIOS32_FAMILY_EMULATION"
 # mios32_shim dir is kept OFF the path so its freestanding <string.h> doesn't
 # shadow host libc.  Order matters: hostinc first.
 INC="-I$HERE/hostinc -I$CORE -I$CORE/components -I$MODSID -I$NOTESTACK -I$RANDOM_DIR"
-CXXFLAGS="-std=c++14 -O1 -fno-exceptions -fno-rtti $DEFS $INC -I$HERE -I$SHIM -Wall -Wno-unused"
+# -fpermissive: after the ilp32-correct typedef fix, mios32.h's `u32` is a 32-bit
+# uint32_t (== target width). MbSidSysEx::sendAck() does a `(u32)pointer` cast
+# that is LOSSLESS on the 32-bit target but truncates a 64-bit pointer on this
+# LP64 host — a hard g++ error. That function is the SysEx-ACK reply path: never
+# driven by the oracle sequences and --gc-sections'd out of the M1 Lead firmware,
+# so the truncated (and discarded) value never affects the L trace. Demote the
+# host-only diagnostic so the oracle still builds; equivalence is then proven by
+# the byte-identical traces below.
+CXXFLAGS="-std=c++14 -O1 -fno-exceptions -fno-rtti -fpermissive $DEFS $INC -I$HERE -I$SHIM -Wall -Wno-unused"
 # notestack.c calls MIOS32_MIDI_SendDebugMessage (the printf-style debug
 # console); the shim header only provides the DEBUG_MSG macro, so the call is
 # an implicit decl on host. Demote to warning; resolved by a no-op in
