@@ -88,6 +88,16 @@ fn main() {
     // GNU-ld flag as-is, NOT wrapped in -Wl,.
     println!("cargo:rustc-link-arg=--gc-sections");
 
+    // ---- Run the C++ engine's static constructors on the target. ----------------
+    // riscv-rt's link.x has no `.init_array` output section and its reset path
+    // never calls __libc_init_array, so the engine's global ctors (speed factor,
+    // RNG seed, clock defaults — see mbsid_shim.cpp) would never run. init_array.x
+    // collects `.init_array` + exposes __init_array_start/__init_array_end, which
+    // mbsid_run_static_ctors() walks at startup. Found relative to the crate root
+    // (cwd at link time), same as memory.x/link.x.
+    println!("cargo:rustc-link-arg=-Tinit_array.x");
+    println!("cargo:rerun-if-changed=init_array.x");
+
     // ---- Rerun triggers. --------------------------------------------------------
     println!("cargo:rerun-if-changed=csrc");
     rerun_dir(&core);

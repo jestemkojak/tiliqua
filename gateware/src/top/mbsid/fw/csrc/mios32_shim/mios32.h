@@ -16,6 +16,7 @@
 #define _MIOS32_H
 
 #include <stddef.h>   // freestanding: NULL, size_t (engine uses NULL via <mios32.h>)
+#include <stdint.h>   // int32_t/uint32_t: width-exact on BOTH host (LP64) and target (ilp32)
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,27 +27,31 @@ extern "C" {
 /////////////////////////////////////////////////////////////////////////////
 #if !defined(__STM32F10x_H) && !defined(__STM32F4xx_H)
 
-typedef signed long  s32;
+// NOTE: 32-bit types are int32_t/uint32_t, NOT (signed/unsigned) long. On the
+// ilp32 target `long` is 32-bit, but on the LP64 host oracle it is 64-bit — so
+// `long` would let the host miss 32-bit-overflow math the target performs. Using
+// the fixed-width stdint types makes the host oracle width-identical to target.
+typedef int32_t      s32;
 typedef signed short s16;
 typedef signed char  s8;
 
-typedef signed long  const sc32;
+typedef int32_t      const sc32;
 typedef signed short const sc16;
 typedef signed char  const sc8;
 
-typedef volatile signed long  vs32;
+typedef volatile int32_t      vs32;
 typedef volatile signed short vs16;
 typedef volatile signed char  vs8;
 
-typedef unsigned long  u32;
+typedef uint32_t       u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-typedef unsigned long  const uc32;
+typedef uint32_t       const uc32;
 typedef unsigned short const uc16;
 typedef unsigned char  const uc8;
 
-typedef volatile unsigned long  vu32;
+typedef volatile uint32_t       vu32;
 typedef volatile unsigned short vu16;
 typedef volatile unsigned char  vu8;
 
@@ -172,10 +177,11 @@ static inline s32 MIOS32_MIDI_SendDebugMessage(const char *format, ...) {
 }
 
 // sprintf: used only by MbSidEnvironment to format human-readable patch names
-// (display strings). NOT freestanding -- declared here; the riscv32 firmware
-// must provide a real (s)printf at link time (newlib-nano / a tiny formatter).
-// This DOES return data the UI shows, so the link-time impl must be real, not
-// a stub. snprintf declared too for safer future use.
+// (display strings). NOT on the Lead register-write path — M1 has no UI that
+// shows patch names, so --gc-sections drops the only caller and the firmware
+// links fine WITHOUT any (s)printf implementation. Declared here so the engine
+// TUs compile; if a future UI calls it, provide a real formatter at link time.
+// snprintf declared too for safer future use.
 int sprintf (char *str, const char *fmt, ...);
 int snprintf(char *str, size_t size, const char *fmt, ...);
 

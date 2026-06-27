@@ -1,10 +1,16 @@
 /* mbsid_shim.cpp — flat extern "C" wrapper around one MbSidEnvironment.
  *
- * One MbSidEnvironment lives in .bss (zero-initialised).  The ctor sets
- * updateSpeedFactorSet(2) internally; mbsid_tick()'s speed_factor arg is
- * accepted for ABI stability but is NOT wired into env.tick() — the engine
- * uses its internal factor.  If Task 2 reveals the oracle drives the factor
- * dynamically, add env.updateSpeedFactorSet(speed_factor) before env.tick().
+ * `env` is a C++ global whose constructor (MbSidEnvironment::MbSidEnvironment,
+ * and recursively every member ctor) establishes essential state: speed factor
+ * = 2, RNG seed 0xcafebabe, clock BPM=120 / mode AUTO, per-voice/LFO/arp init,
+ * etc.  On the bare-metal riscv target NOTHING runs that ctor (riscv-rt has no
+ * __libc_init_array), so mbsid_init() runs all static ctors itself first — see
+ * mbsid_run_static_ctors() below.  On the host oracle, libc already ran the
+ * ctors before main(), so the runner is a no-op there (kept width/behaviour
+ * identical between host and target).
+ *
+ * mbsid_tick()'s speed_factor arg is accepted for ABI stability but is NOT wired
+ * into env.tick() — the engine uses its internal factor.
  */
 
 #include "mbsid_shim.h"
@@ -13,13 +19,31 @@
 static_assert(sizeof(sid_patch_t) == 512, "patch must be 512 bytes");
 
 namespace {
-    MbSidEnvironment env;       // .bss: engine + clock; ctor sets updateSpeedFactor=2
+    MbSidEnvironment env;       // .bss until its ctor runs (see mbsid_run_static_ctors)
     sid_regs_t       regL;      // .bss, zero-init
     sid_regs_t       regR;      // .bss, zero-init
     const uint8_t    MIDI_CHN = 0;
 }
 
+/* Run every C++ static constructor (.init_array) exactly as a hosted libc would.
+ * On the target the bounds come from fw/init_array.x; on the host libc already
+ * ran them, so this is compiled out (avoids an undefined-symbol link error and
+ * a redundant re-run). */
+#if defined(__riscv)
+extern "C" {
+    extern void (*__init_array_start[])(void);
+    extern void (*__init_array_end[])(void);
+}
+extern "C" void mbsid_run_static_ctors(void) {
+    for (void (**p)(void) = __init_array_start; p != __init_array_end; ++p)
+        (*p)();
+}
+#else
+extern "C" void mbsid_run_static_ctors(void) { /* host libc ran ctors before main() */ }
+#endif
+
 extern "C" void mbsid_init(void) {
+    mbsid_run_static_ctors();   // construct `env` (and all members) before first use
     for (int r = 0; r < SID_REGS_NUM; ++r) { regL.ALL[r] = 0; regR.ALL[r] = 0; }
     env.mbSid[0].init(/*sidNum*/0, &regL, &regR, &env.mbSidClock);
 }
