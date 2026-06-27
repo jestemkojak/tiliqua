@@ -2,6 +2,16 @@
 # Paths are relative to: mios32/apps/synthesizers/midibox_sid_v3/core/
 # Canonical list consumed by Tasks 1/4 (build.rs). Comments with '#'.
 #
+# Required compile define: -DMIOS32_FAMILY_EMULATION (selects no-RTOS path;
+#   without it, tasks.h #includes FreeRTOS headers that do not exist here).
+# Link-time stubs that MUST be provided (real or no-op) by the shim/firmware
+#   in a later task — all are extern "C" voids, safe to no-op (single-hart):
+#     TASKS_MIDIOUTSemaphoreTake/Give, TASKS_MIDIINSemaphoreTake/Give,
+#     TASKS_SDCardSemaphoreTake/Give, TASKS_LCDTake/Give
+# Link-time REAL implementations required (NOT no-op — engine consumes their
+#   output): notestack.c, jsw_rand.c (Mersenne Twister), sprintf/snprintf,
+#   mem*/str* (libc). MIOS32_MIDI_DeviceIDGet currently returns 0 (SysEx default).
+#
 # EXCLUDED (not Lead): MbSidSeBassline/Drum/Multi, components/*Drum*, MbSidAsid.
 #
 # --- top-level engine ---
