@@ -1,0 +1,27 @@
+# MBSID "Lead" engine subset — vendored .cpp files to compile for riscv32im.
+# Paths are relative to: mios32/apps/synthesizers/midibox_sid_v3/core/
+# Canonical list consumed by Tasks 1/4 (build.rs). Comments with '#'.
+#
+# EXCLUDED (not Lead): MbSidSeBassline/Drum/Multi, components/*Drum*, MbSidAsid.
+#
+# --- top-level engine ---
+MbSid.cpp
+MbSidEnvironment.cpp
+MbSidSe.cpp
+MbSidSeLead.cpp
+MbSidPatch.cpp
+MbSidTables.cpp
+MbSidSysEx.cpp
+# --- components ---
+components/MbSidVoice.cpp
+components/MbSidVoiceQueue.cpp
+components/MbSidMidiVoice.cpp
+components/MbSidFilter.cpp
+components/MbSidLfo.cpp
+components/MbSidEnvLead.cpp
+components/MbSidWt.cpp
+components/MbSidArp.cpp
+components/MbSidMod.cpp
+components/MbSidSeq.cpp
+components/MbSidClock.cpp
+components/MbSidRandomGen.cpp
