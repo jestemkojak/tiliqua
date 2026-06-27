@@ -1,0 +1,11 @@
+# seq_basic.txt — single-note gate on/off, repeated notes.
+# Format: <t_ms> event args   (see seq.h).  Patch row is supplied on the
+# command line by run_oracle.sh prepending a "0 patch <row>" line, so this
+# file deliberately omits the patch select.
+10 on 60 100
+500 off 60
+800 on 64 110
+1200 off 64
+1400 on 67 90
+1900 off 67
+2200 end

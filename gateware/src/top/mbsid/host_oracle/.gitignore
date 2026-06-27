@@ -1,0 +1,3 @@
+# Host-oracle build artifacts and generated traces.
+build/
+*.trace

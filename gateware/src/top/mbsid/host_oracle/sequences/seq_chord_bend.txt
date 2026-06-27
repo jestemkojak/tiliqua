@@ -1,0 +1,18 @@
+# seq_chord_bend.txt — overlapping notes, a CC sweep and pitch-bend gestures.
+# Patch row is prepended by run_oracle.sh as "0 patch <row>".
+20 on 60 100
+40 on 64 100
+60 on 67 100
+200 bend 8192
+300 bend 10000
+400 bend 6000
+500 bend 8192
+600 cc 1 64
+700 cc 1 127
+900 off 67
+1000 off 64
+1100 off 60
+1300 on 72 120
+1300 bend 12000
+1600 off 72
+1700 end
