@@ -7,18 +7,19 @@
 # the Lead path actually needs.
 #
 # Engine provenance: the mios32/ tree is GPL + gitignored. Populate it with
-# ./fetch-mios32.sh (shallow-clones github.com/midibox/mios32 at the pinned
-# commit). See gateware/src/top/mbsid/CLAUDE.md "Vendored engine".
+# ./fetch-mios32.sh (blobless-clones github.com/midibox/mios32 --filter=blob:none
+# at the pinned commit). See gateware/src/top/mbsid/CLAUDE.md "Vendored engine".
 #
 # Required compile define: -DMIOS32_FAMILY_EMULATION (selects no-RTOS path;
 #   without it, tasks.h #includes FreeRTOS headers that do not exist here).
-# Link-time stubs that MUST be provided (real or no-op) by the shim/firmware
-#   in a later task — all are extern "C" voids, safe to no-op (single-hart):
+# Link-time stubs — PROVIDED (no-op) in fw/csrc/cxx_runtime.c — all extern "C"
+#   voids, safe to no-op (single-hart):
 #     TASKS_MIDIOUTSemaphoreTake/Give, TASKS_MIDIINSemaphoreTake/Give,
 #     TASKS_SDCardSemaphoreTake/Give, TASKS_LCDTake/Give
-# Link-time REAL implementations required (NOT no-op — engine consumes their
-#   output): notestack.c, jsw_rand.c (Mersenne Twister), sprintf/snprintf,
-#   mem*/str* (libc). MIOS32_MIDI_DeviceIDGet currently returns 0 (SysEx default).
+# Link-time REAL implementations (engine consumes their output): notestack.c +
+#   jsw_rand.c are compiled by build.rs; mem*/str* come from compiler_builtins;
+#   sprintf/snprintf are dropped by --gc-sections (patch-name path unreachable in
+#   M1). MIOS32_MIDI_DeviceIDGet returns 0 (SysEx default).
 #
 # EXCLUDED (not Lead): MbSidSeBassline/Drum/Multi, components/*Drum*, MbSidAsid.
 #
