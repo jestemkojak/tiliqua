@@ -1,0 +1,6 @@
+/mios32/
+*.bin
+fw/target/
+fw/Cargo.lock
+pac/
+fw/memory.x

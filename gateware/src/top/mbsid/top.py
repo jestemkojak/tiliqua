@@ -1,0 +1,45 @@
+# Copyright (c) 2026 Tiliqua contributors
+#
+# SPDX-License-Identifier: CERN-OHL-S-2.0
+"""
+MBSID-on-Tiliqua (M1): reuses top/sid's SoC verbatim (VexiiRiscv @ 60 MHz,
+SIDPeripheral, Phi2Divider, MIDI-in CSR FIFO, Timer0). The only delta is the
+firmware path — `path=this_path` points the firmware build at `mbsid/fw`, whose
+build.rs cross-compiles the MBSID v3 C++ engine and links it into the ELF.
+"""
+
+import os
+import sys
+
+# This file is named top.py and is run as a script, so its own directory lands on
+# sys.path[0] and shadows the `top` package (making `from top.sid...` re-import this
+# file). Replace that entry with the `src` root so `top.sid.top` resolves correctly.
+_this_dir = os.path.dirname(os.path.realpath(__file__))
+_src_root = os.path.dirname(os.path.dirname(_this_dir))  # .../src
+if sys.path and os.path.realpath(sys.path[0]) == _this_dir:
+    sys.path[0] = _src_root
+elif _src_root not in sys.path:
+    sys.path.insert(0, _src_root)
+
+from top.sid.top import SIDSoc
+from tiliqua.build.cli import top_level_cli
+
+
+class MBSIDSoc(SIDSoc):
+    """top/sid's SoC, but with a larger BRAM (mainram) window.
+
+    The MBSID v3 engine is aggregated BY VALUE inside one static MbSidEnvironment,
+    so the whole engine tree's state lands in .bss (~16 KB) — it nearly fills sid's
+    default 0x4000 BRAM, leaving no room for the stack. Bump to 0x8000 (32 KB):
+    ~16 KB .bss + ~16 KB stack. (M1 SoC-RAM risk, DESIGN.md §8.)
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("mainram_size", 0x8000)
+        super().__init__(**kwargs)
+
+
+if __name__ == "__main__":
+    this_path = os.path.dirname(os.path.realpath(__file__))
+    top_level_cli(MBSIDSoc, path=this_path,
+                  archiver_callback=lambda archiver: archiver.with_option_storage())

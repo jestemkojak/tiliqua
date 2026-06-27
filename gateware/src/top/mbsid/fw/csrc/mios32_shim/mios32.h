@@ -164,6 +164,13 @@ static inline s32 MIOS32_MIDI_SendSysEx(mios32_midi_port_t port, u8 *stream, u32
 // discards its args (kept side-effect-free; never consumed by the engine).
 #define DEBUG_MSG(...) do { } while (0)
 
+// notestack.c calls MIOS32_MIDI_SendDebugMessage() directly (printf-style console
+// dump in NOTESTACK_SendDebugMessage). Debug-only, never on the engine hot path:
+// a per-TU no-op inline (variadic, args discarded) keeps it link-symbol-free.
+static inline s32 MIOS32_MIDI_SendDebugMessage(const char *format, ...) {
+  (void)format; return 0;
+}
+
 // sprintf: used only by MbSidEnvironment to format human-readable patch names
 // (display strings). NOT freestanding -- declared here; the riscv32 firmware
 // must provide a real (s)printf at link time (newlib-nano / a tiny formatter).

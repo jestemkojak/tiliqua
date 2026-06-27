@@ -467,9 +467,11 @@ class SIDSoc(TiliquaSoc):
     )
 
     def __init__(self, **kwargs):
-        # Don't finalize CSR bridge yet
+        # Don't finalize CSR bridge yet. Default mainram (BRAM) is 0x4000 — the big
+        # opts struct eats stack. Subclasses (e.g. top/mbsid, whose by-value C++
+        # engine state needs more .bss) may override via the mainram_size kwarg.
+        kwargs.setdefault("mainram_size", 0x4000)
         super().__init__(finalize_csr_bridge=False,
-                         mainram_size=0x4000, # big opts struct eats stack
                          **kwargs)
 
         # Add SID peripheral
