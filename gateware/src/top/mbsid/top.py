@@ -37,6 +37,7 @@ class MBSIDSoc(SIDSoc):
     def __init__(self, **kwargs):
         kwargs.setdefault("mainram_size", 0x8000)
         kwargs.setdefault("with_scope", False)
+        kwargs.setdefault("n_sids", 2)
         super().__init__(**kwargs)
 
 
