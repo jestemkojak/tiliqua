@@ -12,6 +12,7 @@ extern "C" {
     fn mbsid_tick(speed_factor: u8) -> i32;
     fn mbsid_regs_l() -> *const u8;
     fn mbsid_regs_r() -> *const u8;
+    fn mbsid_program_change(patch: u8);
 }
 
 // --- safe wrappers (riscv32 target) ---
@@ -42,6 +43,11 @@ pub fn regs_r() -> &'static [u8; 32] {
 #[cfg(target_arch = "riscv32")]
 pub fn load_patch(buf: &[u8; 512]) -> bool {
     unsafe { mbsid_load_patch(buf.as_ptr()) == 0 }
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn program_change(patch: u8) {
+    unsafe { mbsid_program_change(patch) }
 }
 
 #[cfg(target_arch = "riscv32")]
@@ -83,6 +89,9 @@ pub fn regs_r() -> &'static [u8; 32] { &HOST_REGS_STUB }
 
 #[cfg(not(target_arch = "riscv32"))]
 pub fn load_patch(_buf: &[u8; 512]) -> bool { true }
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn program_change(_patch: u8) {}
 
 #[cfg(not(target_arch = "riscv32"))]
 pub fn note_on(_note: u8, _vel: u8) {}
