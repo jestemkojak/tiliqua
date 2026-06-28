@@ -1,9 +1,11 @@
-# MBSID Lead
+# MBSID
 
-Run the **MIDIbox SID v3 Lead engine** on the Tiliqua, driven by MIDI. Two
+Run the **MIDIbox SID v3** sound engine on the Tiliqua, driven by MIDI. Two
 cycle-accurate reSID cores (MOS 8580) produce true stereo output — the MBSID
-engine distributes voices and timbres across both chips. Patches are the
-standard zetaSID `.syx` format; a factory bank ships in the bitstream.
+engine distributes voices and timbres across both chips. All four MBSID engines
+(**Lead, Bassline, Drum, Multi**) are present; the engine of a patch is selected
+by the patch itself. Patches are the standard `.syx` format; a factory
+bank ships in the bitstream.
 
 ---
 
@@ -25,7 +27,39 @@ standard zetaSID `.syx` format; a factory bank ships in the bitstream.
    ```
 
 3. **Connect MIDI** (TRS jack or USB host) and play. The patch menu lets you
-   browse the factory bank with the encoder.
+   browse the factory bank with the encoder. See the channel map below for which
+   MIDI channels each engine listens on.
+
+---
+
+## Sound engines & MIDI channels
+
+MBSID is a **multi-timbral MIDI module**, not a single-channel synth. Each engine
+maps its internal MIDI "voices" onto the two SIDs and onto fixed MIDI channels.
+The mapping is the engine's, not the patch's — every patch of a given engine uses
+the same channel layout:
+
+| Engine | MIDI channels | Voices → SID | Plays from one keyboard? |
+|--------|:---:|---|---|
+| **Lead** | 1 | engine allocates up to all 6 oscillators (unison / detune / wavetable chord) | ✅ fully |
+| **Drum** | 1 | MIDI note → drum instrument, like a GM drum part | ✅ fully |
+| **Bassline** | 1, 2 | two independent basslines (one per channel), each split at note 60 | ⚠️ ch 1 = bassline 1 only |
+| **Multi** | 1–6 | 6 independent mono parts: ch 1–3 → **Left** SID osc 1–3, ch 4–6 → **Right** SID osc 1–3 | ⚠️ one part per channel |
+
+**How to play:**
+
+- **Lead / Drum** — a single MIDI keyboard or pad on **channel 1** plays the whole
+  engine. This is the live-play case.
+- **Multi / Bassline** — these want a **multi-channel source** (a DAW, hardware
+  sequencer, or groovebox) sending on channels 1–6, exactly like driving any
+  multi-timbral GM module. A keyboard that can split its keys into per-channel
+  zones can play several parts by hand; a plain single-channel keyboard plays only
+  the one part assigned to its channel.
+
+> **Status:** the firmware currently forwards all MIDI on channel 0, so **Lead and
+> Drum play today** but Multi (voices 2–6) and Bassline's second channel are not
+> yet reachable. Full per-channel input is delivered by the multi-engine milestone
+> (see `DESIGN.md §10` / the milestone spec).
 
 ---
 
@@ -104,13 +138,14 @@ full scale.
 
 **Key points:**
 
-- The **MBSID v3 Lead C++ engine** (`mios32/apps/synthesizers/midibox_sid_v3/`)
-  is cross-compiled freestanding for `riscv32im` by `fw/build.rs` using clang++.
-  It runs entirely on the RISC-V; no gateware changes versus `top/sid`.
+- The **MBSID v3 C++ engine** (`mios32/apps/synthesizers/midibox_sid_v3/`, all
+  four engines) is cross-compiled freestanding for `riscv32im` by `fw/build.rs`
+  using clang++. It runs entirely on the RISC-V; no gateware changes versus
+  `top/sid`. The active engine is dispatched from `patch.body.engine`.
 - **Control rate is 1 kHz** (`TIMER0_ISR_PERIOD_MS = 1`). On each tick the
   engine produces two 29-register SID images (L and R); only changed registers
   are enqueued to the respective `SIDPeripheral` FIFO (RegDiff).
-- **zetaSID `.syx` patches** are standard MBSID v2 voice descriptions. The
+- **`.syx` patches** are standard MBSID v2 voice descriptions. The
   engine translates them into SID register writes — there is no SID register
   data in the patch file itself.
 - **Static constructors** don't auto-run on riscv-rt; `mbsid_run_static_ctors()`
