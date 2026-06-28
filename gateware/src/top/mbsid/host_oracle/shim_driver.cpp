@@ -17,10 +17,11 @@ struct ShimBackend {
     void init()                      { mbsid_init(); }
     int  load_patch(int row)         { return mbsid_load_patch(sid_bank_preset_0[row]); }
     int  program_change(int patch)   { mbsid_program_change((uint8_t)patch); return 0; }
-    void note_on (int note, int vel) { mbsid_note_on((uint8_t)note, (uint8_t)vel); }
-    void note_off(int note)          { mbsid_note_off((uint8_t)note); }
-    void cc(int num, int val)        { mbsid_cc((uint8_t)num, (uint8_t)val); }
-    void bend(int val14)             { mbsid_pitch_bend((uint16_t)val14); }
+    void note_on (int chn, int note, int vel) { mbsid_note_on((uint8_t)chn, (uint8_t)note, (uint8_t)vel); }
+    void note_off(int chn, int note)          { mbsid_note_off((uint8_t)chn, (uint8_t)note); }
+    void cc(int chn, int num, int val)        { mbsid_cc((uint8_t)chn, (uint8_t)num, (uint8_t)val); }
+    void bend(int chn, int val14)             { mbsid_pitch_bend((uint8_t)chn, (uint16_t)val14); }
+    void aftertouch(int chn, int val)         { mbsid_aftertouch((uint8_t)chn, (uint8_t)val); }
     int  tick()                      { return mbsid_tick(2); }
     const uint8_t *regs()            { return mbsid_regs_l(); }
     const uint8_t *regs_r()          { return mbsid_regs_r(); }

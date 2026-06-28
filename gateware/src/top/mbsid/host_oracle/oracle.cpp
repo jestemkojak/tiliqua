@@ -13,10 +13,6 @@
 // In-tree Lead preset bank: static const u8 sid_bank_preset_0[128][512].
 #include "sid_bank_preset_a.inc"
 
-namespace {
-    const u8 MIDI_CHN = 0;
-}
-
 struct OracleBackend {
     MbSidEnvironment env;
     sid_regs_t sidRegs[2];   // [0]=L, [1]=R  (mirrors PluginProcessor.cpp)
@@ -35,10 +31,11 @@ struct OracleBackend {
         return env.sysexSetPatch(/*sid*/0, &p, /*toBank*/false, 0, 0) ? 0 : -1;
     }
     int program_change(int patch) { return env.bankLoad(/*sid*/0, /*bank*/0, (u8)patch); }
-    void note_on (int note, int vel) { env.mbSid[0].midiReceiveNote(MIDI_CHN, (u8)note, (u8)vel); }
-    void note_off(int note)          { env.mbSid[0].midiReceiveNote(MIDI_CHN, (u8)note, 0); }
-    void cc(int num, int val)        { env.mbSid[0].midiReceiveCC(MIDI_CHN, (u8)num, (u8)val); }
-    void bend(int val14)             { env.mbSid[0].midiReceivePitchBend(MIDI_CHN, (u16)val14); }
+    void note_on (int chn, int note, int vel) { env.mbSid[0].midiReceiveNote((u8)chn, (u8)note, (u8)vel); }
+    void note_off(int chn, int note)          { env.mbSid[0].midiReceiveNote((u8)chn, (u8)note, 0); }
+    void cc(int chn, int num, int val)        { env.mbSid[0].midiReceiveCC((u8)chn, (u8)num, (u8)val); }
+    void bend(int chn, int val14)             { env.mbSid[0].midiReceivePitchBend((u8)chn, (u16)val14); }
+    void aftertouch(int chn, int val)         { env.mbSid[0].midiReceiveAftertouch((u8)chn, (u8)val); }
     int  tick()                      { return env.tick() ? 1 : 0; }
     const uint8_t *regs()            { return sidRegs[0].ALL; }
     const uint8_t *regs_r()          { return sidRegs[1].ALL; }
