@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-06-28): M2 dual-SID implemented (Tasks 1–5 complete); Task 6 = hardware bring-up pending.**
+**Status (2026-06-28): M2 dual-SID implemented (Tasks 1–5 complete); M3 factory patch bank done (MIDI PC → 128 patches); Task 6 = hardware bring-up pending.**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 6/6

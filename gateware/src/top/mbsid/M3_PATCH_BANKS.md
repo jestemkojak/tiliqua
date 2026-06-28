@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-28
 **Branch:** `mbsid-port`
-**Status:** Design approved; implementation not started.
+**Status:** Implementation complete (MIDI Program Change → factory bank; boot A124; 12/12 oracle; 128-patch no-crash sweep).
 **Scope of this doc:** design only — interfaces and acceptance tests, so implementation is
 mechanical. Builds on the M1 (Lead, mono) and M2 (dual-SID stereo) work; see `DESIGN.md`
 and `M2_DUAL_SID.md`.
