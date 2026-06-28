@@ -96,12 +96,24 @@ mbsid_sys::load_patch(&PATCH);          // before
 ```
 ```rust
 mbsid_sys::init();
-mbsid_sys::program_change(BOOT_PATCH_INDEX);   // after; BOOT_PATCH_INDEX = 51 (A052 "Nice Lead")
+mbsid_sys::program_change(BOOT_PATCH_INDEX);   // after; BOOT_PATCH_INDEX = 123 (A124 "Crazy Lead")
 ```
 
-This unifies boot and Program Change on the same bank/load path. **Retire `fw/src/patch.rs`**
-— its hand-copied 512-byte image is exactly row 51 of the bank we now link, so it becomes
-redundant.
+`BOOT_PATCH_INDEX` is the **0-based bank slot** (= MIDI Program Change value = patch number − 1).
+**Constraint:** it must point at a **Lead** slot, or the synth boots with a wrong-sounding
+non-Lead patch; document this on the constant. A124 "Crazy Lead" → index 123 is Lead.
+
+**Load mechanism is identical to M2's boot.** The current boot's `load_patch` →
+`MbSid::sysexSetPatch(p)` runs exactly `mbSidPatch.copyToPatch(p); updatePatch(false);` — the
+*same two lines* `bankLoad` runs. The full engine init already happened in `MbSid::init` →
+`updatePatch(true)` during `mbsid_init`, before either call. So boot timing, engine init, and
+the first-tick register image come from identical code; **only the patch source changes**
+(hand-copied array → bank slot). This unifies boot and Program Change on one path.
+
+**Retire `fw/src/patch.rs`** — its hand-copied 512-byte image (A052 "Nice Lead") is just a row
+of the bank we now link; delete the array, its `pub mod patch`, and the `use …::PATCH` import.
+`mbsid_load_patch` / `mbsid_sys::load_patch` lose their firmware caller but are **kept**: the
+host oracle's bit-exact harness still loads raw 512-byte patches through that primitive.
 
 ---
 
@@ -119,9 +131,9 @@ redundant.
 - **Live re-patch while playing.** `updatePatch` wraps the engine swap in
   `MIOS32_IRQ_Disable`/`Enable` (atomic). Program Change is handled in the same firmware
   MIDI-drain context as note events, so no new concurrency is introduced.
-- **Boot sound.** At init the engine's `prevEngine` is already `SID_SE_LEAD`, so
-  `bankLoad(BOOT_INDEX)` with a Lead patch does `initPatch(patchOnly)`. Validation (§6) confirms
-  the boot patch still sounds identical to M2.
+- **Boot sound.** The new boot path is identical engine code to M2's (`copyToPatch` +
+  `updatePatch(false)`; see §3d), so the only change is the chosen patch (A124 "Crazy Lead").
+  Validation (§6) confirms the boot patch sounds correctly.
 
 ---
 
@@ -147,8 +159,9 @@ redundant.
    arm compile and route.
 4. **Build.** `pdm mbsid build` green; report post-route `sync` Fmax (expect unchanged — no
    gateware delta).
-5. **Hardware.** Send Program Change across several indices: the boot patch sounds as before,
-   and at least one *other* Lead index audibly changes timbre.
+5. **Hardware.** Boot plays A124 "Crazy Lead" (the new `BOOT_PATCH_INDEX = 123`); send Program
+   Change across several indices and confirm at least one *other* Lead index audibly changes
+   timbre.
 
 ---
 
