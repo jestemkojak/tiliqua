@@ -224,10 +224,13 @@ the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/
 
 ### Further deferred (no plan doc yet)
 
-- **Bassline / Drum / Multi engines.** Already compiled into `libmbsid.a` and dead-stripped
-  by `--gc-sections` (the engine aggregates them by value). Enabling is firmware UI/routing +
-  RAM budget, not new vendoring or freestanding-port work.
-- **Patch bank storage** (flash-resident banks; M1 loads a single boot patch).
+- **Bassline / Drum / Multi engines.** Already compiled into `libmbsid.a` and **linked**
+  (not dead-stripped — `MbSid::updatePatch` references them via `&mbSidSe*` + virtual
+  dispatch; 24–26 symbols each in the ELF). Enabling is firmware UI/routing + RAM budget,
+  not new vendoring or freestanding-port work.
+- **Patch bank storage.** Read-only ROM-baked factory bank **done** — see
+  `M3_PATCH_BANKS.md` (all 128 factory patches selectable over MIDI Program Change).
+  Writable user banks (flash) and a browse UI remain deferred.
 - **Wave-sequencer / full MBSID UI** (the macro_osc `opts`/`ui`/`draw` pattern is the model).
 - **ASID** (`MbSidAsid` — currently excluded from the Lead subset, §3).
 
