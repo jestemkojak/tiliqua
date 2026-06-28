@@ -179,7 +179,7 @@ fn main() -> ! {
     let mut timer = Timer0::new(peripherals.TIMER0, sysclk);
 
     // Bring up the engine and load the boot Lead patch so the SoC sounds from the
-    // first MIDI note (no UI patch-loading in M1). Reset the diff shadow so the
+    // first MIDI note (patch loaded via factory bank at BOOT_PATCH_INDEX). Reset the diff shadow so the
     // first tick streams the full power-on register image.
     mbsid_sys::init();
     mbsid_sys::program_change(BOOT_PATCH_INDEX);
