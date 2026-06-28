@@ -5,10 +5,11 @@
 extern "C" {
     fn mbsid_init();
     fn mbsid_load_patch(buf512: *const u8) -> i32;
-    fn mbsid_note_on(note: u8, vel: u8);
-    fn mbsid_note_off(note: u8);
-    fn mbsid_pitch_bend(bend14: u16);
-    fn mbsid_cc(cc: u8, val: u8);
+    fn mbsid_note_on(chn: u8, note: u8, vel: u8);
+    fn mbsid_note_off(chn: u8, note: u8);
+    fn mbsid_pitch_bend(chn: u8, bend14: u16);
+    fn mbsid_cc(chn: u8, cc: u8, val: u8);
+    fn mbsid_aftertouch(chn: u8, val: u8);
     fn mbsid_tick(speed_factor: u8) -> i32;
     fn mbsid_regs_l() -> *const u8;
     fn mbsid_regs_r() -> *const u8;
@@ -54,23 +55,28 @@ pub fn program_change(patch: u8) {
 }
 
 #[cfg(target_arch = "riscv32")]
-pub fn note_on(note: u8, vel: u8) {
-    unsafe { mbsid_note_on(note, vel) }
+pub fn note_on(chn: u8, note: u8, vel: u8) {
+    unsafe { mbsid_note_on(chn, note, vel) }
 }
 
 #[cfg(target_arch = "riscv32")]
-pub fn note_off(note: u8) {
-    unsafe { mbsid_note_off(note) }
+pub fn note_off(chn: u8, note: u8) {
+    unsafe { mbsid_note_off(chn, note) }
 }
 
 #[cfg(target_arch = "riscv32")]
-pub fn pitch_bend(bend14: u16) {
-    unsafe { mbsid_pitch_bend(bend14) }
+pub fn pitch_bend(chn: u8, bend14: u16) {
+    unsafe { mbsid_pitch_bend(chn, bend14) }
 }
 
 #[cfg(target_arch = "riscv32")]
-pub fn cc(cc: u8, val: u8) {
-    unsafe { mbsid_cc(cc, val) }
+pub fn cc(chn: u8, cc: u8, val: u8) {
+    unsafe { mbsid_cc(chn, cc, val) }
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn aftertouch(chn: u8, val: u8) {
+    unsafe { mbsid_aftertouch(chn, val) }
 }
 
 #[cfg(target_arch = "riscv32")]
@@ -112,16 +118,19 @@ pub fn load_patch(_buf: &[u8; 512]) -> bool { true }
 pub fn program_change(_patch: u8) {}
 
 #[cfg(not(target_arch = "riscv32"))]
-pub fn note_on(_note: u8, _vel: u8) {}
+pub fn note_on(_chn: u8, _note: u8, _vel: u8) {}
 
 #[cfg(not(target_arch = "riscv32"))]
-pub fn note_off(_note: u8) {}
+pub fn note_off(_chn: u8, _note: u8) {}
 
 #[cfg(not(target_arch = "riscv32"))]
-pub fn pitch_bend(_bend14: u16) {}
+pub fn pitch_bend(_chn: u8, _bend14: u16) {}
 
 #[cfg(not(target_arch = "riscv32"))]
-pub fn cc(_cc: u8, _val: u8) {}
+pub fn cc(_chn: u8, _cc: u8, _val: u8) {}
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn aftertouch(_chn: u8, _val: u8) {}
 
 #[cfg(not(target_arch = "riscv32"))]
 pub fn bank_count() -> u8 { 1 }

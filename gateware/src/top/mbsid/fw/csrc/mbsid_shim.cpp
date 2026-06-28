@@ -22,7 +22,6 @@ namespace {
     MbSidEnvironment env;       // .bss until its ctor runs (see mbsid_run_static_ctors)
     sid_regs_t       regL;      // .bss, zero-init
     sid_regs_t       regR;      // .bss, zero-init
-    const uint8_t    MIDI_CHN = 0;
 }
 
 /* Run every C++ static constructor (.init_array) exactly as a hosted libc would.
@@ -84,10 +83,11 @@ extern "C" void mbsid_bank_patch_name_get(uint8_t bank, uint8_t patch, char *buf
     env.bankPatchNameGet(bank, patch, buf17);
 }
 
-extern "C" void mbsid_note_on (uint8_t note, uint8_t vel) { env.mbSid[0].midiReceiveNote(MIDI_CHN, note, vel); }
-extern "C" void mbsid_note_off(uint8_t note)              { env.mbSid[0].midiReceiveNote(MIDI_CHN, note, 0); }
-extern "C" void mbsid_pitch_bend(uint16_t bend14)         { env.mbSid[0].midiReceivePitchBend(MIDI_CHN, bend14); }
-extern "C" void mbsid_cc(uint8_t cc, uint8_t val)         { env.mbSid[0].midiReceiveCC(MIDI_CHN, cc, val); }
+extern "C" void mbsid_note_on (uint8_t chn, uint8_t note, uint8_t vel) { env.mbSid[0].midiReceiveNote(chn, note, vel); }
+extern "C" void mbsid_note_off(uint8_t chn, uint8_t note)             { env.mbSid[0].midiReceiveNote(chn, note, 0); }
+extern "C" void mbsid_pitch_bend(uint8_t chn, uint16_t bend14)        { env.mbSid[0].midiReceivePitchBend(chn, bend14); }
+extern "C" void mbsid_cc(uint8_t chn, uint8_t cc, uint8_t val)        { env.mbSid[0].midiReceiveCC(chn, cc, val); }
+extern "C" void mbsid_aftertouch(uint8_t chn, uint8_t val)            { env.mbSid[0].midiReceiveAftertouch(chn, val); }
 
 extern "C" int  mbsid_tick(uint8_t /*speed_factor*/)      { return env.tick() ? 1 : 0; }
 extern "C" const uint8_t *mbsid_regs_l(void)              { return regL.ALL; }
