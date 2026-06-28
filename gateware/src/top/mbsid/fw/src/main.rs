@@ -212,6 +212,7 @@ fn main() -> ! {
         BLIT_MEM_BASE,
     );
     palette::ColorPalette::default().write_to_hardware(&mut display);
+    display.clear(HI8::BLACK).ok();
 
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
     persist.set_persistence(MENU_PERSIST);
@@ -226,14 +227,15 @@ fn main() -> ! {
         s.register(Interrupt::TIMER0, timer0);
         timer.enable_tick_isr(TIMER0_ISR_PERIOD_MS, pac::Interrupt::TIMER0);
 
+        let mut dirty = true; // draw once on startup
         loop {
             encoder.update();
             let ticks = encoder.poke_ticks();
             let pressed = encoder.poke_btn();
 
             let mut need_load = false;
-            if ticks != 0 { need_load |= state.on_turn(ticks); }
-            if pressed   { state.on_press(); }
+            if ticks != 0 { need_load |= state.on_turn(ticks); dirty = true; }
+            if pressed   { state.on_press(); dirty = true; }
 
             if need_load {
                 critical_section::with(|_cs| {
@@ -241,10 +243,13 @@ fn main() -> ! {
                 });
             }
 
-            let mut namebuf = [0u8; 17];
-            mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
-            let name = menu::name_from_cstr(&namebuf);
-            menu::draw(&mut display, &state, name, MENU_X, MENU_Y, MENU_HUE).ok();
+            if dirty {
+                let mut namebuf = [0u8; 17];
+                mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
+                let name = menu::name_from_cstr(&namebuf);
+                menu::draw(&mut display, &state, name, MENU_X, MENU_Y, MENU_HUE).ok();
+                dirty = false;
+            }
         }
     })
 }
