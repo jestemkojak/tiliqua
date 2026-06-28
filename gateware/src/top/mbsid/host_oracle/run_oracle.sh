@@ -88,16 +88,18 @@ fail=0
 for seq in "$HERE"/sequences/*.txt; do
     seqname="$(basename "$seq" .txt)"
     for row in "${PATCHES[@]}"; do
-        tmp="$BUILD/${seqname}_p${row}.seq"
-        { echo "0 patch $row"; cat "$seq"; } > "$tmp"
-        "$BUILD/oracle"      "$tmp" > "$BUILD/oracle.trace"
-        "$BUILD/shim_driver" "$tmp" > "$BUILD/shim.trace"
-        if diff -u "$BUILD/oracle.trace" "$BUILD/shim.trace"; then
-            echo "OK: $seqname patch=$row"
-        else
-            echo "DIFF: $seqname patch=$row"
-            fail=1
-        fi
+        for mode in patch pc; do
+            tmp="$BUILD/${seqname}_${mode}${row}.seq"
+            { echo "0 $mode $row"; cat "$seq"; } > "$tmp"
+            "$BUILD/oracle"      "$tmp" > "$BUILD/oracle.trace"
+            "$BUILD/shim_driver" "$tmp" > "$BUILD/shim.trace"
+            if diff -u "$BUILD/oracle.trace" "$BUILD/shim.trace"; then
+                echo "OK: $seqname $mode=$row"
+            else
+                echo "DIFF: $seqname $mode=$row"
+                fail=1
+            fi
+        done
     done
 done
 
