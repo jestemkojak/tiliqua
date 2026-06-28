@@ -1,4 +1,4 @@
-# seq_basic.txt — single-note gate on/off, repeated notes.
+# seq_lead_basic.txt — single-note gate on/off, repeated notes.
 # Format: <t_ms> event args   (see seq.h).  Patch row is supplied on the
 # command line by run_oracle.sh prepending a "0 patch <row>" line, so this
 # file deliberately omits the patch select.
