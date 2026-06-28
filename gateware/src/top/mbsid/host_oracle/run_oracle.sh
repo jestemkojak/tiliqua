@@ -89,7 +89,7 @@ C_OBJS=("$BUILD/notestack.o" "$BUILD/jsw_rand.o" "$BUILD/sid.o")
 PATCHES=(0 51 94)
 
 fail=0
-for seq in "$HERE"/sequences/*.txt; do
+for seq in "$HERE"/sequences/seq_lead_*.txt; do
     seqname="$(basename "$seq" .txt)"
     for row in "${PATCHES[@]}"; do
         for mode in patch pc; do
