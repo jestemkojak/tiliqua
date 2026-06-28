@@ -1,8 +1,8 @@
 /* shim_driver.cpp — the SHIM side of the Task-2 equivalence check.
  *
  * Drives the flat extern "C" mbsid_* ABI (fw/csrc/mbsid_shim.{h,cpp}) over the
- * SAME sequence and emits the SAME L-register trace.  If this diverges from
- * oracle.cpp the shim mis-wraps the engine — fix the shim, never the trace.
+ * SAME sequence and emits the SAME L- and R-register traces.  If this diverges
+ * from oracle.cpp the shim mis-wraps the engine — fix the shim, never the trace.
  *
  * mios32.h is included ONLY to obtain `u8` for the preset-bank .inc; the driver
  * itself touches no mios32 types — everything crosses via <stdint.h>.

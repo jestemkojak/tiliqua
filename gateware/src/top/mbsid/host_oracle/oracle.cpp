@@ -3,8 +3,8 @@
  * Instantiates the MBSID Lead engine EXACTLY as the JUCE PluginProcessor.cpp
  * does (mbSidEnvironment.mbSid[0].init(sid, &sidRegs[L], &sidRegs[R], &clock)),
  * drives the sequence through env.mbSid[0].midiReceive*, runs one env.tick()
- * per ms-step, and emits the changed L-register trace (the PluginProcessor
- * diff loop, L side only).  Uses the vendored engine source directly — NO shim.
+ * per ms-step, and emits the changed L- and R-register traces (the PluginProcessor
+ * diff loop, both sides).  Uses the vendored engine source directly — NO shim.
  */
 #include <mios32.h>
 #include "MbSidEnvironment.h"
