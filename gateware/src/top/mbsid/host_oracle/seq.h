@@ -5,7 +5,8 @@
  * difference is the Backend they hand to run_sequence().
  *
  * Sequence file format (one event per line, '#' comments and blanks ignored):
- *     <t_ms> patch <row>        select sid_bank_preset_0[row] (512-byte patch)
+ *     <t_ms> patch <row>        select sid_bank_preset_0[row] via sysexSetPatch
+ *     <t_ms> pc    <row>        select sid_bank_preset_0[row] via bankLoad (Program Change path)
  *     <t_ms> on    <note> <vel>
  *     <t_ms> off   <note>
  *     <t_ms> cc    <num> <val>
@@ -27,7 +28,7 @@
 
 struct SeqEvent {
     int t_ms;
-    enum Kind { PATCH, ON, OFF, CC, BEND, END } kind;
+    enum Kind { PATCH, PC, ON, OFF, CC, BEND, END } kind;
     int a;   // patch row / note / cc num / bend value
     int b;   // velocity / cc value
 };
@@ -49,6 +50,7 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
         if (n < 2) continue;  // blank / comment-only
         SeqEvent e; e.t_ms = t; e.a = a; e.b = b;
         if      (!strcmp(ev, "patch")) e.kind = SeqEvent::PATCH;
+        else if (!strcmp(ev, "pc"))    e.kind = SeqEvent::PC;
         else if (!strcmp(ev, "on"))    e.kind = SeqEvent::ON;
         else if (!strcmp(ev, "off"))   e.kind = SeqEvent::OFF;
         else if (!strcmp(ev, "cc"))    e.kind = SeqEvent::CC;
@@ -64,6 +66,7 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
 /* Backend concept (duck-typed):
  *   void          init();
  *   int           load_patch(int row);   // 0 = ok
+ *   int           program_change(int patch); // bankLoad(0,0,patch); 0 = ok
  *   void          note_on(int note, int vel);
  *   void          note_off(int note);
  *   void          cc(int num, int val);
@@ -97,6 +100,7 @@ static inline void run_sequence(const char *path, Backend &be, FILE *out) {
             const SeqEvent &e = evts[ei];
             switch (e.kind) {
             case SeqEvent::PATCH: be.load_patch(e.a);        break;
+            case SeqEvent::PC:    be.program_change(e.a);    break;
             case SeqEvent::ON:    be.note_on(e.a, e.b);      break;
             case SeqEvent::OFF:   be.note_off(e.a);          break;
             case SeqEvent::CC:    be.cc(e.a, e.b);           break;
