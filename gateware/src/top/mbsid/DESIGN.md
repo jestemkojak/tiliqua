@@ -224,10 +224,10 @@ the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/
 
 ### Further deferred (no plan doc yet)
 
-- **Bassline / Drum / Multi engines.** Already compiled into `libmbsid.a` and **linked**
-  (not dead-stripped — `MbSid::updatePatch` references them via `&mbSidSe*` + virtual
-  dispatch; 24–26 symbols each in the ELF). Enabling is firmware UI/routing + RAM budget,
-  not new vendoring or freestanding-port work.
+- **Bassline / Drum / Multi engines.** **Done** — all three are validated to the
+  oracle bit-exact bar across the 9 non-Lead factory patches, with real per-channel
+  MIDI input (Multi multi-timbral across both SIDs). See the all-engines milestone
+  spec/plan and `README.md` for the channel map.
 - **Patch bank storage.** Read-only ROM-baked factory bank **done** — see
   `M3_PATCH_BANKS.md` (all 128 factory patches selectable over MIDI Program Change).
   Writable user banks (flash) and a browse UI remain deferred.
