@@ -23,6 +23,7 @@ elif _src_root not in sys.path:
 
 from top.sid.top import SIDSoc
 from tiliqua.build.cli import top_level_cli
+from tiliqua.build.types import BitstreamHelp
 
 
 class MBSIDSoc(SIDSoc):
@@ -33,6 +34,12 @@ class MBSIDSoc(SIDSoc):
     default 0x4000 BRAM, leaving no room for the stack. Bump to 0x8000 (32 KB):
     ~16 KB .bss + ~16 KB stack. (M1 SoC-RAM risk, DESIGN.md §8.)
     """
+
+    bitstream_help = BitstreamHelp(
+        brief="MBSID Lead: dual SID stereo synth, MIDI in.",
+        io_left=['', '', '', '', 'L out', 'R out', 'L+R mix', 'L+R mix'],
+        io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
+    )
 
     def __init__(self, **kwargs):
         kwargs.setdefault("mainram_size", 0x8000)
