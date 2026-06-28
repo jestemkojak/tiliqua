@@ -16,6 +16,7 @@
 struct ShimBackend {
     void init()                      { mbsid_init(); }
     int  load_patch(int row)         { return mbsid_load_patch(sid_bank_preset_0[row]); }
+    int  program_change(int patch)   { mbsid_program_change((uint8_t)patch); return 0; }
     void note_on (int note, int vel) { mbsid_note_on((uint8_t)note, (uint8_t)vel); }
     void note_off(int note)          { mbsid_note_off((uint8_t)note); }
     void cc(int num, int val)        { mbsid_cc((uint8_t)num, (uint8_t)val); }

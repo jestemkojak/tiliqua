@@ -34,6 +34,7 @@ struct OracleBackend {
         memcpy(&p, sid_bank_preset_0[row], sizeof(p));
         return env.sysexSetPatch(/*sid*/0, &p, /*toBank*/false, 0, 0) ? 0 : -1;
     }
+    int program_change(int patch) { return env.bankLoad(/*sid*/0, /*bank*/0, (u8)patch); }
     void note_on (int note, int vel) { env.mbSid[0].midiReceiveNote(MIDI_CHN, (u8)note, (u8)vel); }
     void note_off(int note)          { env.mbSid[0].midiReceiveNote(MIDI_CHN, (u8)note, 0); }
     void cc(int num, int val)        { env.mbSid[0].midiReceiveCC(MIDI_CHN, (u8)num, (u8)val); }
