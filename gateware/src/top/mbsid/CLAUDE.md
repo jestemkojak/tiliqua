@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-06-27): M1 software pipeline implemented; hardware bring-up pending.**
-`DESIGN.md` is the approved M1 spec (authoritative for interfaces/milestones/acceptance).
+**Status (2026-06-28): M2 dual-SID implemented (Tasks 1–5 complete); Task 6 = hardware bring-up pending.**
+`DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 6/6
 bit-exact), host `cargo test --lib`, full bitstream build, `sync` Fmax 67.25 MHz PASS. The one
@@ -29,8 +29,8 @@ constructors don't auto-run on target. `fw/init_array.x` (wired in `build.rs`) e
 ## What this is
 
 Runs the **MBSID Lead** sound engine (mios32 `midibox_sid_v3` C++ core) on the VexiiRiscv
-softcore, FFI'd from the firmware Rust, driving **one** gateware reSID (mono) played live
-over MIDI. The C++ engine is the mandatory middle layer: zetaSID `.syx` patches are MBSID v2
+softcore, FFI'd from the firmware Rust, driving **two** gateware reSIDs (L/R stereo) played
+live over MIDI. The C++ engine is the mandatory middle layer: zetaSID `.syx` patches are MBSID v2
 voice descriptions with **zero** SID-register data — only the engine turns a patch into the
 per-tick `sid_regs_t` register image. See `DESIGN.md §1–2`.
 
@@ -45,9 +45,8 @@ Reference the base wiring before writing new code:
   drains by reading until 0); `Phi2Sel`.
 - `../sid/fw/src/main.rs` — the Timer0 ISR + MIDI-in drain pattern to copy. **Replace** its
   per-note `midi_note_to_sid_freq` voice logic with: feed MIDI events to the MBSID engine,
-  call `mbsid_tick`, diff `mbsid_regs_l()` against a 32-byte shadow, enqueue only changed
-  registers to `SIDPeripheral`. The L image is used; the R image is computed but discarded
-  (M1 mono-collapse decision, `DESIGN.md §2`).
+  call `mbsid_tick`, diff `mbsid_regs_l()` and `mbsid_regs_r()` against their 32-byte shadows,
+  enqueue only changed registers to `SIDPeripheral` (L) and `SIDPeripheral_R` (R) respectively.
 
 ## The register-write path (the whole point)
 
