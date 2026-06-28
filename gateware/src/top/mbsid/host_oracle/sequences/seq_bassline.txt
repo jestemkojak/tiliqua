@@ -1,0 +1,24 @@
+# seq_bassline.txt — Bassline engine: 4 MIDI voices. ch0 voices split at note
+# 60 (v0 < 60, v1 >= 60); ch1 likewise (v2 < 60, v3 >= 60). Hit all four zones.
+# Clock switches to MASTER at ~4099ms so the sequence runs until 5000ms.
+# Patch row prepended by run_oracle.sh as "0 <mode> <row>".
+10 ch 0
+10 on 40 100
+60 on 72 100
+120 ch 1
+120 on 45 110
+170 on 76 110
+300 ch 0
+300 cc 1 100
+350 off 40
+400 off 72
+450 ch 1
+450 off 45
+500 off 76
+# second pass: overlapping notes within a zone (notestack behaviour)
+600 ch 0
+600 on 36 90
+650 on 43 90
+800 off 43
+850 off 36
+5000 end

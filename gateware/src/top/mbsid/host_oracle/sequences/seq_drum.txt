@@ -1,0 +1,20 @@
+# seq_drum.txt — Drum engine: MIDI note selects the drum instrument (one MIDI
+# voice on ch0). Notes 63 (pattern 3) and 66 (pattern 6) produce activity in
+# all 4 factory drum patches (32-35). Clock switches to MASTER at ~4099ms so
+# the sequence runs until 4181ms (crash-safe upper bound found empirically).
+# Patch row prepended by run_oracle.sh as "0 <mode> <row>".
+10 ch 0
+10 on 63 127
+80 off 63
+100 on 66 127
+180 off 66
+200 on 63 100
+260 off 63
+280 on 66 100
+340 off 66
+# additional triggers to populate notestack
+400 on 61 90
+460 off 61
+480 on 66 110
+540 off 66
+4181 end
