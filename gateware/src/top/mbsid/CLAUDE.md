@@ -38,7 +38,7 @@ per-tick `sid_regs_t` register image. See `DESIGN.md §1–2`.
 
 The SoC is `top/sid`'s, unchanged: VexiiRiscv @ 60 MHz (`riscv32im`), `SIDPeripheral`,
 `Phi2Divider` (φ2 = 1 MHz), MIDI-in CSR FIFO, Timer0. **No CSR changes expected for M1**, so
-no PAC regen needed (if any CSR changes, `pdm sid build --pac-only` per the root CLAUDE.md).
+no PAC regen needed (if any CSR changes, `pdm sid build --pac-only` per the root CLAUDE.md). M2 added `SID_PERIPH_R` at `0x1200` — PAC already regenerated.
 Reference the base wiring before writing new code:
 - `../sid/top.py` — `SIDPeripheral` (`transaction_data` = `(data<<5)|addr`, 16-bit, depth-16
   FIFO, backpressure via `TxnStatus`/`writable`); `Phi2Divider`; `midi_read` CSR FIFO (firmware
@@ -52,9 +52,9 @@ Reference the base wiring before writing new code:
 
 ```
 MIDI in (midi_read CSR FIFO) ─► mbsid_note_on/off / pitch_bend / cc   (engine state)
-Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image
-           ─► Rust diffs L vs 32-byte shadow ─► changed regs (data<<5)|addr ─► SIDPeripheral
-           ─► reSID (φ2 = 1 MHz) ─► codec   [everything from the FIFO on is top/sid, reused]
+Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► RegDiff L ─► SIDPeripheral   ─► reSID0 ─► L output
+                                        └─► sid_regs_t R image ──► RegDiff R ─► SIDPeripheral_R ─► reSID1 ─► R output
+           [both changed as (data<<5)|addr; φ2 = 1 MHz each; everything from the FIFO on is top/sid, reused]
 ```
 
 ## Non-obvious gotchas for this port
@@ -85,7 +85,7 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image
   `sid_patch_t` layout — no re-encoding).
 - **Oracle validation is the keystone, runnable entirely on PC before any FPGA work.** Build
   the same `.cpp` + `mbsid_shim.cpp` for x86, run an identical `(patch, note-sequence)` through
-  both it and the instrumented JUCE port, diff the **L** register streams — must be
+  both it and the instrumented JUCE port, diff the **L and R** register streams — must be
   byte-identical on ≥3 Lead patches. Do this (`DESIGN.md §6`, milestone 1) before gateware.
 - **`mainram_size` is bumped to `0x8000`** (`MBSIDSoc` subclasses `SIDSoc` in `top.py`; sid's
   default is `0x4000`). The by-value engine aggregation lands ~6.9 KB `.bss` + needs stack room;
