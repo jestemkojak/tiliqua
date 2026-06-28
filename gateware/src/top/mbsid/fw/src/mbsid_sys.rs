@@ -23,6 +23,9 @@ pub fn init() {
 
 #[cfg(target_arch = "riscv32")]
 pub fn tick() -> bool {
+    // speed_factor=0: the arg is accepted by the shim ABI but ignored — the
+    // engine uses its internal updateSpeedFactor=2 set by MbSidEnvironment ctor.
+    // shim_driver.cpp passes 2 for documentation clarity; both are equivalent.
     unsafe { mbsid_tick(0) != 0 }
 }
 

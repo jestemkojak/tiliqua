@@ -540,8 +540,6 @@ class SIDSoc(TiliquaSoc):
             self.sid_periph_r.sid = sid_r
             m.d.comb += [self.sid_periph_r.ext_w_en.eq(0),
                          self.sid_periph_r.ext_w_data.eq(0)]
-
-        if self.n_sids > 1:
             # Stereo: SID0 mix -> LEFT, SID1 mix -> RIGHT. payload[2]/[3] carry
             # a voice tap per SID for optional debug (no scope consumer in mbsid).
             m.d.comb += [
@@ -561,6 +559,9 @@ class SIDSoc(TiliquaSoc):
             ]
 
         if self.with_scope:
+            # Note: when n_sids > 1, payload[3] fed to scope.i.payload[0] is a
+            # voice tap (SID_R voice0_dca), not the audio mix — scope ch0 shows
+            # a voice waveform rather than the mix output in stereo builds.
             m.d.comb += [
                 # TODO: we're actually overriding soc_en indirectly here because of the early elaboration.
                 # this signal should be split properly to avoid it.

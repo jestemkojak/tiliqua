@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 """
-MBSID-on-Tiliqua (M1): reuses top/sid's SoC verbatim (VexiiRiscv @ 60 MHz,
+MBSID-on-Tiliqua (M2): reuses top/sid's SoC verbatim (VexiiRiscv @ 60 MHz,
 SIDPeripheral, Phi2Divider, MIDI-in CSR FIFO, Timer0). The only delta is the
 firmware path — `path=this_path` points the firmware build at `mbsid/fw`, whose
 build.rs cross-compiles the MBSID v3 C++ engine and links it into the ELF.

@@ -1,4 +1,4 @@
-// main.rs — MBSID-on-Tiliqua M1 firmware (Task 5).
+// main.rs — MBSID-on-Tiliqua M2 dual-SID firmware (Tasks 5–6).
 //
 // A 1 kHz Timer0 ISR is the whole engine. Each 1 ms tick it:
 //   1. drains the SIDPeripheral MIDI-in CSR FIFO and feeds events to the MBSID
