@@ -130,13 +130,13 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             if let Ok(msg) = MidiMessage::try_parse_slice(&bytes) {
                 match msg {
                     // Note-on with non-zero velocity -> engine note on.
-                    MidiMessage::NoteOn(_, note, vel) if u8::from(vel) > 0 => {
-                        mbsid_sys::note_on(u8::from(note), u8::from(vel));
+                    MidiMessage::NoteOn(ch, note, vel) if u8::from(vel) > 0 => {
+                        mbsid_sys::note_on(u8::from(ch), u8::from(note), u8::from(vel));
                     }
                     // Note-on vel 0 (running-status note-off) or explicit note-off.
-                    MidiMessage::NoteOn(_, note, _) |
-                    MidiMessage::NoteOff(_, note, _) => {
-                        mbsid_sys::note_off(u8::from(note));
+                    MidiMessage::NoteOn(ch, note, _) |
+                    MidiMessage::NoteOff(ch, note, _) => {
+                        mbsid_sys::note_off(u8::from(ch), u8::from(note));
                     }
                     // Pitch bend: the engine wants the raw 14-bit MIDI value
                     // (msb<<7)|lsb, range 0..16383, center 8192 — exactly what
@@ -144,14 +144,18 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                     // midiReceivePitchBend(). We rebuild it from the raw data
                     // bytes (bytes[1]=LSB, bytes[2]=MSB) to avoid any signed/
                     // centered re-interpretation by midi-types' PitchBend type.
-                    MidiMessage::PitchBendChange(_, _) => {
+                    MidiMessage::PitchBendChange(ch, _) => {
                         let lsb = (bytes[1] & 0x7F) as u16;
                         let msb = (bytes[2] & 0x7F) as u16;
-                        mbsid_sys::pitch_bend((msb << 7) | lsb);
+                        mbsid_sys::pitch_bend(u8::from(ch), (msb << 7) | lsb);
                     }
                     // Control change -> engine CC.
-                    MidiMessage::ControlChange(_, ctrl, val) => {
-                        mbsid_sys::cc(u8::from(ctrl), u8::from(val));
+                    MidiMessage::ControlChange(ch, ctrl, val) => {
+                        mbsid_sys::cc(u8::from(ch), u8::from(ctrl), u8::from(val));
+                    }
+                    // Channel aftertouch -> engine aftertouch.
+                    MidiMessage::ChannelPressure(ch, val) => {
+                        mbsid_sys::aftertouch(u8::from(ch), u8::from(val));
                     }
                     // Program Change -> load factory bank patch N (0..127) via
                     // the engine bankLoad path. Accepted on any MIDI channel.

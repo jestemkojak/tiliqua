@@ -16,9 +16,9 @@ int main() {
     mbsid_init();
     for (int row = 0; row < 128; ++row) {
         mbsid_program_change((uint8_t)row);
-        mbsid_note_on(60, 100);
+        mbsid_note_on(0, 60, 100);
         for (int t = 0; t < 16; ++t) mbsid_tick(2);
-        mbsid_note_off(60);
+        mbsid_note_off(0, 60);
         for (int t = 0; t < 4; ++t)  mbsid_tick(2);
     }
     printf("SWEEP OK: 128 patches\n");
