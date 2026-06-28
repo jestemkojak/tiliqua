@@ -546,8 +546,10 @@ class SIDSoc(TiliquaSoc):
                 pmod0.i_cal.valid.eq(1),
                 pmod0.i_cal.payload[0].as_value().eq(self.sid_periph.last_audio_left>>8),
                 pmod0.i_cal.payload[1].as_value().eq(self.sid_periph_r.last_audio_left>>8),
-                pmod0.i_cal.payload[2].as_value().eq(self.sid_periph.voice0_dca_o),
-                pmod0.i_cal.payload[3].as_value().eq(self.sid_periph_r.voice0_dca_o),
+                pmod0.i_cal.payload[2].as_value().eq(
+                    (self.sid_periph.last_audio_left + self.sid_periph_r.last_audio_left) >> 9),
+                pmod0.i_cal.payload[3].as_value().eq(
+                    (self.sid_periph.last_audio_left + self.sid_periph_r.last_audio_left) >> 9),
             ]
         else:
             m.d.comb += [
