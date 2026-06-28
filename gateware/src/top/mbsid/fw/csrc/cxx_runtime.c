@@ -12,6 +12,39 @@
  */
 
 #include <stddef.h>
+#include <stdarg.h>
+
+/* sprintf — minimal implementation for bankPatchNameGet error strings.
+ * Supports only the formats actually used: %c (char) and %[0N]d (int).
+ * Only called on invalid-bank/invalid-patch error paths, never on the
+ * hot Lead register-write path. */
+int sprintf(char *buf, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char *p = buf;
+    for (; *fmt; fmt++) {
+        if (*fmt != '%') { *p++ = *fmt; continue; }
+        fmt++;
+        char pad = ' '; int width = 0;
+        if (*fmt == '0') { pad = '0'; fmt++; }
+        while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt++ - '0'); }
+        if (*fmt == 'c') {
+            *p++ = (char)va_arg(ap, int);
+        } else if (*fmt == 'd') {
+            int v = va_arg(ap, int);
+            char tmp[12]; int n = 0;
+            if (v < 0) { *p++ = '-'; v = -v; }
+            do { tmp[n++] = (char)('0' + (v % 10)); v /= 10; } while (v);
+            while (n < width) { tmp[n++] = pad; }
+            while (n > 0) { *p++ = tmp[--n]; }
+        } else if (*fmt == '%') {
+            *p++ = '%';
+        }
+    }
+    *p = 0;
+    va_end(ap);
+    return (int)(p - buf);
+}
 
 /* time() — no wall clock on the freestanding target; jsw_rand's jsw_time_seed()
  * is the only caller, so a constant yields a fixed, reproducible RNG seed. */
