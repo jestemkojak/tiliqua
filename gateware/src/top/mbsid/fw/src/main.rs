@@ -31,7 +31,6 @@ use tiliqua_hal as hal;
 
 use tiliqua_fw::mbsid_sys;
 use tiliqua_fw::regdiff::{RegDiff, WriteList};
-use tiliqua_fw::patch::PATCH;
 
 use midi_types::MidiMessage;
 use midi_convert::parse::MidiTryParseSlice;
@@ -44,6 +43,12 @@ hal::impl_tiliqua_soc_pac!();
 // engine every 1 ms, so a 1 ms ISR is the only apples-to-apples cadence. (Base
 // `top/sid` uses 5 ms — that is wrong for the engine; do not copy it.)
 pub const TIMER0_ISR_PERIOD_MS: u32 = 1;
+
+// Boot patch = factory bank slot loaded at power-on. 0-based slot index =
+// MIDI Program Change value = (patch number - 1). 123 = A124 "Crazy Lead".
+// MUST be a Lead-engine slot, or the synth boots with a wrong-sounding
+// non-Lead patch (the 9 non-Lead slots are 15, 32-35, 60, 98, 99, 106).
+const BOOT_PATCH_INDEX: u8 = 123;
 
 // Scoped TIMER0 interrupt + its dispatch from riscv-rt's DefaultHandler. This is
 // the minimal slice of `top/sid`'s handlers.rs we still need (no logger/UI).
@@ -137,6 +142,11 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                     MidiMessage::ControlChange(_, ctrl, val) => {
                         mbsid_sys::cc(u8::from(ctrl), u8::from(val));
                     }
+                    // Program Change -> load factory bank patch N (0..127) via
+                    // the engine bankLoad path. Accepted on any MIDI channel.
+                    MidiMessage::ProgramChange(_ch, prog) => {
+                        mbsid_sys::program_change(u8::from(prog));
+                    }
                     _ => {}
                 }
             }
@@ -172,7 +182,7 @@ fn main() -> ! {
     // first MIDI note (no UI patch-loading in M1). Reset the diff shadow so the
     // first tick streams the full power-on register image.
     mbsid_sys::init();
-    mbsid_sys::load_patch(&PATCH);
+    mbsid_sys::program_change(BOOT_PATCH_INDEX);
 
     let mut app = App::new();
     app.diff_l.reset();
