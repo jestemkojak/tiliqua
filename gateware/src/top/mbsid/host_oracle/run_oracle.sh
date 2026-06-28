@@ -75,6 +75,10 @@ C_OBJS=("$BUILD/notestack.o" "$BUILD/jsw_rand.o" "$BUILD/sid.o")
 "$CXX" $CXXFLAGS -c "$HERE/shim_driver.cpp" -o "$BUILD/shim_driver.o"
 "$CXX" $CXXFLAGS -c "$SHIM/mbsid_shim.cpp"  -o "$BUILD/mbsid_shim.o"
 
+# --- no-crash sweep driver (shim side only) ---
+"$CXX" $CXXFLAGS -c "$HERE/sweep_driver.cpp" -o "$BUILD/sweep_driver.o"
+"$CXX" $CXXFLAGS "$BUILD/sweep_driver.o" "$BUILD/mbsid_shim.o" "${ENGINE_OBJS[@]}" "${C_OBJS[@]}" "$BUILD/host_stubs.o" -o "$BUILD/sweep_driver"
+
 "$CXX" $CXXFLAGS "$BUILD/oracle.o"     "${ENGINE_OBJS[@]}" "${C_OBJS[@]}" "$BUILD/host_stubs.o" -o "$BUILD/oracle"
 "$CXX" $CXXFLAGS "$BUILD/shim_driver.o" "$BUILD/mbsid_shim.o" "${ENGINE_OBJS[@]}" "${C_OBJS[@]}" "$BUILD/host_stubs.o" -o "$BUILD/shim_driver"
 
@@ -102,5 +106,13 @@ for seq in "$HERE"/sequences/*.txt; do
         done
     done
 done
+
+echo "=== no-crash sweep (all 128 factory patches, incl. non-Lead) ==="
+if timeout 30 "$BUILD/sweep_driver"; then
+    echo "OK: no-crash sweep"
+else
+    echo "FAIL: no-crash sweep (crash or hang, exit $?)"
+    fail=1
+fi
 
 exit $fail
