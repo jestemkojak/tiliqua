@@ -107,6 +107,55 @@ for seq in "$HERE"/sequences/*.txt; do
     done
 done
 
+# --- non-Lead engine fixtures: "row:sequence" pairs (row = Program Change) ---
+#   Multi:    15 (A016), 60 (A061), 106 (A107)
+#   Bassline: 98 (A099), 99 (A100)
+#   Drum:     32-35 (A033-A036)
+NONLEAD=(
+    "15:seq_multi" "60:seq_multi" "106:seq_multi"
+    "98:seq_bassline" "99:seq_bassline"
+    "32:seq_drum" "33:seq_drum" "34:seq_drum" "35:seq_drum"
+)
+echo "=== non-Lead engines (Multi / Bassline / Drum), multi-channel ==="
+for pair in "${NONLEAD[@]}"; do
+    row="${pair%%:*}"; seqname="${pair##*:}"
+    seq="$HERE/sequences/${seqname}.txt"
+    for mode in patch pc; do
+        tmp="$BUILD/${seqname}_${row}_${mode}.seq"
+        { echo "0 $mode $row"; cat "$seq"; } > "$tmp"
+        "$BUILD/oracle"      "$tmp" > "$BUILD/oracle.trace"
+        "$BUILD/shim_driver" "$tmp" > "$BUILD/shim.trace"
+        if ! diff -u "$BUILD/oracle.trace" "$BUILD/shim.trace"; then
+            echo "DIFF: $seqname $mode=$row"; fail=1; continue
+        fi
+        # Non-triviality guard: a green diff of two near-empty traces proves
+        # nothing. Each non-Lead sequence must drive real register activity.
+        lines=$(wc -l < "$BUILD/oracle.trace")
+        if [ "$lines" -lt 40 ]; then
+            echo "TRIVIAL: $seqname $mode=$row produced only $lines reg writes (engine barely ran)"; fail=1
+        else
+            echo "OK: $seqname $mode=$row ($lines reg writes)"
+        fi
+    done
+done
+
+# --- Multi channel-routing differential: spread (ch0-5) vs collapsed (all ch0)
+#     must differ, or per-channel routing has no observable effect (the exact
+#     bug this milestone exists to rule out). Uses the oracle (engine) side.
+echo "=== Multi channel-routing differential ==="
+spread="$BUILD/multi_spread.seq"
+collapsed="$BUILD/multi_collapsed.seq"
+{ echo "0 patch 15"; cat "$HERE/sequences/seq_multi.txt"; } > "$spread"
+# collapse: rewrite every 'ch <n>' to 'ch 0'
+{ echo "0 patch 15"; sed -E 's/^([0-9]+ )ch [0-9]+/\1ch 0/' "$HERE/sequences/seq_multi.txt"; } > "$collapsed"
+"$BUILD/oracle" "$spread"    > "$BUILD/multi_spread.trace"
+"$BUILD/oracle" "$collapsed" > "$BUILD/multi_collapsed.trace"
+if diff -q "$BUILD/multi_spread.trace" "$BUILD/multi_collapsed.trace" >/dev/null; then
+    echo "FAIL: Multi spread==collapsed — channel routing has no effect!"; fail=1
+else
+    echo "OK: Multi channel routing is observable (spread != collapsed)"
+fi
+
 echo "=== no-crash sweep (all 128 factory patches, incl. non-Lead) ==="
 if timeout 30 "$BUILD/sweep_driver"; then
     echo "OK: no-crash sweep"
