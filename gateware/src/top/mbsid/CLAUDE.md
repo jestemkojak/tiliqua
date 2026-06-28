@@ -19,7 +19,7 @@ A fresh clone has no `mios32/`, so `pdm mbsid build` fails in `fw/build.rs`. Run
 (`--filter=blob:none`) and checks out the pinned commit
 `44d8e6af401e41a8adf2319ce6a584cce154a14f` into `./mios32` (idempotent).
 `fw/csrc/vendor_sources.txt` records the Lead-subset TUs (documentation only; build.rs globs
-the whole `core/` tree and drops dead code with `--gc-sections`).
+the whole `core/` tree and drops genuinely-unreferenced code with `--gc-sections`).
 
 **Static ctors:** riscv-rt never calls `__libc_init_array`, so the engine's global
 constructors don't auto-run on target. `fw/init_array.x` (wired in `build.rs`) exposes
@@ -74,8 +74,12 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **The Lead subset does NOT self-link.** `MbSid` aggregates the Bassline/Drum/Multi SEs +
   `MbSidAsid` **by value**, so `build.rs` compiles the **whole** `core/` + `components/` tree
   (every `*.cpp` except `app.cpp`) + `sid.c`/`notestack.c`/`jsw_rand.c`, then `-ffunction/
-  data-sections` + link `--gc-sections` drop the dead non-Lead code. `vendor_sources.txt` is
-  now documentation only (build.rs globs, doesn't read it).
+  data-sections` + link `--gc-sections` drop genuinely-unreferenced
+  code (`app.cpp`, the SysEx-ACK/`sprintf` paths, `MbSidAsid`). NOTE: the Bassline/Drum/
+  Multi SEs are **not** dropped — `MbSid::updatePatch` references them via `&mbSidSe*`
+  + virtual dispatch, so they stay linked (verified: 24–26 symbols each in the ELF).
+  This is why loading a non-Lead patch is crash-safe (it dispatches to a real engine).
+  `vendor_sources.txt` is now documentation only (build.rs globs, doesn't read it).
 - **Static ctors don't auto-run** — see the "Static ctors" note above. `mbsid_run_static_ctors()`
   (walks `.init_array` via `fw/init_array.x`) is the reason the engine's speed-factor + RNG seed
   actually get applied on target. The host oracle CANNOT catch this (host libc runs ctors).
