@@ -1,5 +1,15 @@
 //! Minimal patch-browser menu: host-pure state machine + cstr helper + draw.
 
+use tiliqua_hal::embedded_graphics::{
+    mono_font::{ascii::FONT_9X15, MonoTextStyle},
+    primitives::{PrimitiveStyleBuilder, Rectangle},
+    text::Text,
+    prelude::*,
+};
+use tiliqua_lib::color::HI8;
+use heapless::String;
+use core::fmt::Write;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Row { Bank, Program }
 
@@ -69,6 +79,63 @@ impl MenuState {
 pub fn name_from_cstr(buf: &[u8; 17]) -> &str {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(16);
     core::str::from_utf8(&buf[..end]).unwrap_or("?")
+}
+
+/// Width/height of the menu's opaque background box, in pixels.
+const MENU_W: u32 = 380;
+const MENU_H: u32 = 96;
+const ROW_DY: i32 = 24; // vertical spacing between rows
+
+/// Draw the menu into its own opaque box at (pos_x, pos_y). `name` is the
+/// 16-char patch name for the current (bank, program).
+pub fn draw<D>(d: &mut D, st: &MenuState, name: &str,
+               pos_x: i32, pos_y: i32, hue: u8) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = HI8>,
+{
+    // Opaque background so old text never bleeds through under high persistence.
+    let bg = PrimitiveStyleBuilder::new().fill_color(HI8::new(0, 0)).build();
+    Rectangle::new(Point::new(pos_x - 10, pos_y - 18), Size::new(MENU_W, MENU_H))
+        .into_styled(bg)
+        .draw(d)?;
+
+    let dim    = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 9));
+    let bright = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 15));
+
+    // Title.
+    Text::new("MBSID", Point::new(pos_x, pos_y), bright).draw(d)?;
+
+    // Row helper: marker depends on focus/mode; value is bright when focused.
+    let mut line: String<48> = String::new();
+
+    // Bank row.
+    let bank_focused = st.focus == Row::Bank;
+    let marker = row_marker(st, Row::Bank);
+    line.clear();
+    let _ = write!(line, "{} Bank     {}", marker, (b'A' + st.bank) as char);
+    let style = if bank_focused { bright } else { dim };
+    Text::new(&line, Point::new(pos_x, pos_y + ROW_DY), style).draw(d)?;
+
+    // Program row (with the patch name).
+    let prog_focused = st.focus == Row::Program;
+    let marker = row_marker(st, Row::Program);
+    line.clear();
+    let _ = write!(line, "{} Program  {:03}  {}", marker, st.program, name);
+    let style = if prog_focused { bright } else { dim };
+    Text::new(&line, Point::new(pos_x, pos_y + 2 * ROW_DY), style).draw(d)?;
+
+    Ok(())
+}
+
+#[inline]
+fn row_marker(st: &MenuState, row: Row) -> char {
+    if st.focus != row {
+        ' '
+    } else if st.mode == Mode::Edit {
+        '#' // editing this row
+    } else {
+        '>' // navigation cursor
+    }
 }
 
 #[cfg(test)]
