@@ -1,0 +1,36 @@
+# seq_multi.txt — Multi engine: one sustained note per MIDI voice, channels
+# 0..5 (wire) = MIDI ch 1..6. Voices 0-2 -> Left SID osc 1-3, 3-5 -> Right SID.
+# Patch row prepended by run_oracle.sh as "0 <mode> <row>".
+10 ch 0
+10 on 48 100
+40 ch 1
+40 on 52 100
+70 ch 2
+70 on 55 100
+100 ch 3
+100 on 60 100
+130 ch 4
+130 on 64 100
+160 ch 5
+160 on 67 100
+# modulate one voice to exercise CC + aftertouch routing on a non-zero channel
+300 ch 3
+300 cc 1 64
+350 at 80
+400 cc 1 127
+500 bend 10000
+600 bend 8192
+# release all, staggered
+800 ch 0
+800 off 48
+840 ch 1
+840 off 52
+880 ch 2
+880 off 55
+920 ch 3
+920 off 60
+960 ch 4
+960 off 64
+1000 ch 5
+1000 off 67
+1200 end
