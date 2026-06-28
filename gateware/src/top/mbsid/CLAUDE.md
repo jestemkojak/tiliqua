@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-06-28): M2 dual-SID implemented (Tasks 1–5 complete); M3 factory patch bank done (MIDI PC → 128 patches); Task 6 = hardware bring-up pending.**
+**Status (2026-06-28): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); hardware bring-up pending.**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
-(`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 6/6
-bit-exact), host `cargo test --lib`, full bitstream build, `sync` Fmax 67.25 MHz PASS. The one
-thing NOT yet validated is **playback on real hardware** (DESIGN §7 milestones 2–3).
+(`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
+Multi differential + 128-patch sweep), host `cargo test --lib`, full bitstream build, `sync`
+Fmax 68.27 MHz PASS. The one thing NOT yet validated is **playback on real hardware** (DESIGN §7
+milestones 2–3).
 
 ## Vendored engine (not in this repo)
 
@@ -94,6 +95,14 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **`mainram_size` is bumped to `0x8000`** (`MBSIDSoc` subclasses `SIDSoc` in `top.py`; sid's
   default is `0x4000`). The by-value engine aggregation lands ~6.9 KB `.bss` + needs stack room;
   measured `.bss` 6884 B + stack 25880 B fits 0x8000. If you add firmware state, watch RAM.
+- **All four engines are validated** (oracle bit-exact, all 9 non-Lead factory
+  patches + Lead). The firmware forwards the **real MIDI channel** (not hardcoded
+  0): each engine routes notes per its fixed `updatePatch` channel map — Lead/Drum
+  on ch 1, Bassline on ch 1–2 (split @ note 60), Multi on ch 1–6 (ch 1–3 → Left
+  SID, ch 4–6 → Right SID). Channel aftertouch is forwarded via `mbsid_aftertouch`.
+  The shim MIDI ABI takes `chn` as its first arg — change it and ALL callers
+  (Rust FFI + both oracle drivers) together (extern "C", no mangling guard).
+- **Drum engine SIGSEGV at t≈4182ms (MASTER clock mode):** `MbSidWtDrum::tick()` dereferences a sentinel pointer `(MbSidDrum*)1` roughly 4.18s after loading a Drum patch with no external MIDI clock. The oracle sequences end before this window; on hardware, use an external MIDI clock or trigger reload before 4s. See `.scratch/mbsid-drum-sigsegv/issue.md`.
 - **GPL.** Linking the MBSID C++ into the firmware makes the distributed bitstream firmware
   GPL (fine for personal/open use).
 
@@ -106,5 +115,7 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - Host firmware tests: `cd fw && cargo test --target x86_64-unknown-linux-gnu --lib` (the
   `riscv32` FFI is cfg-stubbed on host; `regdiff` is host-pure).
 - **Oracle (the keystone):** `host_oracle/run_oracle.sh` — builds the engine + shim for x86 and
-  diffs the L register stream of `oracle` vs `shim_driver` across 3 Lead presets × 2 sequences;
-  must be 6/6 byte-identical. Re-run after any change to the shim, facade, or engine subset.
+  diffs register streams of `oracle` vs `shim_driver` across all four engines (Lead × 3 presets × 2
+  sequences, plus Multi × 3, Bassline × 2, Drum × 4, multi-channel differential, and a 128-patch
+  no-crash sweep); must be 28/28 OK + differential + sweep. Re-run after any change to the shim,
+  facade, or engine subset.
