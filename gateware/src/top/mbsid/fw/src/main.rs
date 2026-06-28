@@ -35,6 +35,12 @@ use tiliqua_fw::regdiff::{RegDiff, WriteList};
 use midi_types::MidiMessage;
 use midi_convert::parse::MidiTryParseSlice;
 
+use tiliqua_lib::{bootinfo, palette};
+use tiliqua_hal::encoder::Encoder;
+use tiliqua_hal::persist::Persist;
+use pac::constants::*;
+use tiliqua_fw::menu::{self, MenuState};
+
 // Generates Serial0/Timer0/etc. for this (binary-only) crate. Kept out of lib.rs
 // so the host `cargo test --lib` build stays pure-Rust (no pac/hal on x86_64).
 hal::impl_tiliqua_soc_pac!();
@@ -49,6 +55,11 @@ pub const TIMER0_ISR_PERIOD_MS: u32 = 1;
 // MUST be a Lead-engine slot, or the synth boots with a wrong-sounding
 // non-Lead patch (the 9 non-Lead slots are 15, 32-35, 60, 98, 99, 106).
 const BOOT_PATCH_INDEX: u8 = 123;
+
+const MENU_X: i32 = 60;
+const MENU_Y: i32 = 80;
+const MENU_HUE: u8 = 10;
+const MENU_PERSIST: u8 = 80;
 
 // Scoped TIMER0 interrupt + its dispatch from riscv-rt's DefaultHandler. This is
 // the minimal slice of `top/sid`'s handlers.rs we still need (no logger/UI).
@@ -178,9 +189,7 @@ fn main() -> ! {
     let sysclk = pac::clock::sysclk();
     let mut timer = Timer0::new(peripherals.TIMER0, sysclk);
 
-    // Bring up the engine and load the boot Lead patch so the SoC sounds from the
-    // first MIDI note (patch loaded via factory bank at BOOT_PATCH_INDEX). Reset the diff shadow so the
-    // first tick streams the full power-on register image.
+    // Engine bring-up + boot patch (unchanged).
     mbsid_sys::init();
     mbsid_sys::program_change(BOOT_PATCH_INDEX);
 
@@ -189,8 +198,27 @@ fn main() -> ! {
     app.diff_r.reset();
     let app = Mutex::new(RefCell::new(app));
 
-    // MIDI source: TRS-in by default (M1). The SIDPeripheral USB-MIDI host stays
-    // disabled at reset, so no extra config is needed for the TRS path.
+    // --- Display init ---
+    let bootinfo = unsafe { bootinfo::BootInfo::from_addr(BOOTINFO_BASE) }.unwrap();
+    let modeline = bootinfo.modeline.maybe_override_fixed(FIXED_MODELINE, CLOCK_DVI_HZ);
+    let mut display = DMAFramebuffer0::new(
+        peripherals.FRAMEBUFFER_PERIPH,
+        peripherals.PALETTE_PERIPH,
+        peripherals.BLIT,
+        peripherals.PIXEL_PLOT,
+        peripherals.LINE,
+        PSRAM_FB_BASE,
+        modeline,
+        BLIT_MEM_BASE,
+    );
+    palette::ColorPalette::default().write_to_hardware(&mut display);
+
+    let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
+    persist.set_persistence(MENU_PERSIST);
+
+    let mut encoder = Encoder0::new(peripherals.ENCODER0);
+
+    let mut state = MenuState::new(mbsid_sys::bank_count(), 0, BOOT_PATCH_INDEX);
 
     handler!(timer0 = || timer0_handler(&app));
 
@@ -198,9 +226,25 @@ fn main() -> ! {
         s.register(Interrupt::TIMER0, timer0);
         timer.enable_tick_isr(TIMER0_ISR_PERIOD_MS, pac::Interrupt::TIMER0);
 
-        // All work happens in the ISR; idle the core between ticks.
         loop {
-            unsafe { riscv::asm::wfi(); }
+            encoder.update();
+            let ticks = encoder.poke_ticks();
+            let pressed = encoder.poke_btn();
+
+            let mut need_load = false;
+            if ticks != 0 { need_load |= state.on_turn(ticks); }
+            if pressed   { state.on_press(); }
+
+            if need_load {
+                critical_section::with(|_cs| {
+                    mbsid_sys::bank_load(state.bank, state.program);
+                });
+            }
+
+            let mut namebuf = [0u8; 17];
+            mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
+            let name = menu::name_from_cstr(&namebuf);
+            menu::draw(&mut display, &state, name, MENU_X, MENU_Y, MENU_HUE).ok();
         }
     })
 }
