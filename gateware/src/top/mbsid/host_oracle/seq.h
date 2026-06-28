@@ -11,6 +11,8 @@
  *     <t_ms> off   <note>
  *     <t_ms> cc    <num> <val>
  *     <t_ms> bend  <val14>      0..16383, 8192 = centre
+ *     <t_ms> ch    <chn>         set current MIDI channel (sticky, default 0)
+ *     <t_ms> at    <val>         channel aftertouch on current channel
  *     <t_ms> end                stop the loop after this ms-tick
  *
  * Trace format emitted: "<t_ms> <L|R> <reg> <hexval>\n" for every changed
@@ -28,7 +30,7 @@
 
 struct SeqEvent {
     int t_ms;
-    enum Kind { PATCH, PC, ON, OFF, CC, BEND, END } kind;
+    enum Kind { PATCH, PC, ON, OFF, CC, BEND, AT, CH, END } kind;
     int a;   // patch row / note / cc num / bend value
     int b;   // velocity / cc value
 };
@@ -55,6 +57,8 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
         else if (!strcmp(ev, "off"))   e.kind = SeqEvent::OFF;
         else if (!strcmp(ev, "cc"))    e.kind = SeqEvent::CC;
         else if (!strcmp(ev, "bend"))  e.kind = SeqEvent::BEND;
+        else if (!strcmp(ev, "at"))    e.kind = SeqEvent::AT;
+        else if (!strcmp(ev, "ch"))    e.kind = SeqEvent::CH;
         else if (!strcmp(ev, "end"))   e.kind = SeqEvent::END;
         else { fprintf(stderr, "seq_parse: %s:%d unknown event '%s'\n", path, lineno, ev); exit(2); }
         evts.push_back(e);
@@ -67,10 +71,11 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
  *   void          init();
  *   int           load_patch(int row);   // 0 = ok
  *   int           program_change(int patch); // bankLoad(0,0,patch); 0 = ok
- *   void          note_on(int note, int vel);
- *   void          note_off(int note);
- *   void          cc(int num, int val);
- *   void          bend(int val14);
+ *   void          note_on(int chn, int note, int vel);
+ *   void          note_off(int chn, int note);
+ *   void          cc(int chn, int num, int val);
+ *   void          bend(int chn, int val14);
+ *   void          aftertouch(int chn, int val);
  *   int           tick();                 // advance one ms
  *   const uint8_t *regs();                // 32-byte L image
  *   const uint8_t *regs_r();              // 32-byte R image
@@ -91,6 +96,7 @@ static inline void run_sequence(const char *path, Backend &be, FILE *out) {
     unsigned char shadow_r[32];
     memset(shadow_l, 0, sizeof(shadow_l));
     memset(shadow_r, 0, sizeof(shadow_r));
+    int cur_chn = 0;
 
     size_t ei = 0;
     for (int t = 0; t <= last_t; ++t) {
@@ -99,13 +105,15 @@ static inline void run_sequence(const char *path, Backend &be, FILE *out) {
         for (; ei < evts.size() && evts[ei].t_ms == t; ++ei) {
             const SeqEvent &e = evts[ei];
             switch (e.kind) {
-            case SeqEvent::PATCH: be.load_patch(e.a);        break;
-            case SeqEvent::PC:    be.program_change(e.a);    break;
-            case SeqEvent::ON:    be.note_on(e.a, e.b);      break;
-            case SeqEvent::OFF:   be.note_off(e.a);          break;
-            case SeqEvent::CC:    be.cc(e.a, e.b);           break;
-            case SeqEvent::BEND:  be.bend(e.a);              break;
-            case SeqEvent::END:   stop = true;               break;
+            case SeqEvent::PATCH: be.load_patch(e.a);              break;
+            case SeqEvent::PC:    be.program_change(e.a);          break;
+            case SeqEvent::CH:    cur_chn = e.a;                   break;
+            case SeqEvent::ON:    be.note_on(cur_chn, e.a, e.b);   break;
+            case SeqEvent::OFF:   be.note_off(cur_chn, e.a);       break;
+            case SeqEvent::CC:    be.cc(cur_chn, e.a, e.b);        break;
+            case SeqEvent::BEND:  be.bend(cur_chn, e.a);           break;
+            case SeqEvent::AT:    be.aftertouch(cur_chn, e.a);     break;
+            case SeqEvent::END:   stop = true;                     break;
             }
         }
         // one engine tick per ms (1 kHz control rate)
