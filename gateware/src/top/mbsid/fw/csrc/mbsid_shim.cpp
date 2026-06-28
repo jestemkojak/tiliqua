@@ -62,6 +62,28 @@ extern "C" void mbsid_program_change(uint8_t patch) {
     env.bankLoad(/*sid*/0, /*bank*/0, patch & 0x7F);
 }
 
+// Number of valid banks. SID_BANK_NUM is private to MbSidEnvironment.cpp, so
+// probe via the side-effect-free bankPatchNameGet (returns <0 on invalid bank).
+extern "C" uint8_t mbsid_bank_count(void) {
+    char tmp[20];
+    uint8_t n = 0;
+    while (n < 255 && env.bankPatchNameGet(n, /*patch*/0, tmp) >= 0)
+        ++n;
+    return n;
+}
+
+// Bank-aware load (generalizes the bank-0-only mbsid_program_change). Returns
+// the engine bankLoad status (0 = ok). Mutates engine state (updatePatch): the
+// Rust caller MUST guard this with a critical section vs the 1 kHz tick ISR.
+extern "C" int mbsid_bank_load(uint8_t bank, uint8_t patch) {
+    return env.bankLoad(/*sid*/0, bank, patch);
+}
+
+// Fill buf17 (>=17 bytes) with the 16-char patch name + NUL. Read-only.
+extern "C" void mbsid_bank_patch_name_get(uint8_t bank, uint8_t patch, char *buf17) {
+    env.bankPatchNameGet(bank, patch, buf17);
+}
+
 extern "C" void mbsid_note_on (uint8_t note, uint8_t vel) { env.mbSid[0].midiReceiveNote(MIDI_CHN, note, vel); }
 extern "C" void mbsid_note_off(uint8_t note)              { env.mbSid[0].midiReceiveNote(MIDI_CHN, note, 0); }
 extern "C" void mbsid_pitch_bend(uint16_t bend14)         { env.mbSid[0].midiReceivePitchBend(MIDI_CHN, bend14); }

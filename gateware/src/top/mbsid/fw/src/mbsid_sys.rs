@@ -13,6 +13,9 @@ extern "C" {
     fn mbsid_regs_l() -> *const u8;
     fn mbsid_regs_r() -> *const u8;
     fn mbsid_program_change(patch: u8);
+    fn mbsid_bank_count() -> u8;
+    fn mbsid_bank_load(bank: u8, patch: u8) -> i32;
+    fn mbsid_bank_patch_name_get(bank: u8, patch: u8, buf: *mut core::ffi::c_char);
 }
 
 // --- safe wrappers (riscv32 target) ---
@@ -70,6 +73,21 @@ pub fn cc(cc: u8, val: u8) {
     unsafe { mbsid_cc(cc, val) }
 }
 
+#[cfg(target_arch = "riscv32")]
+pub fn bank_count() -> u8 {
+    unsafe { mbsid_bank_count() }
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn bank_load(bank: u8, patch: u8) -> bool {
+    unsafe { mbsid_bank_load(bank, patch) == 0 }
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn bank_patch_name(bank: u8, patch: u8, buf: &mut [u8; 17]) {
+    unsafe { mbsid_bank_patch_name_get(bank, patch, buf.as_mut_ptr() as *mut core::ffi::c_char) }
+}
+
 // --- host stubs (non-riscv32, e.g. x86_64 for cargo test --lib) ---
 
 #[cfg(not(target_arch = "riscv32"))]
@@ -104,3 +122,31 @@ pub fn pitch_bend(_bend14: u16) {}
 
 #[cfg(not(target_arch = "riscv32"))]
 pub fn cc(_cc: u8, _val: u8) {}
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn bank_count() -> u8 { 1 }
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn bank_load(_bank: u8, _patch: u8) -> bool { true }
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn bank_patch_name(_bank: u8, _patch: u8, buf: &mut [u8; 17]) {
+    // Deterministic placeholder for host tests/builds.
+    let name = b"HOST STUB PATCH\0";
+    buf[..name.len()].copy_from_slice(name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_stubs_are_sane() {
+        assert!(bank_count() >= 1);
+        assert!(bank_load(0, 0));
+        let mut buf = [0u8; 17];
+        bank_patch_name(0, 0, &mut buf);
+        assert!(buf.iter().any(|&c| c != 0), "name stub must be non-empty");
+        assert_eq!(buf[16], 0, "buffer must stay NUL-terminated");
+    }
+}
