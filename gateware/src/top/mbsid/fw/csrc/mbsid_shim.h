@@ -18,6 +18,8 @@ void           mbsid_program_change(uint8_t patch);     /* load factory bank slo
 uint8_t        mbsid_bank_count(void);                   /* number of valid banks (>=1) */
 int            mbsid_bank_load(uint8_t bank, uint8_t patch);            /* 0 = ok */
 void           mbsid_bank_patch_name_get(uint8_t bank, uint8_t patch, char *buf17); /* 16 chars + NUL */
+int            mbsid_bank_patch_info(uint8_t bank, uint8_t patch,
+                                     uint8_t *engine_out, uint8_t *vflags_out); /* 0 = ok, -1 = bad index */
 void           mbsid_note_on (uint8_t chn, uint8_t note, uint8_t vel);
 void           mbsid_note_off(uint8_t chn, uint8_t note);
 void           mbsid_pitch_bend(uint8_t chn, uint16_t bend14);
