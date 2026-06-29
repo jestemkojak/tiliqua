@@ -118,12 +118,13 @@ pub fn name_from_cstr(buf: &[u8; 17]) -> &str {
 
 /// Width/height of the menu's opaque background box, in pixels.
 const MENU_W: u32 = 380;
-const MENU_H: u32 = 96;
+const MENU_H: u32 = 120;
 const ROW_DY: i32 = 24; // vertical spacing between rows
 
 /// Draw the menu into its own opaque box at (pos_x, pos_y). `name` is the
 /// 16-char patch name for the current (bank, program).
 pub fn draw<D>(d: &mut D, st: &MenuState, name: &str,
+               engine: Engine, voice_mode: Option<VoiceMode>,
                pos_x: i32, pos_y: i32, hue: u8) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = HI8>,
@@ -158,6 +159,18 @@ where
     let _ = write!(line, "{} Program  {:03}  {}", marker, st.program, name);
     let style = if prog_focused { bright } else { dim };
     Text::new(&line, Point::new(pos_x, pos_y + 2 * ROW_DY), style).draw(d)?;
+
+    // Detail row: engine label + voice mode (Lead only) + channel map.
+    line.clear();
+    match voice_mode {
+        Some(vm) => {
+            let _ = write!(line, "  {} {}  {}", engine.label(), vm.label(), engine.ch_map());
+        }
+        None => {
+            let _ = write!(line, "  {}  {}", engine.label(), engine.ch_map());
+        }
+    }
+    Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), dim).draw(d)?;
 
     Ok(())
 }
