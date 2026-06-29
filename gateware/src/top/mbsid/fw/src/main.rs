@@ -251,7 +251,21 @@ fn main() -> ! {
                 let mut namebuf = [0u8; 17];
                 mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
                 let name = menu::name_from_cstr(&namebuf);
-                menu::draw(&mut display, &state, name, MENU_X, MENU_Y, MENU_HUE).ok();
+                // Fetch engine type + voice flags from the ROM bank (read-only, no ISR guard needed).
+                let (engine, voice_mode) = match mbsid_sys::bank_patch_info(state.bank, state.program) {
+                    Some((eng, vfl)) => {
+                        let e = menu::Engine::from_byte(eng);
+                        // voice_mode is only meaningful for Lead; other engines hide it.
+                        let vm = if e == menu::Engine::Lead {
+                            Some(menu::VoiceMode::from_vflags(vfl))
+                        } else {
+                            None
+                        };
+                        (e, vm)
+                    }
+                    None => (menu::Engine::Lead, None),
+                };
+                menu::draw(&mut display, &state, name, engine, voice_mode, MENU_X, MENU_Y, MENU_HUE).ok();
                 dirty = false;
             }
         }
