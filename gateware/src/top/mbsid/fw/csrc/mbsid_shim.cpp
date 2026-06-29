@@ -22,6 +22,7 @@ namespace {
     MbSidEnvironment env;       // .bss until its ctor runs (see mbsid_run_static_ctors)
     sid_regs_t       regL;      // .bss, zero-init
     sid_regs_t       regR;      // .bss, zero-init
+    struct { uint8_t bank, patch, engine, vflags; bool valid; } g_patch_cache = {};
 }
 
 /* Run every C++ static constructor (.init_array) exactly as a hosted libc would.
@@ -54,11 +55,8 @@ extern "C" int mbsid_load_patch(const uint8_t *buf512) {
 }
 
 extern "C" void mbsid_program_change(uint8_t patch) {
-    // Load factory bank slot patch&0x7F (0..127) via the engine's native bank
-    // path. Referencing bankLoad un-strips sid_bank_preset_0 (the 64 KB factory
-    // bank) and the bank code. bankLoad internally clamps bank>=SID_BANK_NUM and
-    // patch>=128; the mask makes every MIDI Program Change value map 1:1.
-    env.bankLoad(/*sid*/0, /*bank*/0, patch & 0x7F);
+    // Route through mbsid_bank_load so the patch cache is updated.
+    mbsid_bank_load(/*bank*/0, patch & 0x7F);
 }
 
 // Number of valid banks. SID_BANK_NUM is private to MbSidEnvironment.cpp, so
@@ -74,8 +72,30 @@ extern "C" uint8_t mbsid_bank_count(void) {
 // Bank-aware load (generalizes the bank-0-only mbsid_program_change). Returns
 // the engine bankLoad status (0 = ok). Mutates engine state (updatePatch): the
 // Rust caller MUST guard this with a critical section vs the 1 kHz tick ISR.
+// Also caches engine type and voice-flags from the loaded patch so that
+// mbsid_bank_patch_info() can answer without touching sid_bank_preset_0
+// (which has internal linkage in MbSidEnvironment.cpp).
 extern "C" int mbsid_bank_load(uint8_t bank, uint8_t patch) {
-    return env.bankLoad(/*sid*/0, bank, patch);
+    int r = env.bankLoad(/*sid*/0, bank, patch);
+    if (r == 0) {
+        const uint8_t *raw = (const uint8_t *)&env.mbSid[0].mbSidPatch.body;
+        g_patch_cache = { bank, patch, raw[0x10], raw[0x50], true };
+    }
+    return r;
+}
+
+// Read engine type (byte 0x10) and voice-flags (byte 0x50) from the last
+// successfully loaded patch. Returns 0 on success, -1 if the requested
+// bank/patch was not the last loaded patch (or no patch has been loaded).
+// Safe to call read-only at any time (does not mutate engine state).
+extern "C" int mbsid_bank_patch_info(uint8_t bank, uint8_t patch,
+                                      uint8_t *engine_out, uint8_t *vflags_out) {
+    if (bank >= 1 || patch >= 128) return -1;
+    if (!g_patch_cache.valid ||
+        g_patch_cache.bank != bank || g_patch_cache.patch != patch) return -1;
+    *engine_out = g_patch_cache.engine;
+    *vflags_out = g_patch_cache.vflags;
+    return 0;
 }
 
 // Fill buf17 (>=17 bytes) with the 16-char patch name + NUL. Read-only.
