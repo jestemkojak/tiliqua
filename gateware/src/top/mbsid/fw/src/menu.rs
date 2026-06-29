@@ -11,6 +11,41 @@ use heapless::String;
 use core::fmt::Write;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Engine { Lead, Bassline, Drum, Multi }
+
+impl Engine {
+    pub fn from_byte(b: u8) -> Self {
+        match b { 1 => Self::Bassline, 2 => Self::Drum, 3 => Self::Multi, _ => Self::Lead }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Lead => "Lead", Self::Bassline => "Bass",
+                     Self::Drum => "Drum", Self::Multi    => "Multi" }
+    }
+    pub fn ch_map(self) -> &'static str {
+        match self {
+            Self::Lead     => "Ch 1",
+            Self::Bassline => "Ch 1/<60  2/>=60",
+            Self::Drum     => "Ch 1",
+            Self::Multi    => "Ch 1-3:L  4-6:R",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VoiceMode { Mono, Poly, Legato }
+
+impl VoiceMode {
+    pub fn from_vflags(b: u8) -> Self {
+        if b & 0x08 != 0 { Self::Poly }
+        else if b & 0x01 != 0 { Self::Legato }
+        else { Self::Mono }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Mono => "Mono", Self::Poly => "Poly", Self::Legato => "Leg" }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Row { Bank, Program }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -214,5 +249,31 @@ mod tests {
         let mut buf = [b'X'; 17];
         buf[16] = 0;
         assert_eq!(name_from_cstr(&buf).len(), 16);
+    }
+
+    #[test]
+    fn engine_from_byte_coverage() {
+        assert_eq!(Engine::from_byte(0), Engine::Lead);
+        assert_eq!(Engine::from_byte(1), Engine::Bassline);
+        assert_eq!(Engine::from_byte(2), Engine::Drum);
+        assert_eq!(Engine::from_byte(3), Engine::Multi);
+        assert_eq!(Engine::from_byte(99), Engine::Lead); // unknown → Lead
+    }
+
+    #[test]
+    fn voice_mode_from_vflags_all_cases() {
+        assert_eq!(VoiceMode::from_vflags(0x00), VoiceMode::Mono);
+        assert_eq!(VoiceMode::from_vflags(0x01), VoiceMode::Legato);  // bit 0
+        assert_eq!(VoiceMode::from_vflags(0x08), VoiceMode::Poly);    // bit 3
+        assert_eq!(VoiceMode::from_vflags(0x09), VoiceMode::Poly);    // POLY wins
+    }
+
+    #[test]
+    fn engine_ch_map_and_label_non_empty() {
+        for b in [0u8, 1, 2, 3, 99] {
+            let e = Engine::from_byte(b);
+            assert!(!e.label().is_empty());
+            assert!(!e.ch_map().is_empty());
+        }
     }
 }

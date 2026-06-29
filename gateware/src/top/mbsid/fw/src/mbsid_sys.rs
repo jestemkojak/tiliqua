@@ -17,6 +17,8 @@ extern "C" {
     fn mbsid_bank_count() -> u8;
     fn mbsid_bank_load(bank: u8, patch: u8) -> i32;
     fn mbsid_bank_patch_name_get(bank: u8, patch: u8, buf: *mut core::ffi::c_char);
+    fn mbsid_bank_patch_info(bank: u8, patch: u8,
+                              engine_out: *mut u8, vflags_out: *mut u8) -> i32;
 }
 
 // --- safe wrappers (riscv32 target) ---
@@ -94,6 +96,17 @@ pub fn bank_patch_name(bank: u8, patch: u8, buf: &mut [u8; 17]) {
     unsafe { mbsid_bank_patch_name_get(bank, patch, buf.as_mut_ptr() as *mut core::ffi::c_char) }
 }
 
+#[cfg(target_arch = "riscv32")]
+pub fn bank_patch_info(bank: u8, patch: u8) -> Option<(u8, u8)> {
+    let mut eng = 0u8;
+    let mut vfl = 0u8;
+    if unsafe { mbsid_bank_patch_info(bank, patch, &mut eng, &mut vfl) } == 0 {
+        Some((eng, vfl))
+    } else {
+        None
+    }
+}
+
 // --- host stubs (non-riscv32, e.g. x86_64 for cargo test --lib) ---
 
 #[cfg(not(target_arch = "riscv32"))]
@@ -145,6 +158,11 @@ pub fn bank_patch_name(_bank: u8, _patch: u8, buf: &mut [u8; 17]) {
     buf[..name.len()].copy_from_slice(name);
 }
 
+#[cfg(not(target_arch = "riscv32"))]
+pub fn bank_patch_info(_bank: u8, _patch: u8) -> Option<(u8, u8)> {
+    Some((0, 0)) // Lead, Mono
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +175,14 @@ mod tests {
         bank_patch_name(0, 0, &mut buf);
         assert!(buf.iter().any(|&c| c != 0), "name stub must be non-empty");
         assert_eq!(buf[16], 0, "buffer must stay NUL-terminated");
+    }
+
+    #[test]
+    fn bank_patch_info_stub_returns_lead_mono() {
+        let info = bank_patch_info(0, 0);
+        assert!(info.is_some(), "stub must return Some");
+        let (eng, vfl) = info.unwrap();
+        assert_eq!(eng, 0, "stub engine must be Lead (0)");
+        assert_eq!(vfl, 0, "stub vflags must be 0 (Mono)");
     }
 }
