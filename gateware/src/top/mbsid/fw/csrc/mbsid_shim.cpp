@@ -90,7 +90,9 @@ extern "C" int mbsid_bank_load(uint8_t bank, uint8_t patch) {
 // Safe to call read-only at any time (does not mutate engine state).
 extern "C" int mbsid_bank_patch_info(uint8_t bank, uint8_t patch,
                                       uint8_t *engine_out, uint8_t *vflags_out) {
-    if (bank >= 1 || patch >= 128) return -1;
+    // Cache-match is the sole authority: g_patch_cache is populated only by a
+    // successful env.bankLoad(), so a match implies a valid (bank, patch) for
+    // however many banks the engine supports. No separate bounds guard needed.
     if (!g_patch_cache.valid ||
         g_patch_cache.bank != bank || g_patch_cache.patch != patch) return -1;
     *engine_out = g_patch_cache.engine;
