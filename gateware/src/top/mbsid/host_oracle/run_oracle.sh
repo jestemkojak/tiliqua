@@ -156,6 +156,42 @@ else
     echo "OK: Multi channel routing is observable (spread != collapsed)"
 fi
 
+# --- Multi WT->filter modulation (A107 Poly Trancegate): cutoff must MOVE ---
+# Reference-free check. The shim-vs-engine diff is blind to this fix (both sides
+# run the same helper), so assert the filter-cutoff registers are sequenced by
+# the WT rather than static. Cutoff is 11-bit, split across reg 21 (filter_l =
+# FC_LO, low 3 bits) and reg 22 (filter_h = FC_HI, high 8 bits); a sweep's range
+# lives mostly in FC_HI, so count changes to reg 21 OR 22 to be robust to how
+# MbSidFilter splits the value. Pre-fix cutoff is static (0) -> <2 change events
+# -> FAIL; post-fix the WT gates it -> many events -> PASS.
+#
+# The stock seq_multi.txt ends at t=1200ms, which is NOT enough: MbSidClock in
+# AUTO mode stays in *slave* mode (waiting for an external MIDI clock) until
+# incomingClkCtr crosses 0xfff (~4095 ticks/ms), only then falling back to its
+# internal BPM master clock that actually raises eventClock and advances the
+# WT (this is the same ~4.1s AUTO-clock behaviour documented for the Drum
+# SIGSEGV in mbsid/CLAUDE.md). So the WT never leaves wtOut=-1 within 1200ms
+# and reg 21/22 are provably static regardless of the fix. We build our own
+# longer trace here: drop seq_multi.txt's terminating "end" (run_sequence ticks
+# once per ms up to the last event's timestamp, so "end" would cut the trace
+# short) and append a harmless tail event past the ~4.1s threshold to force
+# enough master-clock ticks for the WT to step at least twice. Empirically
+# (see task-1 report) this measured L=59 R=59 change events, identical counts
+# on L and R (patch 106 drives one filter target across both channels), so the
+# original "&&" gate (both L and R must show >=2 events) is satisfiable as
+# written -- no need for the OR/combined-count fallback the brief allowed for.
+echo "=== Multi WT->filter modulation (A107) ==="
+a107="$BUILD/a107.seq"
+{ echo "0 patch 106"; grep -v '^[0-9]* end$' "$HERE/sequences/seq_multi.txt"; echo "5500 cc 1 0"; } > "$a107"
+"$BUILD/oracle" "$a107" > "$BUILD/a107.trace"
+l_changes=$(grep -cE '^[0-9]+ L (21|22) ' "$BUILD/a107.trace" || true)
+r_changes=$(grep -cE '^[0-9]+ R (21|22) ' "$BUILD/a107.trace" || true)
+if [ "$l_changes" -ge 2 ] && [ "$r_changes" -ge 2 ]; then
+    echo "OK: A107 filter cutoff is WT-sequenced (L=$l_changes R=$r_changes change events)"
+else
+    echo "FAIL: A107 filter cutoff static (L=$l_changes R=$r_changes) — WT->filter not applied"; fail=1
+fi
+
 echo "=== no-crash sweep (all 128 factory patches, incl. non-Lead) ==="
 if timeout 30 "$BUILD/sweep_driver"; then
     echo "OK: no-crash sweep"
