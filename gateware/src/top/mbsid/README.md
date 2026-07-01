@@ -56,10 +56,11 @@ the same channel layout:
   zones can play several parts by hand; a plain single-channel keyboard plays only
   the one part assigned to its channel.
 
-> **Status:** the firmware currently forwards all MIDI on channel 0, so **Lead and
-> Drum play today** but Multi (voices 2–6) and Bassline's second channel are not
-> yet reachable. Full per-channel input is delivered by the multi-engine milestone
-> (see `DESIGN.md §10` / the milestone spec).
+> **Status:** the firmware forwards the real MIDI channel, so **all four engines are
+> reachable** per the channel map above (Lead/Drum on ch 1, Bassline split across
+> ch 1–2, Multi across ch 1–6). All four are validated bit-exact against the host
+> oracle; live hardware playback bring-up is still pending (see `DESIGN.md §7`,
+> milestones 2–3).
 
 ---
 
@@ -72,11 +73,11 @@ on the remaining outputs:
 ```
 SID0 (sid_periph)          SID1 (sid_periph_r)
 ┌──────────────────┐       ┌──────────────────┐
-│ last_audio_left  │       │ last_audio_left   │
-│ last_audio_right │ [x]   │ last_audio_right  │ [x]
-│ voice0_dca_o     │ [x]   │ voice0_dca_o      │ [x]
-│ voice1_dca_o     │ [x]   │ voice1_dca_o      │ [x]
-│ voice2_dca_o     │ [x]   │ voice2_dca_o      │ [x]
+│ last_audio_left  │       │ last_audio_left  │
+│ last_audio_right │ [x]   │ last_audio_right │ [x]
+│ voice0_dca_o     │ [x]   │ voice0_dca_o     │ [x]
+│ voice1_dca_o     │ [x]   │ voice1_dca_o     │ [x]
+│ voice2_dca_o     │ [x]   │ voice2_dca_o     │ [x]
 └────────┬─────────┘       └─────────┬────────┘
          │                           │
          │  (3-voice post-filter)    │  (3-voice post-filter)
