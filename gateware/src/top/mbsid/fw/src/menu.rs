@@ -121,10 +121,31 @@ const MENU_W: u32 = 380;
 const MENU_H: u32 = 120;
 const ROW_DY: i32 = 24; // vertical spacing between rows
 
+/// Build the detail-row text. `detail` is `Some((engine, voice_mode))` for a
+/// successfully-loaded patch, or `None` when patch info is unavailable (e.g. a
+/// failed `bankLoad`) — in which case we show "---" rather than a stale/default
+/// engine label.
+pub fn detail_line(detail: Option<(Engine, Option<VoiceMode>)>) -> String<48> {
+    let mut line: String<48> = String::new();
+    match detail {
+        Some((engine, Some(vm))) => {
+            let _ = write!(line, "  {} {}  {}", engine.label(), vm.label(), engine.ch_map());
+        }
+        Some((engine, None)) => {
+            let _ = write!(line, "  {}  {}", engine.label(), engine.ch_map());
+        }
+        None => {
+            let _ = write!(line, "  ---");
+        }
+    }
+    line
+}
+
 /// Draw the menu into its own opaque box at (pos_x, pos_y). `name` is the
-/// 16-char patch name for the current (bank, program).
+/// 16-char patch name for the current (bank, program). `detail` is `None` when
+/// patch info is unavailable (failed load), which renders the row as "---".
 pub fn draw<D>(d: &mut D, st: &MenuState, name: &str,
-               engine: Engine, voice_mode: Option<VoiceMode>,
+               detail: Option<(Engine, Option<VoiceMode>)>,
                pos_x: i32, pos_y: i32, hue: u8) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = HI8>,
@@ -160,17 +181,9 @@ where
     let style = if prog_focused { bright } else { dim };
     Text::new(&line, Point::new(pos_x, pos_y + 2 * ROW_DY), style).draw(d)?;
 
-    // Detail row: engine label + voice mode (Lead only) + channel map.
-    line.clear();
-    match voice_mode {
-        Some(vm) => {
-            let _ = write!(line, "  {} {}  {}", engine.label(), vm.label(), engine.ch_map());
-        }
-        None => {
-            let _ = write!(line, "  {}  {}", engine.label(), engine.ch_map());
-        }
-    }
-    Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), dim).draw(d)?;
+    // Detail row: engine label + voice mode (Lead only) + channel map, or "---".
+    let detail_line = detail_line(detail);
+    Text::new(&detail_line, Point::new(pos_x, pos_y + 3 * ROW_DY), dim).draw(d)?;
 
     Ok(())
 }
@@ -279,6 +292,30 @@ mod tests {
         assert_eq!(VoiceMode::from_vflags(0x01), VoiceMode::Legato);  // bit 0
         assert_eq!(VoiceMode::from_vflags(0x08), VoiceMode::Poly);    // bit 3
         assert_eq!(VoiceMode::from_vflags(0x09), VoiceMode::Poly);    // POLY wins
+    }
+
+    #[test]
+    fn detail_line_none_shows_error_indicator_not_lead() {
+        // Failed bankLoad => None: must not silently show a Lead/Mono label.
+        let l = detail_line(None);
+        assert_eq!(l.as_str().trim(), "---");
+        assert!(!l.contains("Lead"));
+    }
+
+    #[test]
+    fn detail_line_lead_includes_voice_mode() {
+        let l = detail_line(Some((Engine::Lead, Some(VoiceMode::Poly))));
+        assert!(l.contains("Lead"));
+        assert!(l.contains("Poly"));
+        assert!(l.contains(Engine::Lead.ch_map()));
+    }
+
+    #[test]
+    fn detail_line_non_lead_omits_voice_mode() {
+        let l = detail_line(Some((Engine::Multi, None)));
+        assert!(l.contains("Multi"));
+        assert!(l.contains(Engine::Multi.ch_map()));
+        assert!(!l.contains("Mono") && !l.contains("Poly") && !l.contains("Leg"));
     }
 
     #[test]
