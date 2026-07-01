@@ -41,7 +41,7 @@ impl VoiceMode {
         else { Self::Mono }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Mono => "Mono", Self::Poly => "Poly", Self::Legato => "Leg" }
+        match self { Self::Mono => "Mono", Self::Poly => "Poly", Self::Legato => "Legato" }
     }
 }
 
