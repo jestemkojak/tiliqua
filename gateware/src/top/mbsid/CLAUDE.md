@@ -103,6 +103,7 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   The shim MIDI ABI takes `chn` as its first arg — change it and ALL callers
   (Rust FFI + both oracle drivers) together (extern "C", no mangling guard).
 - **Drum engine SIGSEGV at t≈4182ms (MASTER clock mode):** `MbSidWtDrum::tick()` dereferences a sentinel pointer `(MbSidDrum*)1` roughly 4.18s after loading a Drum patch with no external MIDI clock. The oracle sequences end before this window; on hardware, use an external MIDI clock or trigger reload before 4s. See `.scratch/mbsid-drum-sigsegv/issue.md`.
+- **`MbSidClock` AUTO mode stays in MIDI-slave mode (WT frozen) until ~4095ms**, then falls back to its internal BPM master clock — same threshold as the Drum SIGSEGV above, but it affects *any* oracle test that needs the WT to actually step (e.g. Multi WT→filter modulation). Stock sequences like `seq_multi.txt` end at ~1200ms and never reach this window, so WT-dependent asserts silently no-op — extend the sequence past ~4.1s locally in the test (don't edit the shared `.txt` file; see `run_oracle.sh`'s A107 block for the pattern) and use a discriminating check (helper disabled → must still FAIL) to rule out false positives from the clock switch itself.
 - **GPL.** Linking the MBSID C++ into the firmware makes the distributed bitstream firmware
   GPL (fine for personal/open use).
 
