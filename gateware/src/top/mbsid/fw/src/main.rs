@@ -252,20 +252,19 @@ fn main() -> ! {
                 mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
                 let name = menu::name_from_cstr(&namebuf);
                 // Fetch engine type + voice flags from the ROM bank (read-only, no ISR guard needed).
-                let (engine, voice_mode) = match mbsid_sys::bank_patch_info(state.bank, state.program) {
-                    Some((eng, vfl)) => {
-                        let e = menu::Engine::from_byte(eng);
-                        // voice_mode is only meaningful for Lead; other engines hide it.
-                        let vm = if e == menu::Engine::Lead {
-                            Some(menu::VoiceMode::from_vflags(vfl))
-                        } else {
-                            None
-                        };
-                        (e, vm)
-                    }
-                    None => (menu::Engine::Lead, None),
-                };
-                menu::draw(&mut display, &state, name, engine, voice_mode, MENU_X, MENU_Y, MENU_HUE).ok();
+                // None => bank_load failed / patch not cached: draw shows "---" rather than
+                // silently falling back to a stale Lead/Mono label.
+                let detail = mbsid_sys::bank_patch_info(state.bank, state.program).map(|(eng, vfl)| {
+                    let e = menu::Engine::from_byte(eng);
+                    // voice_mode is only meaningful for Lead; other engines hide it.
+                    let vm = if e == menu::Engine::Lead {
+                        Some(menu::VoiceMode::from_vflags(vfl))
+                    } else {
+                        None
+                    };
+                    (e, vm)
+                });
+                menu::draw(&mut display, &state, name, detail, MENU_X, MENU_Y, MENU_HUE).ok();
                 dirty = false;
             }
         }
