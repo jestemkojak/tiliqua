@@ -15,6 +15,7 @@
 
 #include "mbsid_shim.h"
 #include "MbSidEnvironment.h"   // pulls sid_regs_t, sid_patch_t via mios32 facade
+#include "mbsid_multi_wt.h"     // Multi WT->parameter modulation (upstream stubbed)
 
 static_assert(sizeof(sid_patch_t) == 512, "patch must be 512 bytes");
 
@@ -111,6 +112,10 @@ extern "C" void mbsid_pitch_bend(uint8_t chn, uint16_t bend14)        { env.mbSi
 extern "C" void mbsid_cc(uint8_t chn, uint8_t cc, uint8_t val)        { env.mbSid[0].midiReceiveCC(chn, cc, val); }
 extern "C" void mbsid_aftertouch(uint8_t chn, uint8_t val)            { env.mbSid[0].midiReceiveAftertouch(chn, val); }
 
-extern "C" int  mbsid_tick(uint8_t /*speed_factor*/)      { return env.tick() ? 1 : 0; }
+extern "C" int  mbsid_tick(uint8_t /*speed_factor*/) {
+    int changed = env.tick() ? 1 : 0;
+    mbsid_multi_wt_fixup(env.mbSid[0]);
+    return changed;
+}
 extern "C" const uint8_t *mbsid_regs_l(void)              { return regL.ALL; }
 extern "C" const uint8_t *mbsid_regs_r(void)              { return regR.ALL; }

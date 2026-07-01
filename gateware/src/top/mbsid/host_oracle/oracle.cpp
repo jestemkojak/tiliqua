@@ -9,6 +9,7 @@
 #include <mios32.h>
 #include "MbSidEnvironment.h"
 #include "seq.h"
+#include "mbsid_multi_wt.h"     // mirror the firmware shim's Multi WT fixup
 
 // In-tree Lead preset bank: static const u8 sid_bank_preset_0[128][512].
 #include "sid_bank_preset_a.inc"
@@ -36,7 +37,11 @@ struct OracleBackend {
     void cc(int chn, int num, int val)        { env.mbSid[0].midiReceiveCC((u8)chn, (u8)num, (u8)val); }
     void bend(int chn, int val14)             { env.mbSid[0].midiReceivePitchBend((u8)chn, (u16)val14); }
     void aftertouch(int chn, int val)         { env.mbSid[0].midiReceiveAftertouch((u8)chn, (u8)val); }
-    int  tick()                      { return env.tick() ? 1 : 0; }
+    int  tick() {
+        int changed = env.tick() ? 1 : 0;
+        mbsid_multi_wt_fixup(env.mbSid[0]);
+        return changed;
+    }
     const uint8_t *regs()            { return sidRegs[0].ALL; }
     const uint8_t *regs_r()          { return sidRegs[1].ALL; }
 };
