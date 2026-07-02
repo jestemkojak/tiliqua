@@ -31,6 +31,9 @@ use tiliqua_hal as hal;
 
 use tiliqua_fw::mbsid_sys;
 use tiliqua_fw::regdiff::{RegDiff, WriteList};
+use tiliqua_fw::sysex_capture::SysexCapture;
+use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
+use tiliqua_fw::menu::PressResult;
 
 use midi_types::MidiMessage;
 use midi_convert::parse::MidiTryParseSlice;
@@ -49,6 +52,13 @@ hal::impl_tiliqua_soc_pac!();
 // engine every 1 ms, so a 1 ms ISR is the only apples-to-apples cadence. (Base
 // `top/sid` uses 5 ms — that is wrong for the engine; do not copy it.)
 pub const TIMER0_ISR_PERIOD_MS: u32 = 1;
+
+// Max SysEx bytes drained per 1 ms tick: bounds ISR time. 32 B/ms = 32 kB/s
+// drain >> 3.1 kB/s serial MIDI; USB is backpressured by the 64-deep gateware
+// FIFO, so the cap costs only latency (a 1.6 kB dump ~ 50 ms), never data.
+const SYSEX_BYTES_PER_TICK: u32 = 32;
+// Abort a half-received SysEx message after this RX gap (spec §6a [DEFAULT]).
+const SYSEX_TIMEOUT_MS: u16 = 500;
 
 // Boot patch = factory bank slot loaded at power-on. 0-based slot index =
 // MIDI Program Change value = (patch number - 1). 123 = A124 "Crazy Lead".
@@ -88,11 +98,19 @@ struct App {
     diff_l: RegDiff,
     diff_r: RegDiff,
     wl:     WriteList,
+    sysex_cap: SysexCapture,
+    sysex_idle_ms: u16,
+    /// Complete Bank Write captured by the ISR; persisted by the main loop
+    /// (flash I/O must never run in the 1 ms ISR).
+    pending_save: Option<(u8, [u8; 512])>,
 }
 
 impl App {
     fn new() -> Self {
-        Self { diff_l: RegDiff::new(), diff_r: RegDiff::new(), wl: WriteList::new() }
+        Self {
+            diff_l: RegDiff::new(), diff_r: RegDiff::new(), wl: WriteList::new(),
+            sysex_cap: SysexCapture::new(), sysex_idle_ms: 0, pending_save: None,
+        }
     }
 }
 
@@ -167,10 +185,42 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             }
         }
 
+        // (a2) Drain the SysEx sideband FIFO (capped per tick). Each byte goes
+        // to BOTH consumers: the engine (RAM Writes apply live upstream) and
+        // the Rust capture parser (Bank Writes -> pending_save -> main loop).
+        let mut got_byte = false;
+        for _ in 0..SYSEX_BYTES_PER_TICK {
+            let r = sid.sysex_read().read();
+            if !r.valid().bit() { break; }
+            let b = r.data().bits();
+            got_byte = true;
+            mbsid_sys::sysex_byte(b);
+            if app.sysex_cap.feed(b) {
+                let mut buf = [0u8; 512];
+                buf.copy_from_slice(app.sysex_cap.data());
+                app.pending_save = Some((app.sysex_cap.slot(), buf));
+            }
+        }
+        if got_byte {
+            app.sysex_idle_ms = 0;
+        } else if app.sysex_cap.in_message() {
+            app.sysex_idle_ms = app.sysex_idle_ms.saturating_add(1);
+            if app.sysex_idle_ms >= SYSEX_TIMEOUT_MS {
+                // Half-received message wedged (cable pulled mid-dump, or an
+                // interrupted USB dump with no in-band terminator): abort both
+                // parsers so the next dump starts clean.
+                mbsid_sys::sysex_timeout();
+                app.sysex_cap.reset();
+                app.sysex_idle_ms = 0;
+            }
+        } else {
+            app.sysex_idle_ms = 0;
+        }
+
         // (b) Tick the engine; on a register change, diff L and R vs their
         //     shadows and stream only the changed regs to their SIDs.
         if mbsid_sys::tick() {
-            let App { diff_l, diff_r, wl } = &mut *app;
+            let App { diff_l, diff_r, wl, .. } = &mut *app;
 
             diff_l.update(mbsid_sys::regs_l(), wl);
             drain_writelist(wl,
@@ -185,6 +235,16 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             wl.clear();
         }
     });
+}
+
+fn save_status(ok: bool, slot: u8) -> heapless::String<24> {
+    let mut s = heapless::String::new();
+    let _ = if ok {
+        core::fmt::Write::write_fmt(&mut s, format_args!("Saved U{:03}", slot))
+    } else {
+        core::fmt::Write::write_fmt(&mut s, format_args!("Save FAILED U{:03}", slot))
+    };
+    s
 }
 
 #[entry]
@@ -223,7 +283,22 @@ fn main() -> ! {
 
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
 
-    let mut state = MenuState::new(mbsid_sys::bank_count(), 0, BOOT_PATCH_INDEX);
+    let spiflash = SPIFlash0::new(
+        peripherals.SPIFLASH_CTRL,
+        SPIFLASH_BASE,
+        SPIFLASH_SZ_BYTES,
+    );
+    let mut store = UserPatchStore::new(spiflash, USER_BANK_FLASH_BASE);
+    // One shared 512B scratch for user-bank load / save / SysEx persist —
+    // keeps peak stack usage flat (mainram budget, CLAUDE.md).
+    let mut patch_buf = [0u8; 512];
+    // Engine/vflags of the last successfully loaded USER patch (the ROM-bank
+    // cache in the shim can't answer for user slots).
+    let mut user_detail: Option<(u8, u8)> = None;
+    let mut status: Option<heapless::String<24>> = None;
+
+    // Total banks = engine ROM banks + the flash User bank (always last).
+    let mut state = MenuState::new(mbsid_sys::bank_count() + 1, 0, BOOT_PATCH_INDEX);
 
     handler!(timer0 = || timer0_handler(&app));
 
@@ -239,32 +314,99 @@ fn main() -> ! {
 
             let mut need_load = false;
             if ticks != 0 { need_load |= state.on_turn(ticks); dirty = true; }
-            if pressed   { state.on_press(); dirty = true; }
+            if pressed {
+                match state.on_press() {
+                    PressResult::Toggled => {}
+                    PressResult::Cancel => { status = None; }
+                    PressResult::Commit(slot) => {
+                        // On-device "save as": copy the live patch out under
+                        // the ISR guard, then write flash OUTSIDE it (slow).
+                        critical_section::with(|_cs| {
+                            mbsid_sys::current_patch_raw(&mut patch_buf);
+                        });
+                        status = Some(save_status(
+                            store.save(slot, &patch_buf).is_ok(), slot));
+                    }
+                }
+                dirty = true;
+            }
+
+            // SysEx Bank Write captured by the ISR -> persist here.
+            let pending = critical_section::with(|cs| {
+                app.borrow_ref_mut(cs).pending_save.take()
+            });
+            if let Some((slot, bytes)) = pending {
+                status = Some(save_status(store.save(slot, &bytes).is_ok(), slot));
+                dirty = true;
+            }
 
             if need_load {
-                critical_section::with(|_cs| {
-                    mbsid_sys::bank_load(state.bank, state.program);
-                });
+                if state.is_user_bank() {
+                    if store.load(state.program, &mut patch_buf) {
+                        critical_section::with(|_cs| {
+                            mbsid_sys::load_patch(&patch_buf);
+                        });
+                        // engine byte 0x10, vflags 0x50 (sid_patch_t layout)
+                        user_detail = Some((patch_buf[0x10], patch_buf[0x50]));
+                    } else {
+                        user_detail = None; // empty slot: engine untouched
+                    }
+                } else {
+                    critical_section::with(|_cs| {
+                        mbsid_sys::bank_load(state.bank, state.program);
+                    });
+                }
             }
 
             if dirty {
                 let mut namebuf = [0u8; 17];
-                mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
-                let name = menu::name_from_cstr(&namebuf);
-                // Fetch engine type + voice flags from the ROM bank (read-only, no ISR guard needed).
-                // None => bank_load failed / patch not cached: draw shows "---" rather than
-                // silently falling back to a stale Lead/Mono label.
-                let detail = mbsid_sys::bank_patch_info(state.bank, state.program).map(|(eng, vfl)| {
-                    let e = menu::Engine::from_byte(eng);
-                    // voice_mode is only meaningful for Lead; other engines hide it.
-                    let vm = if e == menu::Engine::Lead {
-                        Some(menu::VoiceMode::from_vflags(vfl))
-                    } else {
-                        None
-                    };
-                    (e, vm)
-                });
-                menu::draw(&mut display, &state, name, detail, MENU_X, MENU_Y, MENU_HUE).ok();
+                let name_ok;
+                if state.is_user_bank() {
+                    let mut n16 = [0u8; 16];
+                    name_ok = store.name(state.program, &mut n16);
+                    namebuf[..16].copy_from_slice(&n16);
+                    namebuf[16] = 0;
+                    if !name_ok { namebuf[0] = 0; }
+                } else {
+                    mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
+                    name_ok = true;
+                }
+                let name = if name_ok { menu::name_from_cstr(&namebuf) } else { "Empty" };
+
+                // Fetch engine type + voice flags. USER bank uses the last
+                // successfully loaded slot's cached detail (the shim's ROM-
+                // bank cache can't answer for user slots); ROM banks read
+                // directly (read-only, no ISR guard needed). None => show
+                // "---" rather than a stale/default Lead/Mono label.
+                let detail = if state.is_user_bank() {
+                    user_detail.map(|(eng, vfl)| {
+                        let e = menu::Engine::from_byte(eng);
+                        let vm = if e == menu::Engine::Lead {
+                            Some(menu::VoiceMode::from_vflags(vfl))
+                        } else { None };
+                        (e, vm)
+                    })
+                } else {
+                    mbsid_sys::bank_patch_info(state.bank, state.program).map(|(eng, vfl)| {
+                        let e = menu::Engine::from_byte(eng);
+                        let vm = if e == menu::Engine::Lead {
+                            Some(menu::VoiceMode::from_vflags(vfl))
+                        } else { None };
+                        (e, vm)
+                    })
+                };
+
+                // Save-row preview: name of the slot under the cursor.
+                let mut savebuf = [0u8; 16];
+                let save_name: Option<&str> =
+                    if state.save_cursor >= 0
+                        && store.name(state.save_cursor as u8, &mut savebuf) {
+                        core::str::from_utf8(&savebuf).ok()
+                    } else { None };
+
+                menu::draw(&mut display, &state, name, detail,
+                           save_name, status.as_deref(),
+                           MENU_X, MENU_Y, MENU_HUE).ok();
                 dirty = false;
             }
         }
