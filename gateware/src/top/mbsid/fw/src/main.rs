@@ -93,7 +93,7 @@ fn default_isr_handler() {
 }
 
 /// Engine-adjacent ISR state: per-SID register-diff shadows (L/R) and the
-/// shared scratch write list, shared with the Timer0 ISR via `static APP`.
+/// shared scratch write list, shared with the Timer0 ISR via `Mutex<RefCell<App>>`.
 struct App {
     diff_l: RegDiff,
     diff_r: RegDiff,
