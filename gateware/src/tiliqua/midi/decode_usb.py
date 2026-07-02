@@ -43,7 +43,8 @@ class MidiDecodeUSB(wiring.Component):
     Parse 4-byte USB MIDI packets into structured :py:`MidiMessage`.
 
     Real-time messages can optionally be forwarded on :py:`o_rt`.
-    Sysex packets are drained.
+    Sysex packets are drained by default, forwarded on ``o_sysex``
+    (backpressure honored) with ``forward_sysex=True``.
 
     When :py:`cable_filter` is set to an integer (0-15), only events from
     that cable number are processed.
@@ -51,15 +52,18 @@ class MidiDecodeUSB(wiring.Component):
     Warn: backpressure on ``o_rt`` is ignored!
     """
 
-    def __init__(self, forward_rt=False, cable_filter=None):
+    def __init__(self, forward_rt=False, cable_filter=None, forward_sysex=False):
         self.forward_rt = forward_rt
         self.cable_filter = cable_filter
+        self.forward_sysex = forward_sysex
         sig = {
             "i": In(stream.Signature(Packet(unsigned(8)))),
             "o": Out(stream.Signature(MidiMessage)),
         }
         if forward_rt:
             sig["o_rt"] = Out(stream.Signature(Status.RT))
+        if forward_sysex:
+            sig["o_sysex"] = Out(stream.Signature(unsigned(8)))
         super().__init__(sig)
 
     def elaborate(self, platform):
@@ -75,6 +79,10 @@ class MidiDecodeUSB(wiring.Component):
             m.submodules.rt_fifo = rt_fifo = StreamFIFO(shape=Status.RT, depth=4)
             wiring.connect(m, rt_fifo.o, wiring.flipped(self.o_rt))
 
+        if self.forward_sysex:
+            # remaining valid sysex bytes in the current packet (1..3)
+            syx_cnt = Signal(2)
+
         with m.FSM() as fsm:
 
             with m.State('IDLE'):
@@ -82,13 +90,39 @@ class MidiDecodeUSB(wiring.Component):
                 i_header = USBHeader(i_payload)
                 with m.If(self.i.valid & self.i.payload.first):
                     m.d.sync += header.eq(i_header)
+                    if self.forward_sysex:
+                        is_syx = Signal()
+                        m.d.comb += is_syx.eq(
+                            (i_header.cin == USBMidiCIN.SYSEX_START) |
+                            (i_header.cin == USBMidiCIN.SYSEX_END_1) |
+                            (i_header.cin == USBMidiCIN.SYSEX_END_2) |
+                            (i_header.cin == USBMidiCIN.SYSEX_END_3))
+                        with m.Switch(i_header.cin):
+                            with m.Case(USBMidiCIN.SYSEX_END_1):
+                                m.d.sync += syx_cnt.eq(1)
+                            with m.Case(USBMidiCIN.SYSEX_END_2):
+                                m.d.sync += syx_cnt.eq(2)
+                            with m.Default():
+                                m.d.sync += syx_cnt.eq(3)  # START / END_3
                     if self.cable_filter is not None:
                         with m.If(i_header.cable != self.cable_filter):
                             m.next = 'DRAIN'
                         with m.Else():
-                            m.next = 'STATUS'
+                            if self.forward_sysex:
+                                with m.If(is_syx):
+                                    m.next = 'SYSEX-FWD'
+                                with m.Else():
+                                    m.next = 'STATUS'
+                            else:
+                                m.next = 'STATUS'
                     else:
-                        m.next = 'STATUS'
+                        if self.forward_sysex:
+                            with m.If(is_syx):
+                                m.next = 'SYSEX-FWD'
+                            with m.Else():
+                                m.next = 'STATUS'
+                        else:
+                            m.next = 'STATUS'
 
             with m.State('STATUS'):
                 m.d.comb += self.i.ready.eq(1)
@@ -117,6 +151,25 @@ class MidiDecodeUSB(wiring.Component):
                 m.d.comb += self.i.ready.eq(1)
                 with m.If(self.i.valid & self.i.payload.last):
                     m.next = 'IDLE'
+
+            if self.forward_sysex:
+                with m.State('SYSEX-FWD'):
+                    with m.If(syx_cnt != 0):
+                        # forward payload bytes, honoring o_sysex backpressure
+                        m.d.comb += [
+                            self.o_sysex.payload.eq(i_payload),
+                            self.o_sysex.valid.eq(self.i.valid),
+                            self.i.ready.eq(self.o_sysex.ready),
+                        ]
+                        with m.If(self.i.valid & self.o_sysex.ready):
+                            m.d.sync += syx_cnt.eq(syx_cnt - 1)
+                            with m.If(self.i.payload.last):
+                                m.next = 'IDLE'
+                    with m.Else():
+                        # padding bytes past the valid count: discard
+                        m.d.comb += self.i.ready.eq(1)
+                        with m.If(self.i.valid & self.i.payload.last):
+                            m.next = 'IDLE'
 
             with m.State('READ0'):
                 m.d.comb += self.i.ready.eq(1)

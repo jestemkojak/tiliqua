@@ -321,3 +321,68 @@ class MidiTests(unittest.TestCase):
         sim.add_testbench(testbench)
         with sim.write_vcd(vcd_file=open("test_midi_voice_tracker.vcd", "w")):
             sim.run()
+
+    def test_midi_sysex_sideband_usb(self):
+        dut = midi.MidiDecodeUSB(forward_sysex=True)
+        # F0 00 00 7E 4B 00 0F F7 as USB-MIDI packets:
+        #   SYSEX_START(F0 00 00), SYSEX_START(7E 4B 00), SYSEX_END_2(0F F7)
+        packets = [
+            (0x04, [0xF0, 0x00, 0x00]),
+            (0x04, [0x7E, 0x4B, 0x00]),
+            (0x06, [0x0F, 0xF7, 0x00]),   # 3rd byte = padding, must be dropped
+        ]
+        expect = [0xF0, 0x00, 0x00, 0x7E, 0x4B, 0x00, 0x0F, 0xF7]
+        got = []
+
+        async def feed(ctx):
+            for cin, data in packets:
+                await stream.put(ctx, dut.i, {'first': 1, 'last': 0, 'data': cin})
+                await stream.put(ctx, dut.i, {'first': 0, 'last': 0, 'data': data[0]})
+                await stream.put(ctx, dut.i, {'first': 0, 'last': 0, 'data': data[1]})
+                await stream.put(ctx, dut.i, {'first': 0, 'last': 1, 'data': data[2]})
+            # normal note-on packet still parses afterwards
+            await stream.put(ctx, dut.i, {'first': 1, 'last': 0, 'data': 0x09})
+            await stream.put(ctx, dut.i, {'first': 0, 'last': 0, 'data': 0x92})
+            await stream.put(ctx, dut.i, {'first': 0, 'last': 0, 'data': 0x48})
+            await stream.put(ctx, dut.i, {'first': 0, 'last': 1, 'data': 0x96})
+            p = await stream.get(ctx, dut.o)
+            self.assertEqual(p.status.kind, midi.Status.Kind.NOTE_ON)
+            self.assertEqual(p.midi_payload.note_on.note, 0x48)
+
+        async def collect(ctx):
+            for _ in range(len(expect)):
+                await ctx.tick().repeat(3)  # slow consumer: backpressure path
+                got.append(await stream.get(ctx, dut.o_sysex))
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(feed)
+        sim.add_testbench(collect)
+        with sim.write_vcd(vcd_file=open("test_midi_sysex_usb.vcd", "w")):
+            sim.run()
+        self.assertEqual(got, expect)
+
+    def test_midi_sysex_usb_end1_single_byte(self):
+        dut = midi.MidiDecodeUSB(forward_sysex=True)
+        got = []
+
+        async def feed(ctx):
+            # SYSEX_END_1: only byte1 (F7) valid, bytes 2-3 are padding
+            await stream.put(ctx, dut.i, {'first': 1, 'last': 0, 'data': 0x05})
+            await stream.put(ctx, dut.i, {'first': 0, 'last': 0, 'data': 0xF7})
+            await stream.put(ctx, dut.i, {'first': 0, 'last': 0, 'data': 0x00})
+            await stream.put(ctx, dut.i, {'first': 0, 'last': 1, 'data': 0x00})
+
+        async def collect(ctx):
+            got.append(await stream.get(ctx, dut.o_sysex))
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(feed)
+        sim.add_testbench(collect)
+        sim.run()
+        self.assertEqual(got, [0xF7])
+
+    def test_midi_sysex_usb_flag_off_unchanged(self):
+        dut = midi.MidiDecodeUSB()
+        self.assertFalse(hasattr(dut, "o_sysex"))
