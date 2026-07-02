@@ -58,7 +58,7 @@ impl<F: NorFlash + ReadNorFlash> UserPatchStore<F> {
     }
 
     pub fn save(&mut self, slot: u8, patch: &[u8; 512]) -> Result<(), F::Error> {
-        debug_assert!(slot < N_SLOTS);
+        assert!(slot < N_SLOTS);
         let a = self.slot_addr(slot);
         self.flash.erase(a, a + SLOT_SIZE)?;
         // Payload first; header LAST — the header is the commit point, so an
