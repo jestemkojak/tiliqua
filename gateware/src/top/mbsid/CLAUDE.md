@@ -97,6 +97,13 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **`mainram_size` is bumped to `0x8000`** (`MBSIDSoc` subclasses `SIDSoc` in `top.py`; sid's
   default is `0x4000`). The by-value engine aggregation lands ~6.9 KB `.bss` + needs stack room;
   measured `.bss` 6884 B + stack 25880 B fits 0x8000. If you add firmware state, watch RAM.
+  **Caution:** `llvm-size`'s default summary folds `.bss`+`.heap`+`.stack` into one "bss" number,
+  and the `.stack` *section* size is just the linker's leftover-region allocation, not actual
+  usage — use `llvm-size -A` for the real per-section breakdown, and don't mistake "stack section
+  is nearly full" for "stack is nearly overflowing." Real **peak stack usage was measured on
+  hardware post-M4** via a stack-painting probe (fill with `0xAA` at boot, scan for the
+  high-water mark, log growth over UART0): **4016 / 25824 bytes** after menu navigation + an
+  on-device save (the deepest realistic path) — ~21.8 KB of actual headroom (`M4_USER_PATCH_BANKS.md §6f`).
 - **All four engines are validated** (oracle bit-exact, all 9 non-Lead factory
   patches + Lead). The firmware forwards the **real MIDI channel** (not hardcoded
   0): each engine routes notes per its fixed `updatePatch` channel map — Lead/Drum
