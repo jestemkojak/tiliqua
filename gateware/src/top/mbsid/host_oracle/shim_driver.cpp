@@ -22,6 +22,12 @@ struct ShimBackend {
     void cc(int chn, int num, int val)        { mbsid_cc((uint8_t)chn, (uint8_t)num, (uint8_t)val); }
     void bend(int chn, int val14)             { mbsid_pitch_bend((uint8_t)chn, (uint16_t)val14); }
     void aftertouch(int chn, int val)         { mbsid_aftertouch((uint8_t)chn, (uint8_t)val); }
+    void sysex_byte(uint8_t b) { mbsid_sysex_byte(b); }
+    void sysex_patch_dump(int row) {
+        unsigned char msg[1036];
+        seq_encode_patch_dump(sid_bank_preset_0[row], 0x08, 0x00, 0x00, msg);
+        for (int i = 0; i < 1036; ++i) mbsid_sysex_byte(msg[i]);
+    }
     int  tick()                      { return mbsid_tick(2); }
     const uint8_t *regs()            { return mbsid_regs_l(); }
     const uint8_t *regs_r()          { return mbsid_regs_r(); }
