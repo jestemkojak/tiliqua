@@ -1,207 +1,342 @@
-# MBSID Writable User Patch Banks — Design (M4, in progress)
+# MBSID Writable User Patch Bank + SysEx Upload — Design (M4)
 
-**Date:** 2026-07-01
+**Date:** 2026-07-02 (merged; supersedes the 2026-07-01 draft and the short-lived
+`M5_SYSEX_UPLOAD.md`, folded in per user decision)
 **Branch:** `mbsid-port`
-**Status:** DRAFT — architecture and components agreed with user; edge cases, validation,
-and footprint sections not yet specced (see "Deferred / not yet specced" below). Do not
-implement from this doc until it is complete and re-reviewed.
-**Scope of this doc:** design only. Builds on M1 (Lead mono), M2 (dual-SID stereo), M3
-(read-only factory ROM bank, `M3_PATCH_BANKS.md`).
+**Status:** DESIGN — all user decisions resolved (single milestone; bank 1 = User;
+RAM Write = audition only; on-device save UI kept as groundwork for future on-device
+patch editing). Chosen-default details are marked **[DEFAULT]** — implement as written
+unless the user objects during review.
+**Scope:** design only. Builds on M1 (Lead mono), M2 (dual-SID stereo), M3 (read-only
+factory ROM bank, `M3_PATCH_BANKS.md`).
 
 ---
 
 ## 1. Goal & non-goals
 
-**Goal.** Add a writable **User** patch bank (128 slots, flash-backed) alongside the
-existing read-only **Factory** ROM bank, plus an on-device browse/save UI: browse either
-bank via the existing encoder menu, and save the currently-loaded patch into a chosen User
-slot ("save as" / duplicate).
+**Goal.** One milestone with three cooperating pieces:
+1. **Flash user bank** — 128 writable patch slots persisted in SPI flash, browsable and
+   loadable alongside the read-only Factory ROM bank.
+2. **On-device save UI** — browse either bank via the existing encoder menu; save the
+   currently-loaded patch into a chosen User slot ("save as"/duplicate). Kept (despite
+   SysEx existing) as groundwork for future on-device patch editing.
+3. **MIDI SysEx patch upload** — receive MBSID-protocol patch dumps (MIDIbox SID Editor
+   or any tool speaking the protocol) over TRS or USB MIDI:
+   - **RAM Write** (`type & 0xf8 == 0x08`): applied live by the upstream engine —
+     audition only, never auto-persisted (matches MBSID editor semantics: "send"
+     auditions, "store" persists). User-confirmed.
+   - **Bank Write** (`type & 0xf8 == 0x00`, bank byte **1**): persisted into the flash
+     user bank. Bank 0 is the Factory ROM (read-only) — writes to it are ignored.
+     User-confirmed; matches the on-device convention `0 = Factory, 1 = User`.
 
-**Why this shape.** M3 shipped a read-only factory bank only (`M3_PATCH_BANKS.md §8`
-flagged "user banks (writable)" and "UI" as explicitly deferred). There is no on-device
-patch editor, so "save" means **duplicating an already-loaded patch** (factory or another
-user slot) into a user slot — not editing parameters on-device.
-
-**How the save source was scoped (important context for anyone picking this up).** The
-original ask included "MIDI SysEx patch upload from an editor" as a possible save source.
-Investigation found:
-- MBSID's SysEx protocol (`MbSidSysEx::cmdPatchWrite` → `MbSidEnvironment::sysexSetPatch`)
-  already fully supports receiving a patch dump and applying it live
-  (`toBank=false` branch — this is exactly what `mbsid_load_patch()` already calls).
-- But persisting a SysEx-received patch (`toBank=true` → `MbSidEnvironment::bankSave()`) is
-  an upstream **stub that returns `-2` "not supported yet"** — it does nothing. There is no
-  upstream persistence to reuse.
-- Worse, the gateware MIDI decoders (`tiliqua/midi/decode_serial.py`,
-  `tiliqua/midi/decode_usb.py`, both shared modules used by other tops) **currently drop all
-  SysEx bytes** (0xF0..0xF7) — there's an existing `# TODO: add a sideband stream for sysex
-  messages` comment; nobody built the pass-through path yet.
-- So "SysEx upload" requires new **shared gateware** (a sideband raw-byte stream out of both
-  MIDI decoders + a new CSR FIFO), not just firmware work. That's a materially bigger,
-  cross-cutting change.
-
-**Decision (user-confirmed):** this spec covers **factory-duplicate only**. SysEx upload is
-explicitly deferred to a **separate follow-on spec**, gated on the gateware sideband-stream
-work existing first. See §8.
-
-**Non-goals (this milestone):**
-- MIDI SysEx patch upload (deferred — see above).
-- On-device patch parameter editing.
+**Non-goals:**
+- On-device patch parameter editing (future milestone; this UI is its foundation).
+- MIDI TX / ACK-DISACK replies (§8 — documented limitation, candidate follow-on).
+- SysEx Patch Read / dump-to-editor (`cmd 0x01`), Ensemble dumps (`type 0x70`, an
+  upstream TODO), ASID. Parameter Write (`cmd 0x06`) works for free via the engine but
+  is not validated here.
 - Multiple user banks (one 128-slot User bank only).
-- Any change to the factory ROM bank or upstream `mios32` C++ (no upstream edits at all —
-  the only new C++ is one shim function, §3a).
+- Any edit to vendored `mios32/` C++ (impossible to hook `bankSave` anyway, §2).
 
----
+## 2. Source-verified constraints (why the design is shaped this way)
 
-## 2. Architecture & data flow
+All refs are `mios32/apps/synthesizers/midibox_sid_v3/core/`.
+
+1. **Upstream SysEx receive path is complete** (`MbSidSysEx.cpp`): header
+   `F0 00 00 7E 4B <devId>` (devId = 0, our facade's `MIOS32_MIDI_DeviceIDGet()` returns 0),
+   command byte (`0x02` = Patch Write), then type / bank / patch bytes, 1024 nibblized data
+   bytes (low nibble first → 512-byte `sid_patch_t`), checksum `(-sum & 0x7F)`, `F7`.
+   Dispatch: `cmdPatchWrite` (`:229`) → `MbSidEnvironment::sysexSetPatch` (`:253`).
+2. **`bankSave()` is a stub** returning `-2` (`MbSidEnvironment.cpp:96`) — no upstream
+   persistence exists. It is a **non-virtual** method defined inside a vendored `.cpp`:
+   it cannot be overridden, shadowed, or link-replaced without editing GPL vendored code.
+   **Therefore Bank Write persistence must be captured outside the engine** — in firmware
+   Rust, which owns the raw byte stream anyway.
+3. **The engine silently "succeeds" on Bank Write**: `sysexSetPatch(toBank=true)` calls
+   `bankSave`, *ignores* its return, and returns `true` (`MbSidEnvironment.cpp:258-260`).
+   Forwarding Bank Writes to the engine is therefore harmless (its parser state stays
+   consistent; the live sound is not changed — matching real MBSID semantics where a
+   bank write does not re-patch the playing voice).
+4. **The engine sends ACK/DISACK after every dump** via `sendAck` →
+   `MIOS32_MIDI_SendSysEx`, which our facade **swallows** (`fw/csrc/mios32_shim/mios32.h:163`,
+   comment says exactly this). No MIDI TX path exists in this port. See §8.
+5. **Gateware drops all SysEx today**: `MidiSysexFilter` (`tiliqua/midi/decode_serial.py:95`)
+   drains `F0..F7`; `MidiDecodeUSB` routes `SYSEX_START/END_1/2/3` CIN packets to `DRAIN`
+   (`decode_usb.py`). Both carry a `TODO: add a sideband stream for sysex messages`.
+   The codebase's own template for an opt-in sideband is `MidiRTFilter(forward=True)`
+   → `o_rt`.
+6. **Interrupted-SysEx engine quirk**: `MbSidSysEx::parse` aborts on any status byte
+   ≥ 0x80 mid-message (`cmdFinished`), consuming it — a subsequent `F0` arriving as the
+   aborting byte is *not* re-processed as a new header start, so the next message would
+   be lost. The gateware sideband must therefore deliver **well-framed** messages
+   (always `F0 … F7`, §4a), and firmware drives the upstream `timeOut()` hook on RX
+   gaps (§6a).
+7. **Getting the live patch out for on-device save is trivial**: `mbsid_bank_load`
+   already raw-copies `env.mbSid[0].mbSidPatch.body` (`fw/csrc/mbsid_shim.cpp:79-90`);
+   the save path just needs the same copy in the other direction. Reloading a saved
+   patch is the existing `mbsid_load_patch()` — no new load-side C++.
+
+## 3. Architecture & data flow
 
 ```
 Menu (fw/src/menu.rs, extended)
-  Bank row:    A (Factory ROM, 128) | U (User, 128)
-  Program row: 0-127, name from bankPatchNameGet (A) or flash-read name bytes (U)
-  Save row:    destination user-slot cursor 0-127, shows existing name or "Empty"
-               entering Edit = preview only; committing (see §3d) = flash write;
-               a distinct cancel path = exit without writing
+  Bank row:    0 Factory (ROM, 128) | 1 User (flash, 128)
+  Program row: 0-127; name from bankPatchNameGet (Factory) or flash name bytes (User)
+  Save row:    destination User-slot cursor; commit = flash write (§6d)
 
-Load path (unchanged shape for either bank source):
-  A: mbsid_bank_load(0, program)              [existing shim fn, upstream bankLoad]
-  U: flash read 512B @ slot(program)
-       -> if empty (magic/version check fails): render "Empty", do NOT load
-       -> if populated: mbsid_load_patch(bytes)   [existing shim fn, sysexSetPatch toBank=false]
+Load path:
+  Factory: mbsid_bank_load(0, program)             [existing shim fn]
+  User:    patch_store.load(program)               [flash read 512B + header check]
+             -> None (empty/bad header): render "Empty", do NOT touch the engine
+             -> Some(bytes): mbsid_load_patch(bytes)  [existing shim fn]
 
-Save path (new):
-  mbsid_current_patch_raw()   [ONE new shim fn: copies out env.mbSid[0].mbSidPatch.body,
-                                same field mbsid_bank_load already reads out]
-  -> flash write 512B @ slot(save_slot)   [new firmware-side flash module, §3c]
+Save paths (both end in the same flash write):
+  On-device:  mbsid_current_patch_raw() ──────────────┐
+  SysEx:      MIDI in ─► gateware sysex sideband ─► sysex_read CSR FIFO
+                ─► ISR: mbsid_sysex_byte(b) [engine: RAM Write applies live]
+                        + SysexCapture      [Rust: Bank Write bank 1 → 512B+slot] ─┤
+                                                                                   ▼
+                                             pending_save ─► main loop: patch_store.save
 ```
 
-**Storage mechanism — flat sector-per-slot, not `sequential_storage`/KV.** The existing
-generic option-persistence layer (`gateware/src/rs/opts/src/persistence.rs`,
-`FlashOptionsPersistence<F>`) wraps `sequential_storage::map`, which is built for many
-small, frequently-rewritten keys needing garbage collection. Our access pattern — 128 fixed
-512-byte blobs, individually addressable, written rarely — doesn't fit that model well and
-that module is welded to a 32-byte `DATA_BUFFER_SZ` and the `Options` trait anyway. Instead:
-one 4 KiB erase sector per patch slot (128 × 4 KiB = 512 KiB total). Save = erase sector +
-program 512 B. Load = read 512 B, check a magic/version prefix we write ourselves (upstream
-`sid_patch_t` has no "is this slot used" concept) before ever handing bytes to the engine —
-an unwritten (erased, `0xFF`-filled) slot must never reach `mbsid_load_patch`.
+**Storage mechanism — flat sector-per-slot, not `sequential_storage`/KV.** The generic
+option-persistence layer (`gateware/src/rs/opts/src/persistence.rs`) wraps
+`sequential_storage::map` — built for many small frequently-rewritten keys with GC, welded
+to a 32-byte buffer and the `Options` trait. Our pattern — 128 fixed 512-byte blobs,
+individually addressable, written rarely — wants: **one 4 KiB erase sector per slot**
+(128 × 4 KiB = 512 KiB). Save = erase sector + program header + 512 B. Load = read +
+verify header before bytes ever reach the engine (an erased `0xFF` slot or torn write
+must never reach `mbsid_load_patch`).
 
-**Region placement.** `0x900000`–`0x1000000` (~7 MiB) is unused by the existing flash
-layout: bootloader occupies `[0x0, 0x100000)`, up to 8 bitstream slots occupy
-`[0x100000, 0x900000)` at 1 MiB each (`gateware/src/rs/manifest/src/lib.rs`,
-`spiflash_layout.py`). We carve `0xF00000..0xF80000` (512 KiB) from that tail for the User
-bank. **Verified:** `pdm run flash` (`gateware/src/tiliqua/flash/__init__.py:66`,
-`compute_concrete_regions_to_flash`) only erases/programs the target slot's own manifest
-regions — never a full-chip erase, and option-storage erasure is opt-in
-(`--erase-option-storage`). So a fixed address in the unused tail persists across normal
-reflashes. It does **not** survive a full chip erase (out of scope to solve here — worth
-flagging as a known limitation, not a bug).
+**Region placement.** `0xF00000..0xF80000` (512 KiB) carved from the unused flash tail:
+bootloader `[0x0, 0x100000)`, 8 × 1 MiB bitstream slots `[0x100000, 0x900000)`
+(`gateware/src/rs/manifest/src/lib.rs`, `spiflash_layout.py`). **Verified:** `pdm run
+flash` (`gateware/src/tiliqua/flash/__init__.py:66`) only erases/programs the target
+slot's own manifest regions — never full-chip; option-storage erase is opt-in. So user
+patches survive normal reflashes. They do **not** survive a full chip erase (known
+limitation, not solved here).
 
----
+## 4. Gateware — SysEx sideband (shared module, opt-in)
 
-## 3. Components & interfaces
+**Approach: modify the existing shared decoders** (`tiliqua/midi/decode_serial.py`,
+`decode_usb.py`) with a constructor flag, exactly mirroring `forward_rt`. A separate
+decoder was considered and rejected: it would duplicate the serial RX, running-status
+FSM, and USB CIN parsing — two divergent copies of subtle MIDI logic — for zero benefit.
+With the flag defaulted off, the port doesn't exist and elaborated logic is unchanged,
+so **no other top is affected** and no re-validation of other bitstreams is needed.
 
-### 3a. Shim — `fw/csrc/mbsid_shim.cpp` (one new function)
+### 4a. `MidiSysexFilter(forward=False)` (serial path)
+- When `forward=True`, expose `o_sysex: Out(stream.Signature(unsigned(8)))`.
+- `PASS` state: on `F0`, emit it on `o_sysex` and enter `SYSEX`.
+- `SYSEX` state: forward every byte to `o_sysex`. Termination:
+  - `F7` → forward it, back to `PASS`.
+  - any other status byte (interrupted message) → emit a **synthetic `F7`** on `o_sysex`
+    first, then re-handle the status byte on the normal path (it must not be swallowed —
+    today's filter consumes it; the forwarding variant must return it to the main
+    stream). This keeps the sideband always `F0 … F7`-framed (see §2.6). RT bytes never
+    reach this filter (stripped upstream by `MidiRTFilter`).
+- **Backpressure is honored** (unlike `o_rt`'s fire-and-forget): when `o_sysex` is not
+  ready, stall the input (`i.ready` low). SysEx is bulky (one patch dump ≈ 1.6 KB on the
+  wire); dropping bytes silently corrupts patches. This stalls the whole MIDI stream
+  behind a full sideband — acceptable because the CSR FIFO is drained every 1 ms tick
+  (§6a) and serial MIDI is only ~3.1 KB/s.
+
+### 4b. `MidiDecodeUSB(forward_sysex=False)`
+- Same flag/port. The CIN cases `SYSEX_START` (3 bytes), `SYSEX_END_1/2/3` (1/2/3
+  bytes) — today `DRAIN`ed — emit their payload bytes on `o_sysex`, with honored
+  backpressure (hold `i.ready` low while emitting). USB can burst far faster than
+  serial; backpressure propagates to the `USBMIDIHost` packet stream, the correct
+  throttle.
+- Same synthetic-`F7` framing rule if a dump is cut off (cable unplug mid-dump —
+  firmware `timeOut()` also covers this, §6a).
+
+### 4c. `SIDPeripheral` — new `sysex_read` CSR + FIFO (flag-gated)
+- New param `with_sysex=False` on `SIDPeripheral`/`SIDSoc`; `MBSIDSoc`
+  (`top/mbsid/top.py`) passes `True`. `top/sid` elaborates unchanged.
+- New register `sysex_read` (offset `0x18`, next free after `usb_midi_endp` @ `0x14`),
+  16-bit read: **bit 8 = valid, bits 7:0 = data byte**. (The `midi_read` "read until 0"
+  idiom does NOT work here — `0x00` is a legal SysEx data byte, so an explicit valid
+  bit is required.) Backed by `SyncFIFOBuffered(width=8, depth=64)`; upstream
+  backpressure means no silent overflow — when full, the decoder stalls.
+- The existing `usb_midi_host` CSR mux selects which decoder's `o_sysex` feeds the FIFO
+  (same `m.If/Else` `wiring.connect` pattern as `i_midi`); the unselected side is
+  drained (`ready=1`) so a source switch mid-dump can't wedge the other decoder.
+- **PAC regen required** (`pdm mbsid build --pac-only`) — first CSR change since M2.
+
+### 4d. Gateware tests
+Amaranth sim (in `tests/`, alongside existing MIDI decoder tests): per decoder,
+(a) flag off → bit-identical behavior to today; (b) flag on → an `F0 … F7` sequence
+appears verbatim on `o_sysex` while channel messages still parse on `o`;
+(c) interrupted SysEx → synthetic `F7` emitted and the interrupting status byte still
+parsed normally; (d) `o_sysex.ready=0` stalls input without byte loss.
+
+## 5. Shim + FFI (no upstream edits)
+
+`fw/csrc/mbsid_shim.cpp`, three new functions:
 ```c
-void mbsid_current_patch_raw(uint8_t *buf512);  // copies env.mbSid[0].mbSidPatch.body out
+// On-device save: copy the live patch out (mirror of the raw copy already done
+// inside mbsid_bank_load, other direction).
+void mbsid_current_patch_raw(uint8_t *buf512);   // copies env.mbSid[0].mbSidPatch.body
+// Feed one raw SysEx byte to the engine's parsers (MbSidSysEx + MbSidAsid).
+// Returns nonzero if consumed as SysEx.
+int  mbsid_sysex_byte(uint8_t b);                // env.midiReceiveSysEx(DEFAULT, b)
+// Abort a half-received message after an RX gap (upstream MIDI-timeout hook).
+void mbsid_sysex_timeout(void);                  // env.midiTimeOut(DEFAULT)
 ```
-Mirrors the existing raw-copy already done inside `mbsid_bank_load`
-(`fw/csrc/mbsid_shim.cpp:82`). No upstream `.cpp`/`.h` edits.
+Matching `fw/src/mbsid_sys.rs` FFI (riscv `extern "C"` + host stub, existing pattern).
+`MbSidAsid` also sees the bytes; it stays inert unless an ASID stream is sent (out of
+scope, harmless — already linked, per `CLAUDE.md`).
 
-### 3b. FFI — `fw/src/mbsid_sys.rs`
-Add `current_patch_raw() -> [u8; 512]`, riscv `extern "C"` block + host stub, matching the
-existing pattern for every other function in this file.
+## 6. Firmware
 
-### 3c. New flash module — `fw/src/patch_store.rs` (new file)
+### 6a. SysEx drain (Timer0 ISR, after the existing `midi_read` drain)
+Engine access is single-threaded through the 1 kHz ISR (`mbsid_tick` vs.
+`midiReceiveSysEx` must not race), so SysEx bytes are fed **in the ISR**:
+- Each tick, pop up to **32 bytes** from `sysex_read` (valid-bit loop). 32 B/ms drain
+  ≫ 3.1 KB/s serial; USB is backpressured by the FIFO, so the cap costs only latency
+  (a full 1.6 KB dump ≈ 50 ms — irrelevant), never data. The cap keeps the ISR bounded.
+- Each byte goes to **both** consumers, in order:
+  1. `mbsid_sysex_byte(b)` — the engine applies RAM Writes live (whole upstream path,
+     checksum included, for free).
+  2. the Rust `SysexCapture` parser (§6b) — persists Bank Writes.
+- **Timeout:** if either parser is mid-message and no SysEx byte arrived for ≥ 500 ms,
+  call `mbsid_sysex_timeout()` and reset `SysexCapture`. **[DEFAULT]** 500 ms — long
+  enough for editor inter-message pauses, short enough to recover a wedged parser.
+
+### 6b. `fw/src/sysex_capture.rs` (new, host-testable, no FFI)
+A byte-at-a-time state machine mirroring `cmdPatchWrite`'s framing exactly: header
+`F0 00 00 7E 4B 00`, cmd `0x02`, type/bank/patch, nibble pairs assembled in place into a
+`[u8; 512]` (low nibble first), running checksum, checksum byte, `F7`.
+
+Accept-and-persist condition (all must hold; anything else = ignore silently — the
+engine still sees the bytes and does its own thing):
+- `type & 0xf8 == 0x00` (Bank Write) and `type & 0x07 == 0` (sid 0 — we present one
+  logical MBSID; the stereo pair is one engine).
+- bank byte == **1** (User). Bank 0 = Factory ROM, read-only → ignored, never
+  persisted. Banks ≥ 2 don't exist → ignored. User slot = patch byte (0–127).
+- checksum valid, exactly 1024 data bytes, terminated by `F7` (a synthetic `F7` from
+  §4a arriving early = wrong length = reject).
+- RAM Writes (`type & 0xf8 == 0x08`) are never captured — audition only (user-confirmed).
+
+On accept: stash `(slot, [u8; 512])` into `App` as `pending_save` — **no flash I/O in
+the ISR** (sector erase + program takes ms–tens of ms; the ISR budget is 1 ms).
+
+### 6c. `fw/src/patch_store.rs` (new)
 ```rust
-const USER_PATCH_FLASH_RANGE: Range<u32> = 0xF00000..0xF80000; // 512 KiB, unused tail
-const SLOT_SIZE: u32 = 4096;      // one erase sector per patch
-const MAGIC: [u8; 4] = *b"MBUP";  // marks a slot as populated (vs erased 0xFF)
+const USER_PATCH_FLASH_RANGE: Range<u32> = 0xF00000..0xF80000; // 512 KiB unused tail
+const SLOT_SIZE: u32 = 4096;                                   // one erase sector/slot
+// 8-byte slot header, written AFTER the payload within the same program sequence:
+//   magic  [u8; 4] = *b"MBUP"
+//   ver    u8      = 1
+//   _pad   u8
+//   cksum  u16     — additive checksum over the 512 payload bytes
+// Torn-write safety: erase clears everything to 0xFF; load() verifies magic, version,
+// AND payload checksum, so a save interrupted anywhere (post-erase, mid-program)
+// reads back as empty/invalid — never as a corrupt patch fed to the engine.
 
 pub struct UserPatchStore<F> { flash: F }
 impl<F: NorFlash> UserPatchStore<F> {
-    pub fn load(&mut self, slot: u8) -> Option<[u8; 512]>;   // None if empty/bad magic
-    pub fn save(&mut self, slot: u8, patch: &[u8; 512]) -> Result<(), Error>;  // erase+program
-    pub fn name(&mut self, slot: u8) -> Option<[u8; 16]>;    // reads name bytes only, no full load
+    pub fn load(&mut self, slot: u8) -> Option<[u8; 512]>;  // None: empty/bad hdr/cksum
+    pub fn save(&mut self, slot: u8, patch: &[u8; 512]) -> Result<(), Error>;
+    pub fn name(&mut self, slot: u8) -> Option<[u8; 16]>;   // header + name bytes only
 }
 ```
-Generic over `F` so a host test can inject an in-memory mock — this is the save/load
-keystone test (flash can't run in the host oracle).
+Generic over `F: NorFlash` so host tests inject an in-memory mock (flash can't run in
+the host oracle) — this module is the save/load keystone test target.
 
-### 3d. `menu.rs` changes
-- `Row` gains `Save`; `MenuState` gains `save_slot: u8`; `bank` semantics extend to
-  `0 = Factory, 1 = User`.
-- `on_turn` on the Save row behaves like Program (Edit-mode scroll 0-127, clamped) but
-  never triggers a patch **load** — it triggers a **preview** (query
-  `patch_store.name(save_slot)` for display) instead.
-- `on_press` is special-cased for the Save row: the **Edit → Nav transition specifically on
-  `Row::Save`** is the commit point (do the flash write). A **Nav → Edit** transition, or a
-  distinct cancel path, does not write. Concretely, `on_press` returns
-  `PressResult { None, Commit, Cancel }` computed from `(focus, mode)` before toggling, so
-  the write happens exactly once, only on deliberate confirmation — never on every encoder
-  tick while previewing a destination slot.
-- Bank/Program `on_turn` for the User bank must check `patch_store.load(program)` is `Some`
-  before calling `mbsid_load_patch` — on `None`, render "Empty" and skip the load entirely
-  (the empty-slot safety guard; same class of concern as M3's non-Lead-patch safety
-  argument in `M3_PATCH_BANKS.md §4`).
+### 6d. `menu.rs` — Bank/Program/Save rows
+- `Row` gains `Save`; `bank` semantics extend to `0 = Factory, 1 = User`.
+- Program row, User bank: `patch_store.load(program)` must be `Some` before
+  `mbsid_load_patch` — on `None`, render "Empty" and skip the load entirely (empty-slot
+  safety guard; same class of concern as M3's non-Lead-patch safety argument).
+- Save row `on_turn` (Edit mode): scroll the destination cursor; **preview only**
+  (query `patch_store.name()` for display; show "Empty" for unused slots). Never loads,
+  never writes per-tick.
+- **Commit/cancel [DEFAULT]:** the Save row's Edit-mode cursor is rendered as
+  `Cancel, 0..127`, entering Edit at `Cancel`. Press (Edit → Nav) on a slot number =
+  commit (the one write); press on `Cancel` = exit without writing. `on_press` returns
+  `PressResult { None, Commit(slot), Cancel }` computed from `(focus, mode, cursor)`
+  before toggling, so the write happens exactly once, only on deliberate confirmation.
+- Saving is allowed regardless of which engine the live patch uses (Lead/Bassline/
+  Drum/Multi) — the 512 bytes are engine-agnostic `sid_patch_t`, and reloading any of
+  them is crash-safe (M3's argument).
 
-### 3e. `main.rs` wiring
-- Save-row commit: `mbsid_sys::current_patch_raw()` → `patch_store.save(slot, &bytes)`.
-- Bank=User load: `patch_store.load(program)` → `mbsid_sys::load_patch(&bytes)` (existing
-  M1-era function) instead of `mbsid_bank_load` (which is ROM-only; `SID_BANK_NUM` stays `1`
-  upstream and is never touched).
+### 6e. `main.rs` wiring
+- Main loop checks `pending_save` under `critical_section` (both the SysEx path §6b and
+  a menu commit §6d land here), takes it, calls `patch_store.save()`. Audio keeps
+  running — the engine ticks from BRAM; flash writes don't touch the audio path.
+- On success set the `dirty` UI flag and show `Saved U<slot>`; on error `Save failed`.
+  This status line is the only feedback we can give without MIDI TX (§8).
+- User-bank loads: `patch_store.load(program)` → `mbsid_sys::load_patch()` (existing
+  M1-era fn). `mbsid_bank_load` stays Factory-only; upstream `SID_BANK_NUM` untouched.
 
----
+### 6f. Footprint (re-verify at implementation)
+New `.bss`: 512 B SysEx capture buffer + ~16 B parser state + 512 B `pending_save`
++ 512 B load/save scratch (share one buffer where possible). `CLAUDE.md` records
+`.bss` 6884 B + stack 25880 B against the 0x8000 mainram — nearly exact; re-measure the
+map after adding buffers and shrink the reserve consciously, don't discover it via
+stack overflow.
 
-## 4. Deferred / not yet specced (do not implement yet)
+## 7. Validation
 
-The following sections still need to be worked through with the user before this doc is
-implementation-ready:
+- **Host unit tests** (`cargo test --target x86_64-unknown-linux-gnu --lib`):
+  - `patch_store` (mock flash): save/load round-trip, empty-slot detection, overwrite,
+    torn-write simulation (truncate the mock mid-program → `load` returns `None`).
+  - `sysex_capture`: golden round-trip (encode a known 512-byte patch as SysEx, feed
+    byte-wise, assert exact buffer + slot), wrong checksum → reject, truncated
+    (synthetic `F7`) → reject, RAM Write type → no capture, bank 0 / bank ≥ 2 / sid ≠ 0
+    → no capture, garbage between messages tolerated.
+  - `menu` Save row: cursor/preview, `Commit` exactly once on press-at-slot, `Cancel`
+    writes nothing, "Empty" rendering.
+- **Oracle extension** (`host_oracle/run_oracle.sh`): new sequence command `syx <hex>`
+  feeding `mbsid_sysex_byte` in both drivers. Test: a RAM-Write dump of factory patch N
+  must produce a register stream **byte-identical** to `pc N` — proves the engine-side
+  SysEx path end-to-end with zero gateware.
+- **Gateware sim**: §4d.
+- **Hardware acceptance** (SysEx via `amidi`/`sendmidi` scripting, which sidesteps the
+  ACK-wait problem, §8):
+  1. On-device: save a factory patch to a User slot, power-cycle, browse User bank,
+     it reloads and sounds identical; Cancel writes nothing; empty slots show "Empty"
+     and don't load.
+  2. Reflash a bitstream slot → user patches intact.
+  3. SysEx RAM Write → sound changes live, nothing persisted.
+  4. SysEx Bank Write (bank 1) to slot k → `Saved U k`, power-cycle, slot k loads and
+     sounds identical. Bank Write to bank 0 → ignored, nothing persisted.
+  5. Same over USB MIDI; mid-dump unplug → recovers within timeout, next dump OK.
 
-- **Edge cases & error handling.** At minimum, still needs explicit treatment of: flash
-  write failure mid-save (torn write — erase succeeded, program failed/partial), what
-  happens if Save is entered while the currently-loaded patch is itself from an empty/never-
-  loaded state, whether saving is allowed while a non-Lead engine patch is active, and the
-  Save-row cancel UX in more detail (the doc above states the *rule* — commit only on
-  Edit→Nav — but the concrete cancel gesture, e.g. long-press vs. re-entering Nav via the
-  Bank/Program rows, isn't chosen yet).
-- **Validation / acceptance tests.** Not yet written: host-side tests for `patch_store`
-  (mock flash — save/load round-trip, empty-slot detection, overwrite), extended `menu.rs`
-  host tests for the Save row state machine (slot pick, commit, empty display, cancel),
-  and a hardware acceptance checklist (save a factory patch to a user slot, power-cycle,
-  confirm it reloads; confirm reflashing a bitstream slot doesn't clobber user patches).
-- **Footprint.** New flash region size is chosen (512 KiB) but the actual `.bss`/stack
-  impact of `patch_store.rs` + any buffering hasn't been checked against the `0x8000`
-  mainram budget noted in `CLAUDE.md`.
-- **Documentation follow-ups.** `DESIGN.md §10` and `M3_PATCH_BANKS.md §8` should be updated
-  to point at this doc once it's final.
+## 8. Known limitation — no ACK/DISACK (MIDI TX)
 
----
+Every dump is answered upstream by ACK/DISACK; our facade swallows it. Consequences:
+- Fire-and-forget senders (scripted `amidi`/`sendmidi`, most single-patch "send"
+  buttons) work fine.
+- Editor workflows that **wait for ACK per patch** (typically full-bank uploads) will
+  time out or stall. Workaround: scripted per-patch sends with a fixed inter-message gap.
 
-## 5. Forward-compatibility (later milestones — NOT built now)
+Fixing this needs a MIDI TX path (gateware serial TX or USB routing toward the host,
+plus facade `MIOS32_MIDI_SendSysEx` routed to it) — deliberately out of scope; candidate
+next milestone. The facade comment already anticipates the routing. SysEx Patch Read
+(`cmd 0x01`, dump-to-editor) becomes possible at the same time.
 
-- **MIDI SysEx patch upload.** Blocked on new shared gateware: a sideband raw-byte SysEx
-  stream out of `MidiDecodeSerial`/`MidiDecodeUSB` (both currently drop SysEx bytes
-  entirely) plus a new CSR FIFO to carry it to firmware. Once that exists, the firmware
-  side is small: one new shim function forwarding bytes to `env.midiReceiveSysEx()`
-  (already reachable — `env` in `mbsid_shim.cpp` is already an `MbSidEnvironment`), feeding
-  a byte-level receive loop that lands received patches into a User slot via the same
-  `patch_store.save()` built here.
+## 9. Documentation follow-ups (with the implementation, not before)
 
----
+- `DESIGN.md §10` and `M3_PATCH_BANKS.md §8`: point at this doc.
+- `CLAUDE.md` (this dir): SysEx path summary + the bank 0/1 convention + PAC-regen note.
 
-## 6. Reference pointers
+## 10. Reference pointers
 
-- Factory bank (read-only): `M3_PATCH_BANKS.md`.
-- Upstream stub confirming no persistence to reuse:
-  `mios32/apps/synthesizers/midibox_sid_v3/core/MbSidEnvironment.cpp:96-105` (`bankSave`),
-  `:253-266` (`sysexSetPatch`).
-- Upstream SysEx receive protocol (usable once gateware sideband exists):
-  `mios32/apps/synthesizers/midibox_sid_v3/core/MbSidSysEx.cpp` (`cmdPatchWrite`).
-- SysEx currently dropped in gateware: `gateware/src/tiliqua/midi/decode_serial.py:98`,
-  `gateware/src/tiliqua/midi/decode_usb.py:46`.
-- Existing raw-patch-copy-out precedent: `fw/csrc/mbsid_shim.cpp:79-90` (`mbsid_bank_load`).
-- Existing generic flash-KV pattern (not reused, but the precedent for
-  `NorFlash`/`MultiwriteNorFlash` HAL usage): `gateware/src/rs/opts/src/persistence.rs`.
-- Flash layout / manifest / slot regions: `gateware/src/rs/manifest/src/lib.rs`,
-  `gateware/src/tiliqua/flash/spiflash_layout.py`, `gateware/src/tiliqua/flash/__init__.py`.
-- Menu to extend: `fw/src/menu.rs`.
+- Upstream protocol: `mios32/.../core/MbSidSysEx.cpp` (`parse` :74, `cmd` :150,
+  `cmdPatchWrite` :229), `MbSidEnvironment.cpp` (`bankSave` :96, `midiReceiveSysEx`
+  :199, `sysexSetPatch` :253).
+- Facade stubs: `fw/csrc/mios32_shim/mios32.h:163` (`SendSysEx`), `:192` (`DeviceIDGet`).
+- Sideband template: `MidiRTFilter` (`tiliqua/midi/decode_serial.py:46`); SysEx drop
+  sites: `decode_serial.py:95`, `decode_usb.py` `DRAIN` state.
+- MIDI mux + CSR wiring to copy: `top/sid/top.py:578-607` (decoders + `usb_midi_host`
+  mux), `:296-438` (`midi_read` FIFO/CSR — see §4c for the valid-bit difference).
+- ISR drain pattern to extend: `top/mbsid/fw/src/main.rs` `timer0_handler`.
+- Raw-patch-copy-out precedent: `fw/csrc/mbsid_shim.cpp:79-90` (`mbsid_bank_load`).
+- Flash HAL precedent (not reused, but the `NorFlash` usage pattern):
+  `gateware/src/rs/opts/src/persistence.rs`.
+- Flash layout: `gateware/src/rs/manifest/src/lib.rs`,
+  `gateware/src/tiliqua/flash/spiflash_layout.py`,
+  `gateware/src/tiliqua/flash/__init__.py`.
+- Factory bank (read-only): `M3_PATCH_BANKS.md`. Menu to extend: `fw/src/menu.rs`.
