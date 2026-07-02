@@ -23,7 +23,14 @@ factory ROM bank, `M3_PATCH_BANKS.md`).
    currently-loaded patch into a chosen User slot ("save as"/duplicate). Kept (despite
    SysEx existing) as groundwork for future on-device patch editing.
 3. **MIDI SysEx patch upload** — receive MBSID-protocol patch dumps (MIDIbox SID Editor
-   or any tool speaking the protocol) over TRS or USB MIDI:
+   or any tool speaking the protocol) over TRS or USB MIDI. **The USB port is a host
+   port** (`USBMIDIHost` in `top.py`, unchanged from `top/sid`) — Tiliqua enumerates a
+   MIDI device plugged into it, the same as any USB host. It never presents itself as a
+   MIDI device to a PC, so it will not appear in the PC's own `lsusb`/`amidi -l`, and a
+   plain PC-to-Tiliqua USB-C cable cannot carry SysEx either direction (two hosts can't
+   enumerate each other). For a PC-scripted upload (`amidi`/`sendmidi`), use the **TRS**
+   path: a class-compliant USB-MIDI interface plugged into the PC (that's what shows up
+   as `hw:X`), with a TRS/MIDI cable from it into Tiliqua's TRS MIDI-in jack:
    - **RAM Write** (`type & 0xf8 == 0x08`): applied live by the upstream engine —
      audition only, never auto-persisted (matches MBSID editor semantics: "send"
      auditions, "store" persists). User-confirmed.
@@ -332,7 +339,10 @@ SysEx items use `amidi`/`sendmidi` scripting, which sidesteps the ACK-wait probl
       sound changes live, nothing persisted.
 - [ ] SysEx Bank Write bank 1 slot k → `Saved U00k`, power-cycle, loads identically;
       bank 0 write → ignored.
-- [ ] Same over USB MIDI; mid-dump unplug → recovers ≤ 500 ms idle, next dump OK.
+- [ ] Same over USB MIDI: set the menu's `MIDI Src` row to `USB`, plug a class-compliant
+      USB MIDI device that can transmit SysEx *into Tiliqua's USB-C port* (Tiliqua is the
+      USB host here — a PC's own USB port cannot act as that device; see §1's host-port
+      note). Mid-dump unplug → recovers ≤ 500 ms idle, next dump OK.
 
 ## 8. Known limitation — no ACK/DISACK (MIDI TX)
 
