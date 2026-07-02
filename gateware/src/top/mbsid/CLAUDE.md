@@ -4,13 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-06-28): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); hardware bring-up pending.**
+**Status (2026-07-02): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); hardware bring-up pending for all of the above.**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
-Multi differential + 128-patch sweep), host `cargo test --lib`, full bitstream build, `sync`
-Fmax 68.27 MHz PASS. The one thing NOT yet validated is **playback on real hardware** (DESIGN §7
-milestones 2–3).
+Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
+host `cargo test --lib` (41/41, incl. `patch_store`/`sysex_capture`/menu Save-row), full
+bitstream build, `sync` Fmax 61.76 MHz PASS. The one thing NOT yet validated is **playback
+and the M4 SysEx/user-bank flows on real hardware** (DESIGN §7 milestones 2–3;
+`M4_USER_PATCH_BANKS.md §7` hardware checklist).
 
 ## Vendored engine (not in this repo)
 
@@ -104,8 +106,27 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   (Rust FFI + both oracle drivers) together (extern "C", no mangling guard).
 - **Drum engine SIGSEGV at t≈4182ms (MASTER clock mode):** `MbSidWtDrum::tick()` dereferences a sentinel pointer `(MbSidDrum*)1` roughly 4.18s after loading a Drum patch with no external MIDI clock. The oracle sequences end before this window; on hardware, use an external MIDI clock or trigger reload before 4s. See `.scratch/mbsid-drum-sigsegv/issue.md`.
 - **`MbSidClock` AUTO mode stays in MIDI-slave mode (WT frozen) until ~4095ms**, then falls back to its internal BPM master clock — same threshold as the Drum SIGSEGV above, but it affects *any* oracle test that needs the WT to actually step (e.g. Multi WT→filter modulation). Stock sequences like `seq_multi.txt` end at ~1200ms and never reach this window, so WT-dependent asserts silently no-op — extend the sequence past ~4.1s locally in the test (don't edit the shared `.txt` file; see `run_oracle.sh`'s A107 block for the pattern) and use a discriminating check (helper disabled → must still FAIL) to rule out false positives from the clock switch itself.
+- **Multi engine: repeating one note on a fixed MIDI channel can alternate L/R in blocks of 3 — by upstream design, not a Tiliqua bug.** Root cause is `MbSidVoiceQueue`/`MbSidSeMulti::voiceGet` (`MbSidSeMulti.cpp:476-491`): when an instrument's `voice_asg` patch param is 0 ("all voices"), every note-on round-robins through all 6 physical oscillators via a least-recently-used queue (voices 0-2 = Left SID, 3-5 = Right, same `physVoice = voice % 3` split as Lead). Retriggering the same note repeatedly therefore cycles 0→1→2→3→4→5→0→…, i.e. 3 notes on L then 3 on R, forever. Reproduced bit-exact on the host oracle (no gateware/shim involved) — confirmed with `pc 60 / ch 0 / on 60 100 / off 60` repeated 6× in a `host_oracle` sequence, gate-on lands on L(v0,v1,v2) then R(v0,v1,v2). Lead is unaffected — it always gates all 6 voices (both SIDs) simultaneously (`MbSidSeLead.cpp:391,428`), no `VoiceQueue` involved. Fix, if ever wanted, is patch-side (`voice_asg` = left-only/right-only instead of all), not firmware.
 - **GPL.** Linking the MBSID C++ into the firmware makes the distributed bitstream firmware
   GPL (fine for personal/open use).
+- **M4 SysEx path (full design in `M4_USER_PATCH_BANKS.md`):** gateware sideband
+  (`forward_sysex` on `MidiDecodeUSB`/`MidiSysexFilter`, opt-in, `top/sid` unaffected)
+  → `sysex_read` CSR at offset **`0x24`** on `SIDPeripheral`, a **valid-bit read**
+  (bit 8 = valid, bits 7:0 = data) — this is NOT the `midi_read` "read until 0" idiom,
+  because `0x00` is a legal SysEx data byte. The Timer0 ISR drains it (`SYSEX_BYTES_PER_TICK
+  = 32` per 1 ms tick, `fw/src/main.rs`) and feeds every byte to **both** consumers: the
+  engine (`mbsid_sysex_byte` — RAM Writes apply live, audition only) and Rust
+  `SysexCapture` (`fw/src/sysex_capture.rs` — Bank Write bank **1** only; bank 0 = Factory
+  ROM, ignored/read-only). A captured Bank Write lands in `UserPatchStore`
+  (`fw/src/patch_store.rs`) at flash `0xF00000..0xF80000`, 128 × 4 KiB slots, header
+  written *after* the payload (torn-write safe). `SYSEX_TIMEOUT_MS = 500` resets both
+  parsers on an RX gap.
+- **No MIDI TX — ACK/DISACK is swallowed** (the facade has no route back to any MIDI
+  output). Editors/workflows that wait for a per-patch ACK before sending the next dump
+  will stall or time out; use scripted fire-and-forget sends (`amidi`/`sendmidi`) instead.
+- **`sysex_read` was the first CSR change since M2's `phi2_sel`** — touching
+  `SIDPeripheral` registers again needs `pdm mbsid build --pac-only` before `--fw-only`,
+  same as any other CSR change (root `CLAUDE.md`).
 
 ## Build & test
 

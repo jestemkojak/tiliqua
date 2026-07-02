@@ -230,7 +230,8 @@ the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/
   spec/plan and `README.md` for the channel map.
 - **Patch bank storage.** Read-only ROM-baked factory bank **done** — see
   `M3_PATCH_BANKS.md` (all 128 factory patches selectable over MIDI Program Change).
-  Writable user banks (flash) and a browse UI remain deferred.
+  Writable user banks (flash), the on-device browse/save UI, and MIDI SysEx patch
+  upload are also **done** — see `M4_USER_PATCH_BANKS.md`.
 - **Wave-sequencer / full MBSID UI** (the macro_osc `opts`/`ui`/`draw` pattern is the model).
 - **ASID** (`MbSidAsid` — currently excluded from the Lead subset, §3).
 
