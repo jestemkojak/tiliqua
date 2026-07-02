@@ -155,9 +155,10 @@ still sees the bytes and does its own thing):
   logical MBSID; the stereo pair is one engine).
 - checksum valid, exactly 1024 data bytes, terminated by `F7` (a synthetic `F7` from §3a
   arriving early = wrong length = reject).
-- **[DECISION]** bank byte: proposal = accept **bank 0 only** → user-bank slot = patch
-  byte (0–127). Other banks ignored (we have one user bank). Alternative: accept any
-  bank byte and ignore it.
+- bank byte == **1** (the User bank, matching the M4 on-device convention
+  `0 = Factory, 1 = User`) → user-bank slot = patch byte (0–127). Bank 0 is the
+  read-only Factory ROM: a Bank Write addressed to it is ignored (never persisted).
+  Banks ≥ 2 don't exist and are ignored. (User-confirmed 2026-07-02.)
 - **[DECISION]** RAM Writes are applied live by the engine but NOT auto-persisted
   (matches MBSID semantics: editor "send" = audition, "store" = Bank Write). Alternative:
   a menu toggle to also capture RAM Writes into a "last received" slot.
@@ -193,8 +194,9 @@ consciously, don't discover it via stack overflow.
   SysEx path end-to-end with zero gateware.
 - **Gateware sim**: §3d.
 - **Hardware acceptance**: from MIDIbox SID Editor (or a `amidi`/`sendmidi` script, which
-  avoids the ACK-wait problem, §7): (1) RAM Write → sound changes live; (2) Bank Write to
-  slot k → "Saved U k", power-cycle, browse User bank, slot k loads and sounds identical;
+  avoids the ACK-wait problem, §7): (1) RAM Write → sound changes live; (2) Bank Write
+  (bank 1) to slot k → "Saved U k", power-cycle, browse User bank, slot k loads and
+  sounds identical; (2b) Bank Write to bank 0 (Factory) → ignored, nothing persisted;
   (3) same over USB MIDI; (4) mid-dump unplug → recovers within timeout, next dump OK.
 
 ## 7. Known limitation — no ACK/DISACK (MIDI TX)
