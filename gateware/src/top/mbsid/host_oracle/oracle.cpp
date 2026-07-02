@@ -37,6 +37,13 @@ struct OracleBackend {
     void cc(int chn, int num, int val)        { env.mbSid[0].midiReceiveCC((u8)chn, (u8)num, (u8)val); }
     void bend(int chn, int val14)             { env.mbSid[0].midiReceivePitchBend((u8)chn, (u16)val14); }
     void aftertouch(int chn, int val)         { env.mbSid[0].midiReceiveAftertouch((u8)chn, (u8)val); }
+    void sysex_byte(uint8_t b) { env.midiReceiveSysEx(DEFAULT, b); }
+    void sysex_patch_dump(int row) {
+        unsigned char msg[1036];
+        // type 0x08 = RAM Write sid 0 (applies live, like load_patch).
+        seq_encode_patch_dump(sid_bank_preset_0[row], 0x08, 0x00, 0x00, msg);
+        for (int i = 0; i < 1036; ++i) sysex_byte(msg[i]);
+    }
     int  tick() {
         int changed = env.tick() ? 1 : 0;
         mbsid_multi_wt_fixup(env.mbSid[0]);

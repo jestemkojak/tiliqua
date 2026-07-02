@@ -192,6 +192,60 @@ else
     echo "FAIL: A107 filter cutoff static (L=$l_changes R=$r_changes) — WT->filter not applied"; fail=1
 fi
 
+# --- M4 SysEx RAM-Write path: a full nibblized+checksummed dump through
+#     MbSidSysEx::parse must be byte-identical to the direct sysexSetPatch
+#     load of the same preset (proves the engine-side SysEx receive path
+#     end-to-end, zero gateware). Also shim==oracle on the syx path itself. ---
+echo "=== SysEx RAM-Write equivalence (syxpc == patch) ==="
+for row in 0 123; do
+    for cmd in patch syxpc; do
+        tmp="$BUILD/syx_${cmd}_${row}.txt"
+        # seq_lead_basic.txt deliberately omits the patch-select line (see its
+        # header comment); prepend "0 $cmd $row" the same way the main loop
+        # above prepends "0 patch/pc $row" for the non-syx equivalence sweep.
+        { echo "0 $cmd $row"; cat "$HERE/sequences/seq_lead_basic.txt"; } > "$tmp"
+        "$BUILD/oracle"      "$tmp" > "$BUILD/syx_${cmd}_${row}.oracle.trace"
+        "$BUILD/shim_driver" "$tmp" > "$BUILD/syx_${cmd}_${row}.shim.trace"
+        if ! diff -u "$BUILD/syx_${cmd}_${row}.oracle.trace" "$BUILD/syx_${cmd}_${row}.shim.trace"; then
+            echo "FAIL: syx block shim!=oracle ($cmd row=$row)"; exit 1
+        fi
+    done
+    if ! diff -u "$BUILD/syx_patch_${row}.oracle.trace" "$BUILD/syx_syxpc_${row}.oracle.trace"; then
+        echo "FAIL: RAM-Write dump != direct load (row=$row)"; exit 1
+    fi
+    lines=$(wc -l < "$BUILD/syx_syxpc_${row}.oracle.trace")
+    if [ "$lines" -lt 10 ]; then
+        echo "FAIL: syx trace trivially empty (row=$row, $lines lines)"; exit 1
+    fi
+    echo "OK: SysEx RAM-Write == direct load (row=$row, $lines reg writes)"
+done
+
+# Negative: a corrupted-checksum dump must change NOTHING (trace identical to
+# the same sequence with the dump line removed entirely).
+echo "=== SysEx bad-checksum rejection ==="
+python3 - "$HERE" "$BUILD" <<'EOF'
+import sys, os
+here, build = sys.argv[1], sys.argv[2]
+# Build a RAM-Write dump (type 0x08 — would apply LIVE if accepted, which
+# makes "state unchanged" the sharpest assertion) with a WRONG checksum.
+body = bytearray([0xF0,0x00,0x00,0x7E,0x4B,0x00,0x02,0x08,0x00,0x00])
+body += bytes(1024)              # nibbles of an all-zero patch, sum = 0
+body += bytes([0x01])            # correct would be 0x00
+body += bytes([0xF7])
+hexs = body.hex()
+with open(os.path.join(build, "syx_bad.txt"), "w") as f:
+    f.write(f"0 syx {hexs}\n")
+    f.write("10 on 60 100\n900 off 60\n1000 end\n")
+with open(os.path.join(build, "syx_none.txt"), "w") as f:
+    f.write("10 on 60 100\n900 off 60\n1000 end\n")
+EOF
+"$BUILD/shim_driver" "$BUILD/syx_bad.txt"  > "$BUILD/syx_bad.trace"
+"$BUILD/shim_driver" "$BUILD/syx_none.txt" > "$BUILD/syx_none.trace"
+if ! diff -u "$BUILD/syx_none.trace" "$BUILD/syx_bad.trace"; then
+    echo "FAIL: bad-checksum dump altered engine state"; exit 1
+fi
+echo "OK: bad-checksum dump rejected (state unchanged)"
+
 echo "=== no-crash sweep (all 128 factory patches, incl. non-Lead) ==="
 if timeout 30 "$BUILD/sweep_driver"; then
     echo "OK: no-crash sweep"
