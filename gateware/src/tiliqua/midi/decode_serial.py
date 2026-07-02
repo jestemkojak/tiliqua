@@ -98,13 +98,26 @@ class MidiSysexFilter(wiring.Component):
     Drop SysEx messages (0xF0 .. 0xF7) from a MIDI byte stream.
 
     Expects real-time messages to already be dropped by
-    :py:`MidiRTFilter`. All sysex bytes are consumed and discarded.
+    :py:`MidiRTFilter`. With ``forward=False`` (default) all sysex bytes are
+    consumed and discarded (bit-identical to the historical behaviour).
 
-    TODO: add a sideband stream for sysex messages.
+    With ``forward=True``, sysex bytes are emitted on the ``o_sysex`` sideband
+    instead, with **honored backpressure** (the input stalls while ``o_sysex``
+    is not ready — sysex payloads are bulky and must not be dropped silently).
+    The sideband is always well-framed ``F0 .. F7``: if a sysex message is
+    interrupted by another status byte, a synthetic ``F7`` is emitted first and
+    the interrupting byte is then processed normally (not swallowed).
     """
 
-    i: In(stream.Signature(unsigned(8)))
-    o: Out(stream.Signature(unsigned(8)))
+    def __init__(self, forward=False):
+        self.forward = forward
+        sig = {
+            "i": In(stream.Signature(unsigned(8))),
+            "o": Out(stream.Signature(unsigned(8))),
+        }
+        if forward:
+            sig["o_sysex"] = Out(stream.Signature(unsigned(8)))
+        super().__init__(sig)
 
     def elaborate(self, platform):
         m = Module()
@@ -117,14 +130,41 @@ class MidiSysexFilter(wiring.Component):
             (i_status.kind == Status.Kind.SYSEX) &
             (i_status.nibble.sys.sub.com == Status.SysCom.SYSEX))
 
+        if not self.forward:
+            with m.FSM():
+                with m.State('PASS'):
+                    with m.If(self.i.valid & is_sysex_start):
+                        # Enter sysex mode
+                        m.d.comb += self.i.ready.eq(1)
+                        m.next = 'SYSEX'
+                    with m.Else():
+                        # Pass through
+                        m.d.comb += [
+                            self.o.payload.eq(self.i.payload),
+                            self.o.valid.eq(self.i.valid),
+                            self.i.ready.eq(self.o.ready),
+                        ]
+
+                with m.State('SYSEX'):
+                    # Drain until any status byte terminates.
+                    m.d.comb += self.i.ready.eq(1)
+                    with m.If(self.i.valid & i_status.is_status):
+                        m.next = 'PASS'
+
+            return m
+
+        # forward=True: sideband with honored backpressure.
         with m.FSM():
             with m.State('PASS'):
                 with m.If(self.i.valid & is_sysex_start):
-                    # Enter sysex mode
-                    m.d.comb += self.i.ready.eq(1)
-                    m.next = 'SYSEX'
+                    m.d.comb += [
+                        self.o_sysex.payload.eq(self.i.payload),
+                        self.o_sysex.valid.eq(1),
+                        self.i.ready.eq(self.o_sysex.ready),
+                    ]
+                    with m.If(self.o_sysex.ready):
+                        m.next = 'SYSEX'
                 with m.Else():
-                    # Pass through
                     m.d.comb += [
                         self.o.payload.eq(self.i.payload),
                         self.o.valid.eq(self.i.valid),
@@ -132,10 +172,24 @@ class MidiSysexFilter(wiring.Component):
                     ]
 
             with m.State('SYSEX'):
-                # Drain until any status byte terminates.
-                m.d.comb += self.i.ready.eq(1)
-                with m.If(self.i.valid & i_status.is_status):
-                    m.next = 'PASS'
+                is_interrupt = i_status.is_status & (self.i.payload != 0xF7)
+                with m.If(self.i.valid & is_interrupt):
+                    # Interrupted mid-message: emit a synthetic F7 first; do
+                    # NOT consume the interrupting byte — PASS handles it next.
+                    m.d.comb += [
+                        self.o_sysex.payload.eq(0xF7),
+                        self.o_sysex.valid.eq(1),
+                    ]
+                    with m.If(self.o_sysex.ready):
+                        m.next = 'PASS'
+                with m.Elif(self.i.valid):
+                    m.d.comb += [
+                        self.o_sysex.payload.eq(self.i.payload),
+                        self.o_sysex.valid.eq(1),
+                        self.i.ready.eq(self.o_sysex.ready),
+                    ]
+                    with m.If(self.o_sysex.ready & (self.i.payload == 0xF7)):
+                        m.next = 'PASS'
 
         return m
 
@@ -146,16 +200,22 @@ class MidiDecodeSerial(wiring.Component):
 
     Set :py:`forward_rt` to expose real-time messages on :py:`o_rt`. Warn:
     backpressure on ``o_rt`` is ignored!
+
+    Set :py:`forward_sysex` to expose sysex messages on :py:`o_sysex`
+    (backpressure honored, ``F0 .. F7``-framed — see :py:`MidiSysexFilter`).
     """
 
-    def __init__(self, forward_rt=False):
+    def __init__(self, forward_rt=False, forward_sysex=False):
         self.forward_rt = forward_rt
+        self.forward_sysex = forward_sysex
         sig = {
             "i": In(stream.Signature(unsigned(8))),
             "o": Out(stream.Signature(MidiMessage)),
         }
         if forward_rt:
             sig["o_rt"] = Out(stream.Signature(Status.RT))
+        if forward_sysex:
+            sig["o_sysex"] = Out(stream.Signature(unsigned(8)))
         super().__init__(sig)
 
     def elaborate(self, platform):
@@ -168,9 +228,12 @@ class MidiDecodeSerial(wiring.Component):
         if self.forward_rt:
             wiring.connect(m, rt_filter.o_rt, wiring.flipped(self.o_rt))
 
-        # Step 2: drop sysex messages
-        m.submodules.sysex_filter = sysex_filter = MidiSysexFilter()
+        # Step 2: drop (or fork out) sysex messages
+        m.submodules.sysex_filter = sysex_filter = MidiSysexFilter(
+            forward=self.forward_sysex)
         wiring.connect(m, rt_filter.o, sysex_filter.i)
+        if self.forward_sysex:
+            wiring.connect(m, sysex_filter.o_sysex, wiring.flipped(self.o_sysex))
 
         # Step 3: parse remaining messages (normal channel events)
 
