@@ -300,6 +300,11 @@ fn main() -> ! {
     // Total banks = engine ROM banks + the flash User bank (always last).
     let mut state = MenuState::new(mbsid_sys::bank_count() + 1, 0, BOOT_PATCH_INDEX);
 
+    // Drives the gateware USB/TRS MIDI source mux (top/sid's usb_midi_host
+    // CSR, inherited unchanged — see menu.rs's MidiSrc row). Bound once here;
+    // the ISR's own SID_PERIPH access uses an independent `Peripherals::steal()`.
+    let sid = peripherals.SID_PERIPH;
+
     handler!(timer0 = || timer0_handler(&app));
 
     irq::scope(|s| {
@@ -359,6 +364,13 @@ fn main() -> ! {
             }
 
             if dirty {
+                // Apply the menu's MIDI source selection. Unconditional/
+                // idempotent (mirrors top/sid's identical call) — cheap
+                // enough to run every redraw, no change-tracking needed.
+                sid.usb_midi_host().write(|w| unsafe {
+                    w.host().bit(state.midi_src == menu::MidiSource::Usb)
+                });
+
                 let mut namebuf = [0u8; 17];
                 let name_ok;
                 if state.is_user_bank() {
