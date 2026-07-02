@@ -67,6 +67,14 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   `SID_PERIPH`) unchanged — the menu's 4th row (`menu.rs`'s `Row::MidiSrc`) just writes that
   bit every redraw (`main.rs`). Resets to TRS on every boot (matches the CSR's own reset
   value); not persisted, like the rest of mbsid's menu.
+- **Tiliqua's USB-C MIDI port is a host port, not a device port** (`guh.engines.midi.USBMIDIHost`,
+  a genuine `USBHostEnumerator` — drives VBUS, enumerates whatever's plugged in). Tiliqua will
+  **never** show up in a PC's own `lsusb`/`amidi -l`, and a plain PC-to-Tiliqua USB-C cable
+  carries no MIDI either direction (two hosts can't enumerate each other) — this is by design,
+  not a bug. For PC-scripted SysEx (`amidi`/`sendmidi`), go over **TRS**: a class-compliant
+  USB-MIDI interface plugged into the PC (that's what shows up as `hw:X`) with a TRS/MIDI
+  cable into Tiliqua's TRS MIDI-in jack. To exercise the USB path, plug a MIDI device that can
+  transmit SysEx *into* Tiliqua's USB-C port and set the menu's `MIDI Src` row to `USB`.
 - **Control rate is 1 kHz** (`TIMER0_ISR_PERIOD_MS = 1` in `fw/src/main.rs`, NOT base `sid`'s
   5 ms). The engine uses an internal `updateSpeedFactor = 2` (set by the `MbSidEnvironment`
   ctor); the `mbsid_tick` C arg is accepted but ignored. 1 ms matches the JUCE oracle so the
