@@ -62,6 +62,11 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 
 ## Non-obvious gotchas for this port
 
+- **Menu MIDI Src row (TRS/USB) is a pure firmware toggle, no gateware diff.** `MBSIDSoc`
+  inherits `SIDSoc`'s USB/TRS source mux and `usb_midi_host` CSR (offset `0xC` on
+  `SID_PERIPH`) unchanged — the menu's 4th row (`menu.rs`'s `Row::MidiSrc`) just writes that
+  bit every redraw (`main.rs`). Resets to TRS on every boot (matches the CSR's own reset
+  value); not persisted, like the rest of mbsid's menu.
 - **Control rate is 1 kHz** (`TIMER0_ISR_PERIOD_MS = 1` in `fw/src/main.rs`, NOT base `sid`'s
   5 ms). The engine uses an internal `updateSpeedFactor = 2` (set by the `MbSidEnvironment`
   ctor); the `mbsid_tick` C arg is accepted but ignored. 1 ms matches the JUCE oracle so the
