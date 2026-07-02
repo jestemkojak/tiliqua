@@ -286,14 +286,26 @@ class SIDPeripheral(wiring.Component):
         PSID header) — see sid_player_sw fw/src/main.rs."""
         sel: csr.Field(csr.action.RW, unsigned(1))
 
+    class SysexRead(csr.Register, access="r"):
+        """Raw SysEx sideband byte. Read pops one byte from the 64-deep FIFO.
+        ``valid``=0 means empty (``data`` is then meaningless). A valid bit is
+        required because 0x00 is a legal SysEx data byte — the midi_read
+        'read until 0' idiom cannot work here."""
+        data:  csr.Field(csr.action.R, unsigned(8))
+        valid: csr.Field(csr.action.R, unsigned(1))
+
     def __init__(self, *, transaction_depth=16, sid2_define=True,
-                 sid_hz=30_000_000, phi2_hz=(1_000_000, 1_000_000)):
+                 sid_hz=30_000_000, phi2_hz=(1_000_000, 1_000_000),
+                 with_sysex=False):
         self._sid2_define = sid2_define
         self._sid_hz   = sid_hz
         self._phi2_hz  = phi2_hz
+        self._with_sysex = with_sysex
         self._transactions = AsyncFIFO(width=16, depth=transaction_depth,
                                        w_domain="sync", r_domain="sid")
         self._midi_read_fifo = SyncFIFOBuffered(width=24, depth=8)
+        if with_sysex:
+            self._sysex_fifo = SyncFIFOBuffered(width=8, depth=64)
 
         regs = csr.Builder(addr_width=6, data_width=8)
         self._transaction_data = regs.add("transaction_data", self.TransactionData(), offset=0x0)
@@ -305,6 +317,8 @@ class SIDPeripheral(wiring.Component):
         self._build_model = regs.add("build_model",   self.BuildModel(),  offset=0x18)
         self._txn_status  = regs.add("txn_status",    self.TxnStatus(),   offset=0x1C)
         self._phi2_sel    = regs.add("phi2_sel",      self.Phi2Sel(),     offset=0x20)
+        if with_sysex:
+            self._sysex_read = regs.add("sysex_read", self.SysexRead(), offset=0x24)
         self._bridge = csr.Bridge(regs.as_memory_map())
 
         self.sid = None
@@ -316,7 +330,7 @@ class SIDPeripheral(wiring.Component):
         # SID output sample (~1MHz). Consumers anti-alias/decimate from this rate.
         self.audio_strobe     = Signal()
 
-        super().__init__({
+        sig = {
             "bus":           In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
             "i_midi":        In(stream.Signature(midi.MidiMessage)),
             # External SID write path (e.g. from 6502 bridge in sid_player)
@@ -333,7 +347,11 @@ class SIDPeripheral(wiring.Component):
             "voice0_dca_o": Out(signed(16)),
             "voice1_dca_o": Out(signed(16)),
             "voice2_dca_o": Out(signed(16)),
-        })
+        }
+        if with_sysex:
+            # Raw SysEx byte sideband (backpressure honored -> FIFO never drops)
+            sig["i_sysex"] = In(stream.Signature(unsigned(8)))
+        super().__init__(sig)
         self.bus.memory_map = self._bridge.bus.memory_map
 
 
@@ -437,6 +455,17 @@ class SIDPeripheral(wiring.Component):
         with m.Else():
             m.d.comb += self._midi_read.f.msg.r_data.eq(0)
 
+        if self._with_sysex:
+            m.submodules.sysex_fifo = sysex_fifo = self._sysex_fifo
+            m.d.comb += [
+                sysex_fifo.w_data.eq(self.i_sysex.payload),
+                sysex_fifo.w_en.eq(self.i_sysex.valid),
+                self.i_sysex.ready.eq(sysex_fifo.w_rdy),   # honored backpressure
+                sysex_fifo.r_en.eq(self._sysex_read.element.r_stb),
+                self._sysex_read.f.data.r_data.eq(sysex_fifo.r_data),
+                self._sysex_read.f.valid.r_data.eq(sysex_fifo.r_rdy),
+            ]
+
         # USB host + cfg CSR writes -> output ports.
         with m.If(self._midi_host.f.host.w_stb):
             m.d.sync += self.usb_midi_host.eq(self._midi_host.f.host.w_data)
@@ -466,7 +495,7 @@ class SIDSoc(TiliquaSoc):
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 
-    def __init__(self, *, with_scope=True, n_sids=1, **kwargs):
+    def __init__(self, *, with_scope=True, n_sids=1, with_sysex=False, **kwargs):
         # Don't finalize CSR bridge yet. Default mainram (BRAM) is 0x4000 — the big
         # opts struct eats stack. Subclasses (e.g. top/mbsid, whose by-value C++
         # engine state needs more .bss) may override via the mainram_size kwarg.
@@ -476,9 +505,10 @@ class SIDSoc(TiliquaSoc):
 
         self.with_scope = with_scope
         self.n_sids = n_sids
+        self.with_sysex = with_sysex
 
         # Add SID peripheral
-        self.sid_periph = SIDPeripheral()
+        self.sid_periph = SIDPeripheral(with_sysex=with_sysex)
         self.csr_decoder.add(self.sid_periph.bus, addr=0x1000, name="sid_periph")
 
         if self.n_sids > 1:
@@ -580,14 +610,14 @@ class SIDSoc(TiliquaSoc):
             m.submodules.serialrx = serialrx = midi.SerialRx(
                 system_clk_hz=60e6, pins=midi_pins)
             m.submodules.midi_decode_trs = midi_decode_trs = midi.MidiDecodeSerial(
-                forward_rt=True)
+                forward_rt=True, forward_sysex=self.with_sysex)
             wiring.connect(m, serialrx.o, midi_decode_trs.i)
 
             # USB MIDI host
             ulpi = platform.request(platform.default_usb_connection)
             m.submodules.usb = usb = USBMIDIHost(bus=ulpi)
             m.submodules.midi_decode_usb = midi_decode_usb = midi.MidiDecodeUSB(
-                forward_rt=True)
+                forward_rt=True, forward_sysex=self.with_sysex)
             wiring.connect(m, usb.o_midi, midi_decode_usb.i)
 
             # Source mux: USB host or TRS, controlled by CSR bit
@@ -595,9 +625,17 @@ class SIDSoc(TiliquaSoc):
             with m.If(self.sid_periph.usb_midi_host):
                 wiring.connect(m, midi_decode_usb.o, self.sid_periph.i_midi)
                 m.d.comb += vbus_o.eq(1)
+                if self.with_sysex:
+                    wiring.connect(m, midi_decode_usb.o_sysex, self.sid_periph.i_sysex)
+                    # unselected side drained so a source switch mid-dump
+                    # can't wedge the other decoder
+                    m.d.comb += midi_decode_trs.o_sysex.ready.eq(1)
             with m.Else():
                 wiring.connect(m, midi_decode_trs.o, self.sid_periph.i_midi)
                 m.d.comb += vbus_o.eq(0)
+                if self.with_sysex:
+                    wiring.connect(m, midi_decode_trs.o_sysex, self.sid_periph.i_sysex)
+                    m.d.comb += midi_decode_usb.o_sysex.ready.eq(1)
 
             # Drain RT streams (clock sync not used by SID)
             m.d.comb += [
