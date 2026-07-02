@@ -3,11 +3,13 @@
 **Date:** 2026-07-02 (merged; supersedes the 2026-07-01 draft and the short-lived
 `M5_SYSEX_UPLOAD.md`, folded in per user decision)
 **Branch:** `mbsid-port`
-**Status:** DESIGN — all user decisions resolved (single milestone; bank 1 = User;
-RAM Write = audition only; on-device save UI kept as groundwork for future on-device
-patch editing). Chosen-default details are marked **[DEFAULT]** — implement as written
-unless the user objects during review.
-**Scope:** design only. Builds on M1 (Lead mono), M2 (dual-SID stereo), M3 (read-only
+**Status:** IMPLEMENTED (2026-07-02, commits `f81da90`..`12c8eca`) — gateware,
+firmware, shim/FFI, host unit tests, and oracle coverage all green (see §7). Hardware
+bring-up is pending (§7 hardware acceptance checklist, unchecked). Single milestone;
+bank 1 = User; RAM Write = audition only; on-device save UI kept as groundwork for
+future on-device patch editing. Chosen-default details marked **[DEFAULT]** were
+implemented as written.
+**Scope:** builds on M1 (Lead mono), M2 (dual-SID stereo), M3 (read-only
 factory ROM bank, `M3_PATCH_BANKS.md`).
 
 ---
@@ -149,12 +151,21 @@ so **no other top is affected** and no re-validation of other bitstreams is need
   throttle.
 - Same synthetic-`F7` framing rule if a dump is cut off (cable unplug mid-dump —
   firmware `timeOut()` also covers this, §6a).
+- **Implemented deviation:** the USB decode path (`MidiDecodeUSB`) has no in-band
+  cut-off signal at the packet level equivalent to a serial status byte, so a mid-dump
+  USB unplug does not emit a synthetic `F7` there — recovery instead relies entirely
+  on the firmware's 500 ms idle timeout (§6a, `mbsid_sysex_timeout()`), which resets
+  both parsers on the next byte after the gap. Functionally equivalent (the wedged
+  parser is cleared before the next dump), just via the firmware timeout path rather
+  than a gateware-synthesized frame terminator.
 
 ### 4c. `SIDPeripheral` — new `sysex_read` CSR + FIFO (flag-gated)
 - New param `with_sysex=False` on `SIDPeripheral`/`SIDSoc`; `MBSIDSoc`
   (`top/mbsid/top.py`) passes `True`. `top/sid` elaborates unchanged.
-- New register `sysex_read` (offset `0x18`, next free after `usb_midi_endp` @ `0x14`),
-  16-bit read: **bit 8 = valid, bits 7:0 = data byte**. (The `midi_read` "read until 0"
+- New register `sysex_read` — implemented at offset **`0x24`** (next free slot after
+  `build_model` @ `0x18`, `txn_status` @ `0x1C`, and M2's `phi2_sel` @ `0x20`, which
+  landed between this design's draft and implementation), 16-bit read: **bit 8 =
+  valid, bits 7:0 = data byte**. (The `midi_read` "read until 0"
   idiom does NOT work here — `0x00` is a legal SysEx data byte, so an explicit valid
   bit is required.) Backed by `SyncFIFOBuffered(width=8, depth=64)`; upstream
   backpressure means no silent overflow — when full, the decoder stalls.
@@ -293,16 +304,19 @@ stack overflow.
   must produce a register stream **byte-identical** to `pc N` — proves the engine-side
   SysEx path end-to-end with zero gateware.
 - **Gateware sim**: §4d.
-- **Hardware acceptance** (SysEx via `amidi`/`sendmidi` scripting, which sidesteps the
-  ACK-wait problem, §8):
-  1. On-device: save a factory patch to a User slot, power-cycle, browse User bank,
-     it reloads and sounds identical; Cancel writes nothing; empty slots show "Empty"
-     and don't load.
-  2. Reflash a bitstream slot → user patches intact.
-  3. SysEx RAM Write → sound changes live, nothing persisted.
-  4. SysEx Bank Write (bank 1) to slot k → `Saved U k`, power-cycle, slot k loads and
-     sounds identical. Bank Write to bank 0 → ignored, nothing persisted.
-  5. Same over USB MIDI; mid-dump unplug → recovers within timeout, next dump OK.
+
+**Hardware acceptance checklist (manual, pending — not yet run on real hardware).**
+SysEx items use `amidi`/`sendmidi` scripting, which sidesteps the ACK-wait problem
+(§8):
+
+- [ ] On-device save → power-cycle → reload identical; Cancel writes nothing; empty
+      slots render "Empty" and don't load.
+- [ ] Reflash a bitstream slot → user patches intact.
+- [ ] SysEx RAM Write (e.g. `amidi -p hw:X -S "$(python3 -c 'print(dump_hex)')"`) →
+      sound changes live, nothing persisted.
+- [ ] SysEx Bank Write bank 1 slot k → `Saved U00k`, power-cycle, loads identically;
+      bank 0 write → ignored.
+- [ ] Same over USB MIDI; mid-dump unplug → recovers ≤ 500 ms idle, next dump OK.
 
 ## 8. Known limitation — no ACK/DISACK (MIDI TX)
 

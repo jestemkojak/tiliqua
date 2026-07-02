@@ -179,6 +179,10 @@ host oracle's bit-exact harness still loads raw 512-byte patches through that pr
 
 ## 8. Forward-compatibility (later milestones — NOT built now)
 
+**Implemented in M4** — see `M4_USER_PATCH_BANKS.md`: writable user bank 1 (flat
+sector-per-slot flash store, not the `SID_BANK_NUM`/manifest-region sketch below),
+the on-device browse/save UI, and MIDI SysEx patch upload. Left below for history.
+
 - **User banks (writable).** Raise `SID_BANK_NUM`; back bank `1..` with a flash **manifest
   region** (Tiliqua already has the region system + `SpiFlash` erase/program HAL). Read 512 B
   from flash → `copyToPatch`. The shim grows `mbsid_select_bank` + write entry points; the
