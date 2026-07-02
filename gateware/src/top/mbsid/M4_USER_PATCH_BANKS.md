@@ -288,6 +288,22 @@ New `.bss`: 512 B SysEx capture buffer + ~16 B parser state + 512 B `pending_sav
 map after adding buffers and shrink the reserve consciously, don't discover it via
 stack overflow.
 
+**Note on `llvm-size`:** the default summary's "bss" column folds `.bss` +
+`.heap` + `.stack` together (all NOLOAD sections) — `llvm-size -A` is needed to
+separate them. The `.stack` section size the linker reports (25824 B) is just
+the *leftover region* it assigns to the stack, not a measurement of what's
+actually used; don't read it as a usage number.
+
+**Peak stack, measured on hardware (2026-07-02):** a temporary stack-painting
+probe (fill the stack region with `0xAA` at boot, scan for the high-water mark
+from the main loop, log growth over UART0) settled at **4016 / 25824 bytes**
+used after exercising menu navigation and an on-device save (the deepest
+realistic call path: ISR → main-loop `UserPatchStore::save` → flash
+erase/program). ~21.8 KB of headroom — the M4 additions (`SysexCapture`,
+`pending_save`, `patch_buf`) fit comfortably; the whole-branch-review concern
+about a near-exhausted budget was based on misreading the linker's leftover-
+region size as a usage figure, not an actual measurement.
+
 ## 7. Validation
 
 - **Host unit tests** (`cargo test --target x86_64-unknown-linux-gnu --lib`):
