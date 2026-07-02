@@ -119,3 +119,21 @@ extern "C" int  mbsid_tick(uint8_t /*speed_factor*/) {
 }
 extern "C" const uint8_t *mbsid_regs_l(void)              { return regL.ALL; }
 extern "C" const uint8_t *mbsid_regs_r(void)              { return regR.ALL; }
+
+// M4: copy the live patch out. Mirror of the raw read mbsid_bank_load already
+// does (env.mbSid[0].mbSidPatch.body); the save direction of the same bytes.
+extern "C" void mbsid_current_patch_raw(uint8_t *buf512) {
+    const uint8_t *raw = (const uint8_t *)&env.mbSid[0].mbSidPatch.body;
+    for (unsigned i = 0; i < 512; ++i) buf512[i] = raw[i];
+}
+
+// M4: SysEx byte in. RAM Writes apply live inside the engine (checksum and
+// all); Bank Writes no-op upstream (bankSave stub returns -2, ignored by
+// sysexSetPatch) and are persisted by the firmware-side SysexCapture instead.
+extern "C" int mbsid_sysex_byte(uint8_t b) {
+    return (int)env.midiReceiveSysEx(DEFAULT, b);
+}
+
+extern "C" void mbsid_sysex_timeout(void) {
+    env.midiTimeOut(DEFAULT);
+}

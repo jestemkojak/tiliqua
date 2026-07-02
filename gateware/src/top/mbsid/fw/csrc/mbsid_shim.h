@@ -29,6 +29,15 @@ int            mbsid_tick(uint8_t speed_factor);          /* 1 if regs changed *
 const uint8_t *mbsid_regs_l(void);                        /* 32-byte image */
 const uint8_t *mbsid_regs_r(void);                        /* 32-byte image, used by M2 firmware for SID_PERIPH_R */
 
+/* M4: on-device save — copy the live patch out (raw sid_patch_t bytes). */
+void mbsid_current_patch_raw(uint8_t *buf512);
+/* M4: SysEx receive — feed one raw stream byte to the engine's parsers
+ * (MbSidSysEx + MbSidAsid). Returns nonzero if consumed as SysEx. */
+int  mbsid_sysex_byte(uint8_t b);
+/* M4: abort a half-received SysEx message after an RX gap (upstream
+ * MIDI-timeout hook; MbSidSysEx aborts only on port match, which DEFAULT is). */
+void mbsid_sysex_timeout(void);
+
 #ifdef __cplusplus
 }
 #endif

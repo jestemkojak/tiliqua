@@ -19,6 +19,9 @@ extern "C" {
     fn mbsid_bank_patch_name_get(bank: u8, patch: u8, buf: *mut core::ffi::c_char);
     fn mbsid_bank_patch_info(bank: u8, patch: u8,
                               engine_out: *mut u8, vflags_out: *mut u8) -> i32;
+    fn mbsid_current_patch_raw(buf512: *mut u8);
+    fn mbsid_sysex_byte(b: u8) -> i32;
+    fn mbsid_sysex_timeout();
 }
 
 // --- safe wrappers (riscv32 target) ---
@@ -107,6 +110,21 @@ pub fn bank_patch_info(bank: u8, patch: u8) -> Option<(u8, u8)> {
     }
 }
 
+#[cfg(target_arch = "riscv32")]
+pub fn current_patch_raw(out: &mut [u8; 512]) {
+    unsafe { mbsid_current_patch_raw(out.as_mut_ptr()) }
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn sysex_byte(b: u8) -> bool {
+    unsafe { mbsid_sysex_byte(b) != 0 }
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn sysex_timeout() {
+    unsafe { mbsid_sysex_timeout() }
+}
+
 // --- host stubs (non-riscv32, e.g. x86_64 for cargo test --lib) ---
 
 #[cfg(not(target_arch = "riscv32"))]
@@ -163,6 +181,15 @@ pub fn bank_patch_info(_bank: u8, _patch: u8) -> Option<(u8, u8)> {
     Some((0, 0)) // Lead, Mono
 }
 
+#[cfg(not(target_arch = "riscv32"))]
+pub fn current_patch_raw(out: &mut [u8; 512]) { out.fill(0); }
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn sysex_byte(_b: u8) -> bool { false }
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn sysex_timeout() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +211,14 @@ mod tests {
         let (eng, vfl) = info.unwrap();
         assert_eq!(eng, 0, "stub engine must be Lead (0)");
         assert_eq!(vfl, 0, "stub vflags must be 0 (Mono)");
+    }
+
+    #[test]
+    fn sysex_host_stubs_are_sane() {
+        assert!(!sysex_byte(0xF0));
+        sysex_timeout();
+        let mut buf = [0xAAu8; 512];
+        current_patch_raw(&mut buf);
+        assert_eq!(buf, [0u8; 512]);
     }
 }
