@@ -173,6 +173,86 @@ class MidiTests(unittest.TestCase):
         with sim.write_vcd(vcd_file=open("test_midi_decode_sysex_strip.vcd", "w")):
             sim.run()
 
+    def test_midi_sysex_sideband_serial(self):
+        dut = midi.MidiDecodeSerial(forward_sysex=True)
+        msg = [0xF0, 0x00, 0x00, 0x7E, 0x4B, 0x00, 0x0F, 0xF7]
+        got = []
+
+        async def feed(ctx):
+            for b in msg:
+                await stream.put(ctx, dut.i, b)
+            # normal channel message after the sysex must still parse
+            await stream.put(ctx, dut.i, 0x92)
+            await stream.put(ctx, dut.i, 0x48)
+            await stream.put(ctx, dut.i, 0x96)
+            p = await stream.get(ctx, dut.o)
+            self.assertEqual(p.status.kind, midi.Status.Kind.NOTE_ON)
+            self.assertEqual(p.midi_payload.note_on.note, 0x48)
+
+        async def collect(ctx):
+            # deliberately slow consumer: backpressure must not lose bytes
+            for _ in range(len(msg)):
+                await ctx.tick().repeat(3)
+                got.append(await stream.get(ctx, dut.o_sysex))
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(feed)
+        sim.add_testbench(collect)
+        with sim.write_vcd(vcd_file=open("test_midi_sysex_serial.vcd", "w")):
+            sim.run()
+        self.assertEqual(got, msg)
+
+    def test_midi_sysex_sideband_interrupted_gets_synthetic_f7(self):
+        dut = midi.MidiDecodeSerial(forward_sysex=True)
+        got = []
+
+        async def feed(ctx):
+            # sysex cut off by a status byte (no F7 on the wire)
+            for b in [0xF0, 0x00, 0x00, 0x7E, 0x4B]:
+                await stream.put(ctx, dut.i, b)
+            await stream.put(ctx, dut.i, 0x92)   # NOTE_ON interrupts the sysex
+            await stream.put(ctx, dut.i, 0x48)
+            await stream.put(ctx, dut.i, 0x96)
+            # the interrupting message must NOT be swallowed
+            p = await stream.get(ctx, dut.o)
+            self.assertEqual(p.status.kind, midi.Status.Kind.NOTE_ON)
+            self.assertEqual(p.midi_payload.note_on.note, 0x48)
+            self.assertEqual(p.midi_payload.note_on.velocity, 0x96)
+
+        async def collect(ctx):
+            for _ in range(6):  # 5 real bytes + synthetic F7
+                got.append(await stream.get(ctx, dut.o_sysex))
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(feed)
+        sim.add_testbench(collect)
+        with sim.write_vcd(vcd_file=open("test_midi_sysex_interrupted.vcd", "w")):
+            sim.run()
+        self.assertEqual(got, [0xF0, 0x00, 0x00, 0x7E, 0x4B, 0xF7])
+
+    def test_midi_sysex_flag_off_unchanged(self):
+        # Regression: default construction must still DROP sysex and have no
+        # o_sysex port (shared-module safety for other tops).
+        dut = midi.MidiDecodeSerial()
+        self.assertFalse(hasattr(dut, "o_sysex"))
+
+        async def testbench(ctx):
+            for b in [0xF0, 0x01, 0x02, 0xF7]:
+                await stream.put(ctx, dut.i, b)
+            await stream.put(ctx, dut.i, 0x92)
+            await stream.put(ctx, dut.i, 0x48)
+            await stream.put(ctx, dut.i, 0x96)
+            p = await stream.get(ctx, dut.o)
+            self.assertEqual(p.status.kind, midi.Status.Kind.NOTE_ON)
+            self.assertEqual(p.midi_payload.note_on.note, 0x48)
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
     def test_midi_voice_tracker(self):
 
         dut = midi.MidiVoiceTracker()
