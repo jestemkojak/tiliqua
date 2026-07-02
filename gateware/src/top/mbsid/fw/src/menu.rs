@@ -46,16 +46,20 @@ impl VoiceMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Row { Bank, Program }
+pub enum Row { Bank, Program, Save }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode { Nav, Edit }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PressResult { Toggled, Commit(u8), Cancel }
 
 pub struct MenuState {
     pub focus: Row,
     pub mode: Mode,
     pub bank: u8,
     pub program: u8,
+    pub save_cursor: i16,
     bank_count: u8,
 }
 
@@ -72,6 +76,7 @@ impl MenuState {
             mode: Mode::Nav,
             bank: bank.min(bank_count - 1),
             program: program.min(127),
+            save_cursor: -1,
             bank_count,
         }
     }
@@ -80,8 +85,12 @@ impl MenuState {
     pub fn on_turn(&mut self, delta: i8) -> bool {
         match self.mode {
             Mode::Nav => {
-                // Two rows: positive -> Program, negative -> Bank (clamped, no wrap).
-                self.focus = if delta > 0 { Row::Program } else { Row::Bank };
+                let ix = match self.focus { Row::Bank => 0i16, Row::Program => 1, Row::Save => 2 };
+                self.focus = match clamp_i16(ix + delta as i16, 0, 2) {
+                    0 => Row::Bank,
+                    1 => Row::Program,
+                    _ => Row::Save,
+                };
                 false
             }
             Mode::Edit => match self.focus {
@@ -100,13 +109,39 @@ impl MenuState {
                     // a load is required whenever the bank actually changed.
                     changed
                 }
+                Row::Save => {
+                    self.save_cursor =
+                        clamp_i16(self.save_cursor + delta as i16, -1, 127);
+                    false // preview only; never a load, never a write
+                }
             },
         }
     }
 
-    /// Handle a button press: toggle Nav<->Edit. Never triggers a load.
-    pub fn on_press(&mut self) {
-        self.mode = match self.mode { Mode::Nav => Mode::Edit, Mode::Edit => Mode::Nav };
+    /// Button press. Commit/Cancel are decided BEFORE toggling the mode so a
+    /// write can only ever happen on the deliberate Edit->Nav confirmation on
+    /// the Save row (M4 spec §6d).
+    pub fn on_press(&mut self) -> PressResult {
+        let result = if self.focus == Row::Save && self.mode == Mode::Edit {
+            if self.save_cursor < 0 { PressResult::Cancel }
+            else { PressResult::Commit(self.save_cursor as u8) }
+        } else {
+            PressResult::Toggled
+        };
+        self.mode = match self.mode {
+            Mode::Nav => {
+                if self.focus == Row::Save {
+                    self.save_cursor = -1; // always enter Edit at Cancel
+                }
+                Mode::Edit
+            }
+            Mode::Edit => Mode::Nav,
+        };
+        result
+    }
+
+    pub fn is_user_bank(&self) -> bool {
+        self.bank == self.bank_count - 1
     }
 }
 
@@ -118,7 +153,7 @@ pub fn name_from_cstr(buf: &[u8; 17]) -> &str {
 
 /// Width/height of the menu's opaque background box, in pixels.
 const MENU_W: u32 = 380;
-const MENU_H: u32 = 120;
+const MENU_H: u32 = 170;
 const ROW_DY: i32 = 24; // vertical spacing between rows
 
 /// Build the detail-row text. `detail` is `Some((engine, voice_mode))` for a
@@ -146,6 +181,7 @@ pub fn detail_line(detail: Option<(Engine, Option<VoiceMode>)>) -> String<48> {
 /// patch info is unavailable (failed load), which renders the row as "---".
 pub fn draw<D>(d: &mut D, st: &MenuState, name: &str,
                detail: Option<(Engine, Option<VoiceMode>)>,
+               save_name: Option<&str>, status: Option<&str>,
                pos_x: i32, pos_y: i32, hue: u8) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = HI8>,
@@ -169,7 +205,8 @@ where
     let bank_focused = st.focus == Row::Bank;
     let marker = row_marker(st, Row::Bank);
     line.clear();
-    let _ = write!(line, "{} Bank     {}", marker, (b'A' + st.bank) as char);
+    let bank_char = if st.is_user_bank() { 'U' } else { (b'A' + st.bank) as char };
+    let _ = write!(line, "{} Bank     {}", marker, bank_char);
     let style = if bank_focused { bright } else { dim };
     Text::new(&line, Point::new(pos_x, pos_y + ROW_DY), style).draw(d)?;
 
@@ -181,9 +218,26 @@ where
     let style = if prog_focused { bright } else { dim };
     Text::new(&line, Point::new(pos_x, pos_y + 2 * ROW_DY), style).draw(d)?;
 
+    // Save row: destination cursor. Cancel-first (spec §6d [DEFAULT]).
+    let save_focused = st.focus == Row::Save;
+    let marker = row_marker(st, Row::Save);
+    line.clear();
+    if st.save_cursor < 0 {
+        let _ = write!(line, "{} Save     Cancel", marker);
+    } else {
+        let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
+                       save_name.unwrap_or("Empty"));
+    }
+    let style = if save_focused { bright } else { dim };
+    Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), style).draw(d)?;
+
     // Detail row: engine label + voice mode (Lead only) + channel map, or "---".
     let detail_line = detail_line(detail);
-    Text::new(&detail_line, Point::new(pos_x, pos_y + 3 * ROW_DY), dim).draw(d)?;
+    Text::new(&detail_line, Point::new(pos_x, pos_y + 4 * ROW_DY), dim).draw(d)?;
+
+    if let Some(s) = status {
+        Text::new(s, Point::new(pos_x, pos_y + 5 * ROW_DY), bright).draw(d)?;
+    }
 
     Ok(())
 }
@@ -209,7 +263,11 @@ mod tests {
         assert_eq!(m.focus, Row::Bank);
         assert_eq!(m.on_turn(1), false);      // -> Program, no load
         assert_eq!(m.focus, Row::Program);
-        assert_eq!(m.on_turn(3), false);      // clamp: stays Program
+        assert_eq!(m.on_turn(1), false);      // -> Save, no load
+        assert_eq!(m.focus, Row::Save);
+        assert_eq!(m.on_turn(3), false);      // clamp: stays Save
+        assert_eq!(m.focus, Row::Save);
+        assert_eq!(m.on_turn(-1), false);     // -> Program
         assert_eq!(m.focus, Row::Program);
         assert_eq!(m.on_turn(-1), false);     // -> Bank
         assert_eq!(m.focus, Row::Bank);
@@ -221,9 +279,9 @@ mod tests {
     fn press_toggles_mode_without_loading() {
         let mut m = MenuState::new(1, 0, 10);
         assert_eq!(m.mode, Mode::Nav);
-        m.on_press();
+        let _ = m.on_press();
         assert_eq!(m.mode, Mode::Edit);
-        m.on_press();
+        let _ = m.on_press();
         assert_eq!(m.mode, Mode::Nav);
     }
 
@@ -231,7 +289,7 @@ mod tests {
     fn edit_program_changes_value_clamps_and_loads_only_on_change() {
         let mut m = MenuState::new(1, 0, 0);
         m.focus = Row::Program;
-        m.on_press();                         // -> Edit
+        let _ = m.on_press();                 // -> Edit
         assert_eq!(m.on_turn(5), true);       // 0 -> 5, load
         assert_eq!(m.program, 5);
         assert_eq!(m.on_turn(-100), true);    // clamp to 0, value changed -> load
@@ -247,13 +305,13 @@ mod tests {
     fn edit_bank_is_inert_with_one_bank_but_live_with_many() {
         let mut one = MenuState::new(1, 0, 0);
         one.focus = Row::Bank;
-        one.on_press();
+        let _ = one.on_press();
         assert_eq!(one.on_turn(1), false);    // clamp to [0,0]: inert
         assert_eq!(one.bank, 0);
 
         let mut many = MenuState::new(3, 0, 7);
         many.focus = Row::Bank;
-        many.on_press();
+        let _ = many.on_press();
         assert_eq!(many.on_turn(1), true);    // 0 -> 1, load at current program
         assert_eq!(many.bank, 1);
         assert_eq!(many.program, 7);          // program preserved
@@ -325,5 +383,74 @@ mod tests {
             assert!(!e.label().is_empty());
             assert!(!e.ch_map().is_empty());
         }
+    }
+
+    #[test]
+    fn nav_cycles_three_rows() {
+        let mut m = MenuState::new(2, 0, 10);
+        assert_eq!(m.focus, Row::Bank);
+        m.on_turn(1);
+        assert_eq!(m.focus, Row::Program);
+        m.on_turn(1);
+        assert_eq!(m.focus, Row::Save);
+        m.on_turn(1); // clamp
+        assert_eq!(m.focus, Row::Save);
+        m.on_turn(-1);
+        assert_eq!(m.focus, Row::Program);
+        m.on_turn(-1);
+        assert_eq!(m.focus, Row::Bank);
+        m.on_turn(-1); // clamp
+        assert_eq!(m.focus, Row::Bank);
+    }
+
+    #[test]
+    fn user_bank_is_last() {
+        let mut m = MenuState::new(2, 0, 0);
+        assert!(!m.is_user_bank());
+        m.focus = Row::Bank;
+        let _ = m.on_press(); // -> Edit
+        assert!(m.on_turn(1)); // bank 0 -> 1 (User), load required
+        assert!(m.is_user_bank());
+    }
+
+    #[test]
+    fn save_row_edit_enters_at_cancel_and_scrolls() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.focus = Row::Save;
+        m.save_cursor = 42; // stale from a previous visit
+        let _ = m.on_press(); // Nav -> Edit: cursor must reset to Cancel
+        assert_eq!(m.mode, Mode::Edit);
+        assert_eq!(m.save_cursor, -1);
+        assert!(!m.on_turn(1));  // Cancel -> slot 0; never a load
+        assert_eq!(m.save_cursor, 0);
+        assert!(!m.on_turn(-5)); // clamp at Cancel
+        assert_eq!(m.save_cursor, -1);
+        assert!(!m.on_turn(127)); // -1 + 127 = 126
+        assert_eq!(m.save_cursor, 126);
+        assert!(!m.on_turn(127)); // clamp at 127
+        assert_eq!(m.save_cursor, 127);
+    }
+
+    #[test]
+    fn save_press_commits_at_slot_cancels_at_cancel() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.focus = Row::Save;
+        assert_eq!(m.on_press(), PressResult::Toggled); // Nav -> Edit
+        m.on_turn(10);
+        assert_eq!(m.on_press(), PressResult::Commit(9)); // Edit -> Nav (cursor -1+10=9)
+        assert_eq!(m.mode, Mode::Nav);
+
+        assert_eq!(m.on_press(), PressResult::Toggled); // back to Edit, cursor reset
+        assert_eq!(m.save_cursor, -1);
+        assert_eq!(m.on_press(), PressResult::Cancel);  // press at Cancel
+        assert_eq!(m.mode, Mode::Nav);
+    }
+
+    #[test]
+    fn non_save_rows_never_commit() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.focus = Row::Program;
+        assert_eq!(m.on_press(), PressResult::Toggled);
+        assert_eq!(m.on_press(), PressResult::Toggled);
     }
 }
