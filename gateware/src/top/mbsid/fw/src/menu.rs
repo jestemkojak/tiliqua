@@ -46,7 +46,16 @@ impl VoiceMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Row { Bank, Program, Save }
+pub enum Row { Bank, Program, Save, MidiSrc }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MidiSource { Trs, Usb }
+
+impl MidiSource {
+    pub fn label(self) -> &'static str {
+        match self { Self::Trs => "TRS", Self::Usb => "USB" }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode { Nav, Edit }
@@ -60,6 +69,7 @@ pub struct MenuState {
     pub bank: u8,
     pub program: u8,
     pub save_cursor: i16,
+    pub midi_src: MidiSource,
     bank_count: u8,
 }
 
@@ -77,6 +87,7 @@ impl MenuState {
             bank: bank.min(bank_count - 1),
             program: program.min(127),
             save_cursor: -1,
+            midi_src: MidiSource::Trs,
             bank_count,
         }
     }
@@ -85,11 +96,14 @@ impl MenuState {
     pub fn on_turn(&mut self, delta: i8) -> bool {
         match self.mode {
             Mode::Nav => {
-                let ix = match self.focus { Row::Bank => 0i16, Row::Program => 1, Row::Save => 2 };
-                self.focus = match clamp_i16(ix + delta as i16, 0, 2) {
+                let ix = match self.focus {
+                    Row::Bank => 0i16, Row::Program => 1, Row::Save => 2, Row::MidiSrc => 3,
+                };
+                self.focus = match clamp_i16(ix + delta as i16, 0, 3) {
                     0 => Row::Bank,
                     1 => Row::Program,
-                    _ => Row::Save,
+                    2 => Row::Save,
+                    _ => Row::MidiSrc,
                 };
                 false
             }
@@ -113,6 +127,15 @@ impl MenuState {
                     self.save_cursor =
                         clamp_i16(self.save_cursor + delta as i16, -1, 127);
                     false // preview only; never a load, never a write
+                }
+                Row::MidiSrc => {
+                    if delta != 0 {
+                        self.midi_src = match self.midi_src {
+                            MidiSource::Trs => MidiSource::Usb,
+                            MidiSource::Usb => MidiSource::Trs,
+                        };
+                    }
+                    false // never a patch load; main.rs applies it via CSR write
                 }
             },
         }
@@ -153,7 +176,7 @@ pub fn name_from_cstr(buf: &[u8; 17]) -> &str {
 
 /// Width/height of the menu's opaque background box, in pixels.
 const MENU_W: u32 = 380;
-const MENU_H: u32 = 170;
+const MENU_H: u32 = 194;
 const ROW_DY: i32 = 24; // vertical spacing between rows
 
 /// Build the detail-row text. `detail` is `Some((engine, voice_mode))` for a
@@ -231,12 +254,20 @@ where
     let style = if save_focused { bright } else { dim };
     Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), style).draw(d)?;
 
+    // MIDI source row: which physical input feeds the engine.
+    let midi_focused = st.focus == Row::MidiSrc;
+    let marker = row_marker(st, Row::MidiSrc);
+    line.clear();
+    let _ = write!(line, "{} MIDI Src {}", marker, st.midi_src.label());
+    let style = if midi_focused { bright } else { dim };
+    Text::new(&line, Point::new(pos_x, pos_y + 4 * ROW_DY), style).draw(d)?;
+
     // Detail row: engine label + voice mode (Lead only) + channel map, or "---".
     let detail_line = detail_line(detail);
-    Text::new(&detail_line, Point::new(pos_x, pos_y + 4 * ROW_DY), dim).draw(d)?;
+    Text::new(&detail_line, Point::new(pos_x, pos_y + 5 * ROW_DY), dim).draw(d)?;
 
     if let Some(s) = status {
-        Text::new(s, Point::new(pos_x, pos_y + 5 * ROW_DY), bright).draw(d)?;
+        Text::new(s, Point::new(pos_x, pos_y + 6 * ROW_DY), bright).draw(d)?;
     }
 
     Ok(())
@@ -265,7 +296,11 @@ mod tests {
         assert_eq!(m.focus, Row::Program);
         assert_eq!(m.on_turn(1), false);      // -> Save, no load
         assert_eq!(m.focus, Row::Save);
-        assert_eq!(m.on_turn(3), false);      // clamp: stays Save
+        assert_eq!(m.on_turn(1), false);      // -> MidiSrc, no load
+        assert_eq!(m.focus, Row::MidiSrc);
+        assert_eq!(m.on_turn(3), false);      // clamp: stays MidiSrc
+        assert_eq!(m.focus, Row::MidiSrc);
+        assert_eq!(m.on_turn(-1), false);     // -> Save
         assert_eq!(m.focus, Row::Save);
         assert_eq!(m.on_turn(-1), false);     // -> Program
         assert_eq!(m.focus, Row::Program);
@@ -386,14 +421,18 @@ mod tests {
     }
 
     #[test]
-    fn nav_cycles_three_rows() {
+    fn nav_cycles_four_rows() {
         let mut m = MenuState::new(2, 0, 10);
         assert_eq!(m.focus, Row::Bank);
         m.on_turn(1);
         assert_eq!(m.focus, Row::Program);
         m.on_turn(1);
         assert_eq!(m.focus, Row::Save);
+        m.on_turn(1);
+        assert_eq!(m.focus, Row::MidiSrc);
         m.on_turn(1); // clamp
+        assert_eq!(m.focus, Row::MidiSrc);
+        m.on_turn(-1);
         assert_eq!(m.focus, Row::Save);
         m.on_turn(-1);
         assert_eq!(m.focus, Row::Program);
@@ -452,5 +491,27 @@ mod tests {
         m.focus = Row::Program;
         assert_eq!(m.on_press(), PressResult::Toggled);
         assert_eq!(m.on_press(), PressResult::Toggled);
+    }
+
+    #[test]
+    fn midi_src_defaults_trs_and_toggles_on_edit_turn() {
+        let mut m = MenuState::new(1, 0, 0);
+        assert_eq!(m.midi_src, MidiSource::Trs);
+        m.focus = Row::MidiSrc;
+        let _ = m.on_press(); // Nav -> Edit
+        assert_eq!(m.on_turn(1), false);   // never a load
+        assert_eq!(m.midi_src, MidiSource::Usb);
+        assert_eq!(m.on_turn(-1), false);
+        assert_eq!(m.midi_src, MidiSource::Trs);
+        assert_eq!(m.on_turn(0), false);   // zero delta: no change
+        assert_eq!(m.midi_src, MidiSource::Trs);
+    }
+
+    #[test]
+    fn midi_src_press_never_commits_or_cancels() {
+        let mut m = MenuState::new(1, 0, 0);
+        m.focus = Row::MidiSrc;
+        assert_eq!(m.on_press(), PressResult::Toggled); // Nav -> Edit
+        assert_eq!(m.on_press(), PressResult::Toggled); // Edit -> Nav
     }
 }
