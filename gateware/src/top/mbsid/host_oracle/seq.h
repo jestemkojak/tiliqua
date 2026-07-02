@@ -13,6 +13,10 @@
  *     <t_ms> bend  <val14>      0..16383, 8192 = centre
  *     <t_ms> ch    <chn>         set current MIDI channel (sticky, default 0)
  *     <t_ms> at    <val>         channel aftertouch on current channel
+ *     <t_ms> syx   <hexbytes>    feed literal SysEx bytes (e.g. syx f0...f7)
+ *     <t_ms> syxpc <row>         encode sid_bank_preset_0[row] as an MBSID
+ *                                RAM Write dump (type 0x08, bank 0) and feed
+ *                                it byte-wise through the SysEx receiver
  *     <t_ms> end                stop the loop after this ms-tick
  *
  * Trace format emitted: "<t_ms> <L|R> <reg> <hexval>\n" for every changed
@@ -30,22 +34,48 @@
 
 struct SeqEvent {
     int t_ms;
-    enum Kind { PATCH, PC, ON, OFF, CC, BEND, AT, CH, END } kind;
+    enum Kind { PATCH, PC, ON, OFF, CC, BEND, AT, CH, SYX, SYXPC, END } kind;
     int a;   // patch row / note / cc num / bend value
     int b;   // velocity / cc value
+    std::vector<uint8_t> bytes;  // SYX only: literal SysEx bytes
 };
 
 static inline std::vector<SeqEvent> seq_parse(const char *path) {
     std::vector<SeqEvent> evts;
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "seq_parse: cannot open %s\n", path); exit(2); }
-    char line[256];
+    // Wide enough for a full 1036-byte SysEx dump hex-encoded inline via a
+    // 'syx' line (2072 hex chars + "<t_ms> syx " prefix + margin).
+    char line[2560];
     int lineno = 0;
     while (fgets(line, sizeof(line), f)) {
         ++lineno;
         // strip comment
         char *hash = strchr(line, '#');
         if (hash) *hash = '\0';
+        // 'syx' carries an arbitrary-length hex string: parse it specially.
+        // NB: match the event keyword as its own token first — sscanf's
+        // literal "syx" in a format string matches only those 3 characters,
+        // so "%d syx %s" would also (mis)match a line starting "0 syxpc ..."
+        // (no word-boundary check), silently feeding "pc" to the hex parser.
+        {
+            int t = 0, off = 0;
+            char kw[32];
+            char hex[2200];
+            if (sscanf(line, "%d %31s%n", &t, kw, &off) == 2 && !strcmp(kw, "syx")) {
+                if (sscanf(line + off, "%2199s", hex) != 1) { fprintf(stderr, "seq_parse: %s:%d missing syx hex\n", path, lineno); exit(2); }
+                SeqEvent e; e.t_ms = t; e.kind = SeqEvent::SYX; e.a = e.b = 0;
+                size_t n = strlen(hex);
+                if (n % 2) { fprintf(stderr, "seq_parse: %s:%d odd hex length\n", path, lineno); exit(2); }
+                for (size_t i = 0; i < n; i += 2) {
+                    unsigned v;
+                    if (sscanf(hex + i, "%2x", &v) != 1) { fprintf(stderr, "seq_parse: %s:%d bad hex\n", path, lineno); exit(2); }
+                    e.bytes.push_back((uint8_t)v);
+                }
+                evts.push_back(e);
+                continue;
+            }
+        }
         char ev[32];
         int t = 0, a = 0, b = 0;
         int n = sscanf(line, "%d %31s %d %d", &t, ev, &a, &b);
@@ -59,12 +89,33 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
         else if (!strcmp(ev, "bend"))  e.kind = SeqEvent::BEND;
         else if (!strcmp(ev, "at"))    e.kind = SeqEvent::AT;
         else if (!strcmp(ev, "ch"))    e.kind = SeqEvent::CH;
+        else if (!strcmp(ev, "syxpc")) e.kind = SeqEvent::SYXPC;
         else if (!strcmp(ev, "end"))   e.kind = SeqEvent::END;
         else { fprintf(stderr, "seq_parse: %s:%d unknown event '%s'\n", path, lineno, ev); exit(2); }
         evts.push_back(e);
     }
     fclose(f);
     return evts;
+}
+
+/* Encode a 512-byte patch as an MBSID Patch Write dump (1036 bytes):
+ * F0 00 00 7E 4B 00 | 02 | type | bank | patch | 1024 nibbles lo-first |
+ * (-sum)&0x7F | F7.  Mirrors MbSidSysEx::cmdPatchWrite's expectations. */
+static inline void seq_encode_patch_dump(const unsigned char *patch512,
+                                         uint8_t type, uint8_t bank,
+                                         uint8_t pnum, unsigned char out[1036]) {
+    static const unsigned char hdr[6] = {0xF0, 0x00, 0x00, 0x7E, 0x4B, 0x00};
+    int k = 0;
+    for (int i = 0; i < 6; ++i) out[k++] = hdr[i];
+    out[k++] = 0x02;
+    out[k++] = type; out[k++] = bank; out[k++] = pnum;
+    unsigned sum = 0;
+    for (int i = 0; i < 512; ++i) {
+        unsigned char lo = patch512[i] & 0x0F, hi = (patch512[i] >> 4) & 0x0F;
+        out[k++] = lo; out[k++] = hi; sum += lo + hi;
+    }
+    out[k++] = (unsigned char)((-(int)sum) & 0x7F);
+    out[k++] = 0xF7;
 }
 
 /* Backend concept (duck-typed):
@@ -76,6 +127,8 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
  *   void          cc(int chn, int num, int val);
  *   void          bend(int chn, int val14);
  *   void          aftertouch(int chn, int val);
+ *   void          sysex_byte(uint8_t b);       // feed one literal SysEx byte
+ *   void          sysex_patch_dump(int row);   // encode+feed a RAM Write dump
  *   int           tick();                 // advance one ms
  *   const uint8_t *regs();                // 32-byte L image
  *   const uint8_t *regs_r();              // 32-byte R image
@@ -113,6 +166,13 @@ static inline void run_sequence(const char *path, Backend &be, FILE *out) {
             case SeqEvent::CC:    be.cc(cur_chn, e.a, e.b);        break;
             case SeqEvent::BEND:  be.bend(cur_chn, e.a);           break;
             case SeqEvent::AT:    be.aftertouch(cur_chn, e.a);     break;
+            case SeqEvent::SYX:
+                for (size_t bi = 0; bi < e.bytes.size(); ++bi)
+                    be.sysex_byte(e.bytes[bi]);
+                break;
+            case SeqEvent::SYXPC:
+                be.sysex_patch_dump(e.a);
+                break;
             case SeqEvent::END:   stop = true;                     break;
             }
         }
