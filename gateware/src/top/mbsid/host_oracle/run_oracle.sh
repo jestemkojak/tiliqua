@@ -79,6 +79,10 @@ C_OBJS=("$BUILD/notestack.o" "$BUILD/jsw_rand.o" "$BUILD/sid.o")
 "$CXX" $CXXFLAGS -c "$HERE/sweep_driver.cpp" -o "$BUILD/sweep_driver.o"
 "$CXX" $CXXFLAGS "$BUILD/sweep_driver.o" "$BUILD/mbsid_shim.o" "${ENGINE_OBJS[@]}" "${C_OBJS[@]}" "$BUILD/host_stubs.o" -o "$BUILD/sweep_driver"
 
+# --- M5 param-edit body-capture check (shim side only) ---
+"$CXX" $CXXFLAGS -c "$HERE/param_check.cpp" -o "$BUILD/param_check.o"
+"$CXX" $CXXFLAGS "$BUILD/param_check.o" "$BUILD/mbsid_shim.o" "${ENGINE_OBJS[@]}" "${C_OBJS[@]}" "$BUILD/host_stubs.o" -o "$BUILD/param_check"
+
 "$CXX" $CXXFLAGS "$BUILD/oracle.o"     "${ENGINE_OBJS[@]}" "${C_OBJS[@]}" "$BUILD/host_stubs.o" -o "$BUILD/oracle"
 "$CXX" $CXXFLAGS "$BUILD/shim_driver.o" "$BUILD/mbsid_shim.o" "${ENGINE_OBJS[@]}" "${C_OBJS[@]}" "$BUILD/host_stubs.o" -o "$BUILD/shim_driver"
 
@@ -253,5 +257,8 @@ else
     echo "FAIL: no-crash sweep (crash or hang, exit $?)"
     fail=1
 fi
+
+echo "=== M5 sysex_param save-capture invariant ==="
+if "$BUILD/param_check"; then :; else echo "FAIL: param_check"; fail=1; fi
 
 exit $fail

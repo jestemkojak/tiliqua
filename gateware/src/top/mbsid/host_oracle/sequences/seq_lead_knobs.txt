@@ -1,0 +1,16 @@
+# seq_lead_knobs.txt — M5: knob + parSet modulation while notes play.
+# Exercises mbsid_knob_set / mbsid_par_set (kn/pr) against the engine reference.
+10   on   60 100
+50   kn   0 64
+100  kn   0 192
+150  kn   1 32
+200  pr   4 8192
+250  pr   4 49152
+300  pr   5 61440
+350  pr   1 32768
+400  kn   0 255
+500  on   67 100
+550  pr   4 4096
+700  off  67
+900  off  60
+1200 end
