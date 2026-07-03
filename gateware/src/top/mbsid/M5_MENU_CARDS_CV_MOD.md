@@ -131,10 +131,13 @@ All verified against the pinned mios32 checkout
   same concurrency pattern as M4's `load_patch`/`current_patch_raw`.
 - **Precedence rule (documented, by design):** if a CV input modulates the
   same runtime parameter the user is editing on the Patch Edit card, the CV
-  wins audibly (it rewrites the runtime value at up to 1 kHz), but the menu
-  edit is what's in the patch **body** and therefore what Save persists.
-  Likewise CV→Knob1 and the MIDI mod wheel (CC1) share a knob:
-  last-writer-wins, exactly as two MIDI controllers would.
+  wins audibly *while it's actively changing* (it rewrites the runtime value
+  at up to 1 kHz) — but CV targets are deadbanded on their 8-bit value, so
+  once the CV settles a subsequent menu edit takes effect live until the CV
+  next moves past its resolution step. Either way, the menu edit is what's in
+  the patch **body** and therefore what Save persists. Likewise CV→Knob1 and
+  the MIDI mod wheel (CC1) share a knob: last-writer-wins, exactly as two
+  MIDI controllers would.
 
 ---
 
@@ -377,6 +380,9 @@ already in the M2/M4 SoC.
       load User slot → edit persisted.
 - [ ] Settings persist: assign CVs, set MIDI Src=USB, power cycle, verify.
 - [ ] `*` dirty star appears on first edit, clears on save and on load.
+- [ ] Edit card on a non-Lead patch — confirm the encoder cannot corrupt or
+      dirty the loaded patch (host-test-guarded per the M5 review fix; still
+      worth a physical confirmation of encoder/display behavior).
 
 ---
 
