@@ -1,5 +1,8 @@
 # SID Player
 
+**Superseded:** this is the OLD hardware-6502 variant; active development is the
+software-6502 `../sid_player_sw/` (see its CLAUDE.md). Don't cross-edit.
+
 6502 (arlet `cpu.v`) running a PSID tune from PSRAM via `Cpu6502Bridge`, feeding
 a SID peripheral. The bridge (`top.py`) is a windowed clock-enable interface:
 a free-running `phase` counter pulses `advance`/`cpu_RDY` once per N-cycle window;
