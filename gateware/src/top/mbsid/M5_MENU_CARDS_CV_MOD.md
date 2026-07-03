@@ -382,7 +382,9 @@ already in the M2/M4 SoC.
 - [ ] `*` dirty star appears on first edit, clears on save and on load.
 - [ ] Edit card on a non-Lead patch — confirm the encoder cannot corrupt or
       dirty the loaded patch (host-test-guarded per the M5 review fix; still
-      worth a physical confirmation of encoder/display behavior).
+      worth a physical confirmation of encoder/display behavior), including
+      when the non-Lead patch was selected via inbound MIDI Program Change,
+      not just menu navigation.
 
 ---
 
