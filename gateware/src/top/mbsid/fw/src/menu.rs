@@ -670,4 +670,76 @@ mod tests {
         m.on_turn(10);
         assert_eq!(m.on_press(), PressResult::Commit(9));
     }
+
+    #[test]
+    fn cvmod_row_edit_steps_targets_and_reports_settings_change() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::CvMod;
+        m.focus = 1; // CV1
+        let _ = m.on_press();
+        assert_eq!(m.on_turn(1), TurnResult::SettingsChanged);
+        assert_eq!(m.cv_targets[0], CvTarget::Knob1);
+        assert_eq!(m.on_turn(-1), TurnResult::SettingsChanged);
+        assert_eq!(m.cv_targets[0], CvTarget::Off);
+        assert_eq!(m.on_turn(-1), TurnResult::None); // clamped at Off: no change
+    }
+
+    #[test]
+    fn patch_edit_row_steps_value_and_emits_param() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::PatchEdit;
+        m.edit_values[0] = 5; // Volume row (max 15, step 1)
+        m.focus = 1;
+        let _ = m.on_press();
+        assert_eq!(m.on_turn(2), TurnResult::Param { ix: 0, value: 7 });
+        assert_eq!(m.on_turn(100), TurnResult::Param { ix: 0, value: 15 }); // clamp
+        assert_eq!(m.on_turn(1), TurnResult::None); // at max: no change
+    }
+
+    #[test]
+    fn patch_edit_wide_row_uses_coarse_step() {
+        let cutoff_ix = params::LEAD_PARAMS.iter()
+            .position(|d| d.label == "Cutoff").unwrap();
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::PatchEdit;
+        m.focus = cutoff_ix as u8 + 1;
+        let _ = m.on_press();
+        assert_eq!(m.on_turn(1),
+                   TurnResult::Param { ix: cutoff_ix as u8, value: 16 });
+    }
+
+    #[test]
+    fn patch_edit_scroll_follows_focus() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::PatchEdit;
+        for _ in 0..(N_PARAMS + 1) { m.on_turn(1); } // Nav to the Save row
+        assert_eq!(m.focus, m.row_count() - 1);
+        let ix = m.focus - 1;
+        assert!(ix >= m.edit_scroll && ix < m.edit_scroll + 6, "focus visible");
+        for _ in 0..(N_PARAMS + 1) { m.on_turn(-1); } // back to Card row
+        assert_eq!(m.edit_scroll, 0);
+    }
+
+    #[test]
+    fn patch_edit_save_row_commits_like_main() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::PatchEdit;
+        m.focus = m.row_count() - 1;
+        assert_eq!(m.on_press(), PressResult::Toggled);
+        assert_eq!(m.save_cursor, -1); // Cancel-first
+        m.on_turn(5);
+        assert_eq!(m.on_press(), PressResult::Commit(4));
+    }
+
+    #[test]
+    fn refresh_params_reads_lead_layout() {
+        let mut m = MenuState::new(2, 0, 0);
+        // Body: volume=0xC (0x52), OSC1 ad=0x84 (0x62: A=8, D=4).
+        m.refresh_params(|a| match a { 0x52 => 0x0C, 0x62 => 0x84, _ => 0 });
+        assert_eq!(m.edit_values[0], 12);
+        let atk_ix = params::LEAD_PARAMS.iter().position(|d| d.label == "O1 Atk").unwrap();
+        let dec_ix = params::LEAD_PARAMS.iter().position(|d| d.label == "O1 Dec").unwrap();
+        assert_eq!(m.edit_values[atk_ix], 8);
+        assert_eq!(m.edit_values[dec_ix], 4);
+    }
 }
