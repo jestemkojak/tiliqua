@@ -22,6 +22,11 @@ extern "C" {
     fn mbsid_current_patch_raw(buf512: *mut u8);
     fn mbsid_sysex_byte(b: u8) -> i32;
     fn mbsid_sysex_timeout();
+    fn mbsid_knob_set(knob: u8, value: u8);
+    fn mbsid_par_set(par: u8, value16: u16);
+    fn mbsid_sysex_param(addr: u16, data: u8) -> i32;
+    fn mbsid_patch_byte(addr: u16) -> u8;
+    fn mbsid_current_engine() -> u8;
 }
 
 // --- safe wrappers (riscv32 target) ---
@@ -125,6 +130,21 @@ pub fn sysex_timeout() {
     unsafe { mbsid_sysex_timeout() }
 }
 
+#[cfg(target_arch = "riscv32")]
+pub fn knob_set(knob: u8, value: u8) { unsafe { mbsid_knob_set(knob, value) } }
+
+#[cfg(target_arch = "riscv32")]
+pub fn par_set(par: u8, value16: u16) { unsafe { mbsid_par_set(par, value16) } }
+
+#[cfg(target_arch = "riscv32")]
+pub fn sysex_param(addr: u16, data: u8) -> bool { unsafe { mbsid_sysex_param(addr, data) != 0 } }
+
+#[cfg(target_arch = "riscv32")]
+pub fn patch_byte(addr: u16) -> u8 { unsafe { mbsid_patch_byte(addr) } }
+
+#[cfg(target_arch = "riscv32")]
+pub fn current_engine() -> u8 { unsafe { mbsid_current_engine() } }
+
 // --- host stubs (non-riscv32, e.g. x86_64 for cargo test --lib) ---
 
 #[cfg(not(target_arch = "riscv32"))]
@@ -189,6 +209,21 @@ pub fn sysex_byte(_b: u8) -> bool { false }
 
 #[cfg(not(target_arch = "riscv32"))]
 pub fn sysex_timeout() {}
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn knob_set(_knob: u8, _value: u8) {}
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn par_set(_par: u8, _value16: u16) {}
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn sysex_param(_addr: u16, _data: u8) -> bool { false }
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn patch_byte(_addr: u16) -> u8 { 0 }
+
+#[cfg(not(target_arch = "riscv32"))]
+pub fn current_engine() -> u8 { 0 } // Lead, matches bank_patch_info stub
 
 #[cfg(test)]
 mod tests {

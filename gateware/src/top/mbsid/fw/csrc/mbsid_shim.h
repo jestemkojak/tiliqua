@@ -38,6 +38,13 @@ int  mbsid_sysex_byte(uint8_t b);
  * MIDI-timeout hook; MbSidSysEx aborts only on port match, which DEFAULT is). */
 void mbsid_sysex_timeout(void);
 
+/* M5: modulation + on-device patch editing (M5_MENU_CARDS_CV_MOD.md §4). */
+void    mbsid_knob_set(uint8_t knob, uint8_t value);    /* engine knob 0..7 (K1..K5,V,P,A) */
+void    mbsid_par_set(uint8_t par, uint16_t value16);   /* parSet common block, sidlr=3, 16-bit scaled */
+int     mbsid_sysex_param(uint16_t addr, uint8_t data); /* patch body write + live update; 1 = ok */
+uint8_t mbsid_patch_byte(uint16_t addr);                /* raw patch body read (display) */
+uint8_t mbsid_current_engine(void);                     /* patch body[0x10]: 0=Lead,1=Bass,2=Drum,3=Multi */
+
 #ifdef __cplusplus
 }
 #endif
