@@ -34,15 +34,18 @@ use tiliqua_fw::regdiff::{RegDiff, WriteList};
 use tiliqua_fw::sysex_capture::SysexCapture;
 use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
 use tiliqua_fw::menu::PressResult;
+use tiliqua_fw::cv::{self, CvSink};
+use tiliqua_fw::{params, settings_store};
 
 use midi_types::MidiMessage;
 use midi_convert::parse::MidiTryParseSlice;
 
-use tiliqua_lib::{bootinfo, palette};
+use tiliqua_lib::{bootinfo, palette, calibration};
 use tiliqua_hal::encoder::Encoder;
 use tiliqua_hal::persist::Persist;
+use tiliqua_hal::pmod::EurorackPmod;
 use pac::constants::*;
-use tiliqua_fw::menu::{self, MenuState};
+use tiliqua_fw::menu::{self, MenuState, TurnResult};
 
 // Generates Serial0/Timer0/etc. for this (binary-only) crate. Kept out of lib.rs
 // so the host `cargo test --lib` build stays pure-Rust (no pac/hal on x86_64).
@@ -103,15 +106,36 @@ struct App {
     /// Complete Bank Write captured by the ISR; persisted by the main loop
     /// (flash I/O must never run in the 1 ms ISR).
     pending_save: Option<(u8, [u8; 512])>,
+    /// CV-input modulation routing state (M5 §6b).
+    cv: cv::CvState,
+    /// Calibrated Eurorack CV/gate input jacks, sampled once per ISR tick.
+    pmod: EurorackPmod0,
+    /// ISR tick counter: main-loop debounce timebase (settings persist).
+    uptime_ms: u32,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(pmod: EurorackPmod0) -> Self {
         Self {
             diff_l: RegDiff::new(), diff_r: RegDiff::new(), wl: WriteList::new(),
             sysex_cap: SysexCapture::new(), sysex_idle_ms: 0, pending_save: None,
+            cv: cv::CvState::new(), pmod, uptime_ms: 0,
         }
     }
+}
+
+/// CvSink implementation over the engine FFI. Only used inside
+/// critical_section (ISR body, or main-loop blocks under `cs`).
+struct EngineSink;
+impl CvSink for EngineSink {
+    fn knob(&mut self, knob: u8, value: u8) { mbsid_sys::knob_set(knob, value); }
+    fn par(&mut self, par: u8, value16: u16) { mbsid_sys::par_set(par, value16); }
+    fn note_on(&mut self, note: u8) { mbsid_sys::note_on(0, note, 100); } // MIDI ch 1
+    fn note_off(&mut self, note: u8) { mbsid_sys::note_off(0, note); }
+}
+
+fn now_ms(app: &Mutex<RefCell<App>>) -> u32 {
+    critical_section::with(|cs| app.borrow_ref(cs).uptime_ms)
 }
 
 /// Drain a write list to a SID peripheral, respecting FIFO backpressure
@@ -217,6 +241,14 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
             app.sysex_idle_ms = 0;
         }
 
+        // (a3) CV modulation: sample the calibrated inputs and route per the
+        // menu's target assignments (M5 §6b). Integer-only; engine calls are
+        // the same knob/par paths MIDI CC takes.
+        app.uptime_ms = app.uptime_ms.wrapping_add(1);
+        let x = app.pmod.sample_i();
+        let App { cv, .. } = &mut *app;
+        cv.tick(x, &mut EngineSink);
+
         // (b) Tick the engine; on a register change, diff L and R vs their
         //     shadows and stream only the changed regs to their SIDs.
         if mbsid_sys::tick() {
@@ -256,8 +288,13 @@ fn main() -> ! {
     // Engine bring-up + boot patch (unchanged).
     mbsid_sys::init();
     mbsid_sys::program_change(BOOT_PATCH_INDEX);
+    let mut lead_loaded = mbsid_sys::current_engine() == 0;
 
-    let mut app = App::new();
+    let mut i2cdev1 = I2c1::new(peripherals.I2C1);
+    let mut pmod = EurorackPmod0::new(peripherals.PMOD0_PERIPH);
+    calibration::CalibrationConstants::load_or_default(&mut i2cdev1, &mut pmod);
+
+    let mut app = App::new(pmod);
     app.diff_l.reset();
     app.diff_r.reset();
     let app = Mutex::new(RefCell::new(app));
@@ -299,6 +336,29 @@ fn main() -> ! {
 
     // Total banks = engine ROM banks + the flash User bank (always last).
     let mut state = MenuState::new(mbsid_sys::bank_count() + 1, 0, BOOT_PATCH_INDEX);
+    state.refresh_params(|a| mbsid_sys::patch_byte(a));
+
+    // Load persisted settings (MIDI source, CV target assignments) from the
+    // option-storage flash window, if the manifest provides one. Any
+    // validation failure (blank flash, wrong magic/version, bad checksum)
+    // decodes to defaults (TRS, all CV Off) — see settings_store.rs.
+    let opt_window = bootinfo.manifest.get_option_storage_window();
+    let settings = match opt_window {
+        Some(ref w) => settings_store::load(store.flash_mut(), w.start),
+        None => settings_store::Settings::default(),
+    };
+    state.midi_src = if settings.midi_src == 1 { menu::MidiSource::Usb } else { menu::MidiSource::Trs };
+    state.cv_targets = settings.cv_targets.map(cv::CvTarget::from_u8);
+    let mut settings_dirty_at: Option<u32> = None;
+    let mut last_saved = settings;
+
+    // Seed the ISR's CV routing once before entering the tick loop (no note
+    // can be held yet, EngineSink is inert until the engine is boot-loaded).
+    critical_section::with(|cs| {
+        let mut a = app.borrow_ref_mut(cs);
+        let App { cv, .. } = &mut *a;
+        cv.set_targets(state.cv_targets, &mut EngineSink);
+    });
 
     // Drives the gateware USB/TRS MIDI source mux (top/sid's usb_midi_host
     // CSR, inherited unchanged — see menu.rs's MidiSrc row). Bound once here;
@@ -318,7 +378,31 @@ fn main() -> ! {
             let pressed = encoder.poke_btn();
 
             let mut need_load = false;
-            if ticks != 0 { need_load |= state.on_turn(ticks); dirty = true; }
+            if ticks != 0 {
+                match state.on_turn(ticks) {
+                    TurnResult::Load => { need_load = true; }
+                    TurnResult::Param { ix, value } => {
+                        let d = &params::LEAD_PARAMS[ix as usize];
+                        let ops = params::write_ops(d, value, |a| mbsid_sys::patch_byte(a));
+                        critical_section::with(|_cs| {
+                            for (a, v) in ops.iter() {
+                                mbsid_sys::sysex_param(*a, *v);
+                            }
+                        });
+                        state.edited = true;
+                    }
+                    TurnResult::SettingsChanged => {
+                        critical_section::with(|cs| {
+                            let mut a = app.borrow_ref_mut(cs);
+                            let App { cv, .. } = &mut *a;
+                            cv.set_targets(state.cv_targets, &mut EngineSink);
+                        });
+                        settings_dirty_at = Some(now_ms(&app));
+                    }
+                    TurnResult::None => {}
+                }
+                dirty = true;
+            }
             if pressed {
                 match state.on_press() {
                     PressResult::Toggled => {}
@@ -329,8 +413,9 @@ fn main() -> ! {
                         critical_section::with(|_cs| {
                             mbsid_sys::current_patch_raw(&mut patch_buf);
                         });
-                        status = Some(save_status(
-                            store.save(slot, &patch_buf).is_ok(), slot));
+                        let ok = store.save(slot, &patch_buf).is_ok();
+                        if ok { state.edited = false; }
+                        status = Some(save_status(ok, slot));
                     }
                 }
                 dirty = true;
@@ -353,6 +438,9 @@ fn main() -> ! {
                         });
                         // engine byte 0x10, vflags 0x50 (sid_patch_t layout)
                         user_detail = Some((patch_buf[0x10], patch_buf[0x50]));
+                        state.refresh_params(|a| mbsid_sys::patch_byte(a));
+                        state.edited = false;
+                        lead_loaded = mbsid_sys::current_engine() == 0;
                     } else {
                         user_detail = None; // empty slot: engine untouched
                     }
@@ -360,6 +448,24 @@ fn main() -> ! {
                     critical_section::with(|_cs| {
                         mbsid_sys::bank_load(state.bank, state.program);
                     });
+                    state.refresh_params(|a| mbsid_sys::patch_byte(a));
+                    state.edited = false;
+                    lead_loaded = mbsid_sys::current_engine() == 0;
+                }
+            }
+
+            // Persist settings ~2s after the last change (flash wear; §6d).
+            if let (Some(t0), Some(ref w)) = (settings_dirty_at, opt_window.as_ref()) {
+                if now_ms(&app).wrapping_sub(t0) >= 2000 {
+                    let s = settings_store::Settings {
+                        midi_src: (state.midi_src == menu::MidiSource::Usb) as u8,
+                        cv_targets: state.cv_targets.map(|t| t.to_u8()),
+                    };
+                    if s != last_saved {
+                        let _ = settings_store::save(store.flash_mut(), w.start, &s);
+                        last_saved = s;
+                    }
+                    settings_dirty_at = None;
                 }
             }
 
@@ -417,7 +523,7 @@ fn main() -> ! {
                     } else { None };
 
                 menu::draw(&mut display, &state, name, detail,
-                           save_name, status.as_deref(),
+                           save_name, status.as_deref(), lead_loaded,
                            MENU_X, MENU_Y, MENU_HUE).ok();
                 dirty = false;
             }
