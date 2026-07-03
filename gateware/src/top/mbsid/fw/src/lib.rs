@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod cv;
 pub mod regdiff;
 pub mod mbsid_sys;
 pub mod menu;
