@@ -157,9 +157,10 @@ impl MenuState {
                 self.focus = clamp_i16(self.focus as i16 + delta as i16, 0, hi) as u8;
                 if self.card == Card::PatchEdit && self.focus >= 1 {
                     let ix = self.focus - 1; // 0-based row within the scrolling list
-                    const WINDOW: u8 = 6;
                     if ix < self.edit_scroll { self.edit_scroll = ix; }
-                    if ix >= self.edit_scroll + WINDOW { self.edit_scroll = ix - WINDOW + 1; }
+                    if ix >= self.edit_scroll + PATCH_EDIT_WINDOW {
+                        self.edit_scroll = ix - PATCH_EDIT_WINDOW + 1;
+                    }
                 }
                 TurnResult::None
             }
@@ -423,8 +424,19 @@ where
                 Text::new("Lead patches only",
                           Point::new(pos_x, pos_y + 2 * ROW_DY), dim).draw(d)?;
 
-                // Save row (row_count() - 1 == 2 in this branch since only
-                // Card + Save are navigable, matching MenuState::row_count()).
+                // Save row index: row_count() - 1 is always 2 + N_PARAMS - 1
+                // (currently 33), regardless of `lead_loaded` — MenuState's
+                // row_count()/is_save_row() don't know about `lead_loaded`;
+                // it's a purely visual gate applied here in draw(). This is
+                // intentional per Task 6/7, not a bug.
+                //
+                // NOTE for Task 9 (main.rs wiring): in the `!lead_loaded`
+                // case a user must navigate past the Card row through all
+                // N_PARAMS invisible/non-rendered param rows (nothing drawn
+                // above, since this branch only renders "Lead patches only"
+                // + the Save row) before reaching Save. `on_turn`'s Edit-mode
+                // arm will still mutate `edit_values`/set `edited = true` for
+                // those rows even though nothing is drawn or loaded.
                 let save_row = st.row_count() - 1;
                 let marker = row_marker(st, save_row);
                 line.clear();
