@@ -5,3 +5,4 @@ pub mod mbsid_sys;
 pub mod menu;
 pub mod sysex_capture;
 pub mod patch_store;
+pub mod params;
