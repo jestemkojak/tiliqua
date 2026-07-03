@@ -30,6 +30,10 @@ impl<F: NorFlash + ReadNorFlash> UserPatchStore<F> {
     /// Take the flash back out (tests / teardown).
     pub fn into_inner(self) -> F { self.flash }
 
+    /// Borrow the flash driver (shared with the M5 settings record — one
+    /// SPIFlash instance serves both stores; never called from the ISR).
+    pub fn flash_mut(&mut self) -> &mut F { &mut self.flash }
+
     fn slot_addr(&self, slot: u8) -> u32 {
         self.base + (slot as u32) * SLOT_SIZE
     }
