@@ -2,11 +2,22 @@
 
 **Date:** 2026-07-03
 **Branch:** `mbsid-port`
-**Status:** DESIGN APPROVED (brainstorm 2026-07-03) — not implemented.
+**Status:** IMPLEMENTED (2026-07-03, commits a645709..97d6b25 plus this docs
+commit) — host tests + oracle green; hardware bring-up pending (§8 checklist).
 **Scope:** builds on M1–M4 (`M4_USER_PATCH_BANKS.md`). Zero gateware changes,
 zero CSR changes (no `--pac-only`), no upstream C++ edits. Everything is
 firmware (menu/ISR/flash), five thin shim additions, and oracle/driver
 extensions. Chosen-default details are marked **[DEFAULT]**.
+
+**Implementation deviations from this design (confirmed intentional):**
+- The pitch quantizer (`fw/src/cv.rs`'s `quantize_semitone`/`PITCH_SPAN`/
+  `PITCH_HYST`) is a closed-form integer hysteresis routine, not the 61-entry
+  lookup table this design originally sketched — same semitone-quantization
+  semantics (V/oct tracking with boundary hysteresis to prevent flutter),
+  satisfying the "no f32, integer only" constraint via an equivalent but more
+  compact mechanism.
+- `MENU_H` (`fw/src/menu.rs`) grew from 194 to 244 (during Task 8) to fit the
+  Patch Edit card's scrolling parameter window on screen.
 
 ---
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-07-02): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); hardware bring-up pending for all of the above.**
+**Status (2026-07-03): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented, hardware bring-up pending for all of the above.**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
@@ -65,8 +65,23 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **Menu MIDI Src row (TRS/USB) is a pure firmware toggle, no gateware diff.** `MBSIDSoc`
   inherits `SIDSoc`'s USB/TRS source mux and `usb_midi_host` CSR (offset `0xC` on
   `SID_PERIPH`) unchanged — the menu's 4th row (`menu.rs`'s `Row::MidiSrc`) just writes that
-  bit every redraw (`main.rs`). Resets to TRS on every boot (matches the CSR's own reset
-  value); not persisted, like the rest of mbsid's menu.
+  bit every redraw (`main.rs`). MidiSrc and the CV Mod card's four target assignments persist
+  together in a single 16-byte record in the option-storage flash window
+  (`fw/src/settings_store.rs`: magic `"MBS5"` + version + `midi_src` + `cv_targets[4]` +
+  checksum), written debounced ~2 s after the last change (and skipped if identical, to spare
+  flash wear). A corrupt or blank record (bad magic/version/checksum) decodes to defaults —
+  TRS / all four CV targets Off — rather than failing to boot.
+- **M5 (menu cards + CV modulation + on-device patch edit):** the menu is three cards —
+  Main, CV Mod, Edit (`fw/src/menu.rs`'s `Card` enum) — navigated via a Card selector row.
+  CV Mod assigns each of the 4 CV inputs to a target: Knob1–5 (patch knob matrix, via
+  `mbsid_knob_set`), Volume/Phase/Detune/Cutoff/Reso (parSet common block, `mbsid_par_set`
+  addresses `0x01`–`0x05`), or Pitch/Gate (a CV note machine on MIDI channel 1; see
+  `fw/src/cv.rs`). The Edit card edits the loaded Lead patch's params via `mbsid_sysex_param`,
+  which writes straight into the patch body (so it also lands in whatever gets saved) as well
+  as applying live. **Precedence:** the CV Mod ISR tick runs every 1 ms and overwrites the same
+  live knob/par values the Edit card just set, so CV modulation always wins for what you hear
+  right now — but the Edit card's write already landed in the patch body, so that's the value
+  that gets persisted on Save, independent of whatever CV is currently doing to the live sound.
 - **Tiliqua's USB-C MIDI port is a host port, not a device port** (`guh.engines.midi.USBMIDIHost`,
   a genuine `USBHostEnumerator` — drives VBUS, enumerates whatever's plugged in). Tiliqua will
   **never** show up in a PC's own `lsusb`/`amidi -l`, and a plain PC-to-Tiliqua USB-C cable
