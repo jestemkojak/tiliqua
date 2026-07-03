@@ -28,6 +28,8 @@ struct ShimBackend {
         seq_encode_patch_dump(sid_bank_preset_0[row], 0x08, 0x00, 0x00, msg);
         for (int i = 0; i < 1036; ++i) mbsid_sysex_byte(msg[i]);
     }
+    void knob(int k, int v)   { mbsid_knob_set((uint8_t)k, (uint8_t)v); }
+    void par(int p, int v16)  { mbsid_par_set((uint8_t)p, (uint16_t)v16); }
     int  tick()                      { return mbsid_tick(2); }
     const uint8_t *regs()            { return mbsid_regs_l(); }
     const uint8_t *regs_r()          { return mbsid_regs_r(); }
