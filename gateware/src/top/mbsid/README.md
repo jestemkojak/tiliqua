@@ -217,10 +217,13 @@ exposed by this card.
 
 **CV vs. Edit precedence:** if a CV Mod target and an Edit-card parameter
 happen to affect the same underlying value (e.g. CV routed to Cutoff while
-also editing Cutoff on the Edit card), the CV Mod ISR tick (1 kHz) always
-wins for what you currently hear, since it runs continuously. The Edit card's
-write still lands in the patch body, though, so it's the Edit card's value —
-not whatever CV was doing — that gets saved.
+also editing Cutoff on the Edit card), the CV Mod ISR tick (1 kHz) wins for
+what you currently hear *while the CV input is actively changing* — CV
+targets are deadbanded on their 8-bit value, so once the CV settles an
+Edit-card write to the same target takes effect live until the CV next moves
+past its resolution step. The Edit card's write still lands in the patch
+body, though, so it's the Edit card's value — not whatever CV was doing —
+that gets saved.
 
 ---
 

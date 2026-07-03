@@ -336,6 +336,7 @@ fn main() -> ! {
 
     // Total banks = engine ROM banks + the flash User bank (always last).
     let mut state = MenuState::new(mbsid_sys::bank_count() + 1, 0, BOOT_PATCH_INDEX);
+    state.lead_loaded = lead_loaded;
     state.refresh_params(|a| mbsid_sys::patch_byte(a));
 
     // Load persisted settings (MIDI source, CV target assignments) from the
@@ -441,6 +442,7 @@ fn main() -> ! {
                         state.refresh_params(|a| mbsid_sys::patch_byte(a));
                         state.edited = false;
                         lead_loaded = mbsid_sys::current_engine() == 0;
+                        state.lead_loaded = lead_loaded;
                     } else {
                         user_detail = None; // empty slot: engine untouched
                     }
@@ -451,6 +453,7 @@ fn main() -> ! {
                     state.refresh_params(|a| mbsid_sys::patch_byte(a));
                     state.edited = false;
                     lead_loaded = mbsid_sys::current_engine() == 0;
+                    state.lead_loaded = lead_loaded;
                 }
             }
 

@@ -106,6 +106,11 @@ pub struct MenuState {
     pub edit_values: [u16; N_PARAMS],
     pub edit_scroll: u8,
     pub edited: bool,
+    /// Whether the currently-loaded patch is a Lead-engine patch. Gates the
+    /// PatchEdit card's param rows (Lead-layout byte offsets don't apply to
+    /// Bassline/Drum/Multi patches) — see `row_count()`. Defaults to `true`
+    /// to match `main.rs`'s initial assumption before the first load.
+    pub lead_loaded: bool,
     bank_count: u8,
 }
 
@@ -129,6 +134,7 @@ impl MenuState {
             edit_values: [0u16; N_PARAMS],
             edit_scroll: 0,
             edited: false,
+            lead_loaded: true,
             bank_count,
         }
     }
@@ -137,7 +143,12 @@ impl MenuState {
         match self.card {
             Card::Main => 5,
             Card::CvMod => 5,                       // Card + CV1..CV4
-            Card::PatchEdit => 2 + N_PARAMS as u8,  // Card + params + Save
+            // Card + params + Save, but params are Lead-layout only: when the
+            // loaded patch isn't Lead, collapse to Card + Save (matches what
+            // `draw()` renders for `!lead_loaded`, and bounds `focus` so the
+            // param branch in `on_turn`'s Edit-mode PatchEdit arm becomes
+            // unreachable by construction).
+            Card::PatchEdit => if self.lead_loaded { 2 + N_PARAMS as u8 } else { 2 },
         }
     }
 
@@ -841,6 +852,51 @@ mod tests {
         assert_eq!(m.save_cursor, -1); // Cancel-first
         m.on_turn(5);
         assert_eq!(m.on_press(), PressResult::Commit(4));
+    }
+
+    /// Finding 1: when the loaded patch isn't Lead, PatchEdit must collapse
+    /// to Card + Save only (no param rows reachable), and `on_turn` must
+    /// never emit `TurnResult::Param` — those are Lead-layout byte offsets
+    /// and would corrupt a non-Lead patch body if applied live.
+    #[test]
+    fn patch_edit_gated_off_when_not_lead_loaded() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::PatchEdit;
+        m.lead_loaded = false;
+        assert_eq!(m.row_count(), 2); // Card + Save only, no params
+
+        // Nav mode: turning through (and past) the full old param range must
+        // clamp focus to the Card/Save bound (0..=1) — the param rows must
+        // be unreachable, not just unrendered.
+        for _ in 0..(N_PARAMS + 5) {
+            m.on_turn(1);
+            assert!(m.focus <= 1, "focus escaped the Card/Save bound: {}", m.focus);
+        }
+        assert_eq!(m.focus, m.row_count() - 1); // landed on Save, the only other row
+
+        // Enter Edit mode on the Save row and confirm turning it through the
+        // full old param range never emits Param (it must behave as the Save
+        // row, adjusting save_cursor, since the param branch is unreachable
+        // by construction once row_count() == 2).
+        let _ = m.on_press();
+        for _ in 0..(N_PARAMS + 5) {
+            let r = m.on_turn(1);
+            assert!(!matches!(r, TurnResult::Param { .. }),
+                    "on_turn emitted Param while lead_loaded == false");
+        }
+        assert!(m.is_save_row());
+    }
+
+    /// Sanity check that `lead_loaded == true` (the `MenuState::new` default)
+    /// keeps the Task 7 param-editing behavior fully intact — i.e. this fix
+    /// doesn't change anything when a Lead patch actually is loaded.
+    #[test]
+    fn patch_edit_param_rows_unchanged_when_lead_loaded() {
+        let m = MenuState::new(2, 0, 0);
+        assert!(m.lead_loaded); // default
+        let mut m = m;
+        m.card = Card::PatchEdit;
+        assert_eq!(m.row_count() as usize, 2 + N_PARAMS);
     }
 
     #[test]
