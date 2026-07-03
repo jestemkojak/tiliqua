@@ -137,3 +137,25 @@ extern "C" int mbsid_sysex_byte(uint8_t b) {
 extern "C" void mbsid_sysex_timeout(void) {
     env.midiTimeOut(DEFAULT);
 }
+
+// M5: modulation + on-device patch editing. knobSet/parSet dispatch through
+// the current engine's virtual (safe empty default on MbSidSe); parSet's
+// sidlr=3 targets both SIDs, scaleFrom16bit=true takes a full-range u16 —
+// same call shape as the NRPN path. sysexSetParameter writes the patch BODY
+// byte and live-updates the engine, so mbsid_current_patch_raw captures edits.
+extern "C" void mbsid_knob_set(uint8_t knob, uint8_t value) {
+    env.mbSid[0].currentMbSidSePtr->knobSet(knob & 7, value);
+}
+extern "C" void mbsid_par_set(uint8_t par, uint16_t value16) {
+    env.mbSid[0].currentMbSidSePtr->parSet(par, value16, /*sidlr*/3, /*ins*/0,
+                                           /*scaleFrom16bit*/true);
+}
+extern "C" int mbsid_sysex_param(uint16_t addr, uint8_t data) {
+    return env.mbSid[0].sysexSetParameter(addr, data) ? 1 : 0;
+}
+extern "C" uint8_t mbsid_patch_byte(uint16_t addr) {
+    return env.mbSid[0].mbSidPatch.body.ALL[addr & 0x1FF];
+}
+extern "C" uint8_t mbsid_current_engine(void) {
+    return env.mbSid[0].mbSidPatch.body.ALL[0x10];
+}
