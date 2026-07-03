@@ -79,8 +79,11 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   `fw/src/cv.rs`). The Edit card edits the loaded Lead patch's params via `mbsid_sysex_param`,
   which writes straight into the patch body (so it also lands in whatever gets saved) as well
   as applying live. **Precedence:** the CV Mod ISR tick runs every 1 ms and overwrites the same
-  live knob/par values the Edit card just set, so CV modulation always wins for what you hear
-  right now — but the Edit card's write already landed in the patch body, so that's the value
+  live knob/par values the Edit card just set, so CV modulation wins for what you hear
+  right now *while the CV input is actively changing* — CV targets are deadbanded on their
+  8-bit value (`CvState::tick`'s `last8` dedup in `fw/src/cv.rs`), so once a CV settles an
+  Edit-card write to the same target takes effect live until the CV next crosses an LSB
+  boundary — but the Edit card's write already landed in the patch body, so that's the value
   that gets persisted on Save, independent of whatever CV is currently doing to the live sound.
 - **Tiliqua's USB-C MIDI port is a host port, not a device port** (`guh.engines.midi.USBMIDIHost`,
   a genuine `USBHostEnumerator` — drives VBUS, enumerates whatever's plugged in). Tiliqua will
