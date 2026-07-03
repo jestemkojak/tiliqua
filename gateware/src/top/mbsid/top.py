@@ -37,7 +37,7 @@ class MBSIDSoc(SIDSoc):
 
     bitstream_help = BitstreamHelp(
         brief="MBSID Lead: dual SID stereo synth, MIDI in.",
-        io_left=['', '', '', '', 'L out', 'R out', 'L+R mix', 'L+R mix'],
+        io_left=['CV1 mod', 'CV2 mod', 'CV3 mod', 'CV4 mod', 'L out', 'R out', 'L+R mix', 'L+R mix'],
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 

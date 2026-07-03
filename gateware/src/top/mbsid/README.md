@@ -157,6 +157,73 @@ full scale.
 
 ---
 
+## Menu cards
+
+The on-screen menu (encoder-driven) is three cards, selected from a Card row
+at the top of every card:
+
+| Card | Purpose |
+|------|---------|
+| **Main** | patch bank/program browse + load, MIDI Src (TRS/USB), Save (as user patch) |
+| **CV Mod** | assign each of the 4 CV inputs to a modulation target |
+| **Edit** | live-edit the loaded Lead patch's parameters, then Save |
+
+Turning the encoder on the Card row cycles Main → CV Mod → Edit → Main.
+
+### CV modulation (CV Mod card)
+
+CV Mod maps directly onto Tiliqua's 4 audio/CV input jacks (`CV1`–`CV4` on the
+gateware I/O legend, `pmod` inputs 0–3). Each input independently selects a
+target from:
+
+- **Off** — input ignored.
+- **Knob1–Knob5** — routed into the engine's patch knob matrix
+  (`mbsid_knob_set`), the same mechanism a MIDI CC would drive.
+- **Volume / Phase / Detune / Cutoff / Reso** — routed into the parSet common
+  block (`mbsid_par_set`, addresses `0x01`–`0x05`).
+- **Pitch / Gate** — form a CV note machine on MIDI channel 1: `0 V = C2`,
+  1 V/octave tracking with semitone quantization (integer, hysteresis-based —
+  no float, no lookup table); Gate opens above 2 V and closes below 1 V.
+  Assigning Gate alone (no Pitch) plays a fixed note (C-4) on every gate-on.
+  Assigning **Pitch with no Gate target is inert** — Pitch alone never
+  produces a note; you need both.
+
+Continuous targets (Knob/Volume/Phase/Detune/Cutoff/Reso) are deadbanded on
+the 8-bit scaled value, so small CV noise doesn't spam the engine. Retargeting
+an input, or clearing a held Gate's target, releases any note it's currently
+holding — no stuck notes.
+
+CV Mod assignments persist across power cycles alongside the MIDI Src
+setting (`fw/src/settings_store.rs`), saved ~2 s after the last change.
+
+### Patch editing (Edit card)
+
+The Edit card lists the current Lead patch's editable parameters and lets you
+change them with the encoder; each change writes directly into the loaded
+patch's in-memory body (so the value both sounds immediately and is what gets
+captured by Save) and is marked with a `*` after the patch name in the title
+bar as long as any edit is unsaved.
+
+**Volatility contract:** there is no confirmation prompt. Loading a different
+patch — by browsing to a new bank/program on the Main card, or by an incoming
+MIDI Program Change — discards any unsaved edits immediately. The `*` in the
+title bar is the only warning; if you want to keep an edit, Save it (to a user
+slot) before switching patches.
+
+**Lead-only:** the Edit card only shows parameter rows when the currently
+loaded patch is a **Lead** engine patch. Bassline/Drum/Multi patches show a
+"Lead patches only" placeholder instead — those engines' parameters aren't
+exposed by this card.
+
+**CV vs. Edit precedence:** if a CV Mod target and an Edit-card parameter
+happen to affect the same underlying value (e.g. CV routed to Cutoff while
+also editing Cutoff on the Edit card), the CV Mod ISR tick (1 kHz) always
+wins for what you currently hear, since it runs continuously. The Edit card's
+write still lands in the patch body, though, so it's the Edit card's value —
+not whatever CV was doing — that gets saved.
+
+---
+
 ## Layout
 
 | Path | Role |
