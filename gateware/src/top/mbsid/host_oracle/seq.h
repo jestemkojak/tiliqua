@@ -17,6 +17,8 @@
  *     <t_ms> syxpc <row>         encode sid_bank_preset_0[row] as an MBSID
  *                                RAM Write dump (type 0x08, bank 0) and feed
  *                                it byte-wise through the SysEx receiver
+ *     <t_ms> kn    <knob 0..7> <val8 0..255>
+ *     <t_ms> pr    <par> <val16 0..65535>
  *     <t_ms> end                stop the loop after this ms-tick
  *
  * Trace format emitted: "<t_ms> <L|R> <reg> <hexval>\n" for every changed
@@ -34,7 +36,7 @@
 
 struct SeqEvent {
     int t_ms;
-    enum Kind { PATCH, PC, ON, OFF, CC, BEND, AT, CH, SYX, SYXPC, END } kind;
+    enum Kind { PATCH, PC, ON, OFF, CC, BEND, AT, CH, SYX, SYXPC, KN, PR, END } kind;
     int a;   // patch row / note / cc num / bend value
     int b;   // velocity / cc value
     std::vector<uint8_t> bytes;  // SYX only: literal SysEx bytes
@@ -90,6 +92,8 @@ static inline std::vector<SeqEvent> seq_parse(const char *path) {
         else if (!strcmp(ev, "at"))    e.kind = SeqEvent::AT;
         else if (!strcmp(ev, "ch"))    e.kind = SeqEvent::CH;
         else if (!strcmp(ev, "syxpc")) e.kind = SeqEvent::SYXPC;
+        else if (!strcmp(ev, "kn"))    e.kind = SeqEvent::KN;
+        else if (!strcmp(ev, "pr"))    e.kind = SeqEvent::PR;
         else if (!strcmp(ev, "end"))   e.kind = SeqEvent::END;
         else { fprintf(stderr, "seq_parse: %s:%d unknown event '%s'\n", path, lineno, ev); exit(2); }
         evts.push_back(e);
@@ -129,6 +133,8 @@ static inline void seq_encode_patch_dump(const unsigned char *patch512,
  *   void          aftertouch(int chn, int val);
  *   void          sysex_byte(uint8_t b);       // feed one literal SysEx byte
  *   void          sysex_patch_dump(int row);   // encode+feed a RAM Write dump
+ *   void          knob(int k, int v);          // set knob k (0..7) to v (0..255)
+ *   void          par(int par, int val16);     // set parameter par to val16
  *   int           tick();                 // advance one ms
  *   const uint8_t *regs();                // 32-byte L image
  *   const uint8_t *regs_r();              // 32-byte R image
@@ -173,6 +179,8 @@ static inline void run_sequence(const char *path, Backend &be, FILE *out) {
             case SeqEvent::SYXPC:
                 be.sysex_patch_dump(e.a);
                 break;
+            case SeqEvent::KN:    be.knob(e.a, e.b);             break;
+            case SeqEvent::PR:    be.par(e.a, e.b);              break;
             case SeqEvent::END:   stop = true;                     break;
             }
         }

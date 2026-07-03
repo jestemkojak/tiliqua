@@ -44,6 +44,8 @@ struct OracleBackend {
         seq_encode_patch_dump(sid_bank_preset_0[row], 0x08, 0x00, 0x00, msg);
         for (int i = 0; i < 1036; ++i) sysex_byte(msg[i]);
     }
+    void knob(int k, int v)   { env.mbSid[0].currentMbSidSePtr->knobSet((u8)k, (u8)v); }
+    void par(int p, int v16)  { env.mbSid[0].currentMbSidSePtr->parSet((u8)p, (u16)v16, 3, 0, true); }
     int  tick() {
         int changed = env.tick() ? 1 : 0;
         mbsid_multi_wt_fixup(env.mbSid[0]);
