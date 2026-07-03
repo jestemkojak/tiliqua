@@ -286,8 +286,11 @@ pub fn name_from_cstr(buf: &[u8; 17]) -> &str {
 
 /// Width/height of the menu's opaque background box, in pixels.
 const MENU_W: u32 = 380;
-const MENU_H: u32 = 194;
+const MENU_H: u32 = 244;
 const ROW_DY: i32 = 24; // vertical spacing between rows
+
+/// Visible window height (in rows) for the PatchEdit param list.
+const PATCH_EDIT_WINDOW: u8 = 6;
 
 /// Build the detail-row text. `detail` is `Some((engine, voice_mode))` for a
 /// successfully-loaded patch, or `None` when patch info is unavailable (e.g. a
@@ -312,9 +315,11 @@ pub fn detail_line(detail: Option<(Engine, Option<VoiceMode>)>) -> String<48> {
 /// Draw the menu into its own opaque box at (pos_x, pos_y). `name` is the
 /// 16-char patch name for the current (bank, program). `detail` is `None` when
 /// patch info is unavailable (failed load), which renders the row as "---".
+/// `lead_loaded` gates the PatchEdit card's param rows (Lead-only patch data).
 pub fn draw<D>(d: &mut D, st: &MenuState, name: &str,
                detail: Option<(Engine, Option<VoiceMode>)>,
                save_name: Option<&str>, status: Option<&str>,
+               lead_loaded: bool,
                pos_x: i32, pos_y: i32, hue: u8) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = HI8>,
@@ -328,56 +333,151 @@ where
     let dim    = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 9));
     let bright = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 15));
 
-    // Title.
-    Text::new("MBSID", Point::new(pos_x, pos_y), bright).draw(d)?;
+    // Title, with an edited-patch marker (" *") to the right of "MBSID".
+    let mut title: String<32> = String::new();
+    if st.edited {
+        let _ = write!(title, "MBSID  {} *", name);
+    } else {
+        let _ = write!(title, "MBSID  {}", name);
+    }
+    Text::new(&title, Point::new(pos_x, pos_y), bright).draw(d)?;
 
-    // Row helper: marker depends on focus/mode; value is bright when focused.
     let mut line: String<48> = String::new();
 
-    // Bank row.
-    let bank_focused = st.focus == MAIN_ROW_BANK;
-    let marker = row_marker(st, MAIN_ROW_BANK);
+    // Row 0 on every card: Card selector.
+    let marker = row_marker(st, ROW_CARD);
     line.clear();
-    let bank_char = if st.is_user_bank() { 'U' } else { (b'A' + st.bank) as char };
-    let _ = write!(line, "{} Bank     {}", marker, bank_char);
-    let style = if bank_focused { bright } else { dim };
+    let _ = write!(line, "{} Card     {}", marker, st.card.label());
+    let style = if st.focus == ROW_CARD { bright } else { dim };
     Text::new(&line, Point::new(pos_x, pos_y + ROW_DY), style).draw(d)?;
 
-    // Program row (with the patch name).
-    let prog_focused = st.focus == MAIN_ROW_PROGRAM;
-    let marker = row_marker(st, MAIN_ROW_PROGRAM);
-    line.clear();
-    let _ = write!(line, "{} Program  {:03}  {}", marker, st.program, name);
-    let style = if prog_focused { bright } else { dim };
-    Text::new(&line, Point::new(pos_x, pos_y + 2 * ROW_DY), style).draw(d)?;
+    match st.card {
+        Card::Main => {
+            // Bank row.
+            let bank_focused = st.focus == MAIN_ROW_BANK;
+            let marker = row_marker(st, MAIN_ROW_BANK);
+            line.clear();
+            let bank_char = if st.is_user_bank() { 'U' } else { (b'A' + st.bank) as char };
+            let _ = write!(line, "{} Bank     {}", marker, bank_char);
+            let style = if bank_focused { bright } else { dim };
+            Text::new(&line, Point::new(pos_x, pos_y + 2 * ROW_DY), style).draw(d)?;
 
-    // Save row: destination cursor. Cancel-first (spec §6d [DEFAULT]).
-    let save_focused = st.focus == MAIN_ROW_SAVE;
-    let marker = row_marker(st, MAIN_ROW_SAVE);
-    line.clear();
-    if st.save_cursor < 0 {
-        let _ = write!(line, "{} Save     Cancel", marker);
-    } else {
-        let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
-                       save_name.unwrap_or("Empty"));
-    }
-    let style = if save_focused { bright } else { dim };
-    Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), style).draw(d)?;
+            // Program row (with the patch name).
+            let prog_focused = st.focus == MAIN_ROW_PROGRAM;
+            let marker = row_marker(st, MAIN_ROW_PROGRAM);
+            line.clear();
+            let _ = write!(line, "{} Program  {:03}  {}", marker, st.program, name);
+            let style = if prog_focused { bright } else { dim };
+            Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), style).draw(d)?;
 
-    // MIDI source row: which physical input feeds the engine.
-    let midi_focused = st.focus == MAIN_ROW_MIDISRC;
-    let marker = row_marker(st, MAIN_ROW_MIDISRC);
-    line.clear();
-    let _ = write!(line, "{} MIDI Src {}", marker, st.midi_src.label());
-    let style = if midi_focused { bright } else { dim };
-    Text::new(&line, Point::new(pos_x, pos_y + 4 * ROW_DY), style).draw(d)?;
+            // Save row: destination cursor. Cancel-first (spec §6d [DEFAULT]).
+            let save_focused = st.focus == MAIN_ROW_SAVE;
+            let marker = row_marker(st, MAIN_ROW_SAVE);
+            line.clear();
+            if st.save_cursor < 0 {
+                let _ = write!(line, "{} Save     Cancel", marker);
+            } else {
+                let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
+                               save_name.unwrap_or("Empty"));
+            }
+            let style = if save_focused { bright } else { dim };
+            Text::new(&line, Point::new(pos_x, pos_y + 4 * ROW_DY), style).draw(d)?;
 
-    // Detail row: engine label + voice mode (Lead only) + channel map, or "---".
-    let detail_line = detail_line(detail);
-    Text::new(&detail_line, Point::new(pos_x, pos_y + 5 * ROW_DY), dim).draw(d)?;
+            // MIDI source row: which physical input feeds the engine.
+            let midi_focused = st.focus == MAIN_ROW_MIDISRC;
+            let marker = row_marker(st, MAIN_ROW_MIDISRC);
+            line.clear();
+            let _ = write!(line, "{} MIDI Src {}", marker, st.midi_src.label());
+            let style = if midi_focused { bright } else { dim };
+            Text::new(&line, Point::new(pos_x, pos_y + 5 * ROW_DY), style).draw(d)?;
 
-    if let Some(s) = status {
-        Text::new(s, Point::new(pos_x, pos_y + 6 * ROW_DY), bright).draw(d)?;
+            // Detail row: engine label + voice mode (Lead only) + channel map, or "---".
+            let detail_line = detail_line(detail);
+            Text::new(&detail_line, Point::new(pos_x, pos_y + 6 * ROW_DY), dim).draw(d)?;
+
+            if let Some(s) = status {
+                Text::new(s, Point::new(pos_x, pos_y + 7 * ROW_DY), bright).draw(d)?;
+            }
+        }
+        Card::CvMod => {
+            for i in 0..4u8 {
+                let row = i + 1;
+                let marker = row_marker(st, row);
+                line.clear();
+                let _ = write!(line, "{} CV{}      {}", marker, i + 1,
+                               st.cv_targets[i as usize].label());
+                let style = if st.focus == row { bright } else { dim };
+                Text::new(&line, Point::new(pos_x, pos_y + (2 + i as i32) * ROW_DY), style)
+                    .draw(d)?;
+            }
+            // Dim footer line in place of Main's detail line.
+            Text::new("mods engine knobs/params",
+                      Point::new(pos_x, pos_y + 6 * ROW_DY), dim).draw(d)?;
+
+            if let Some(s) = status {
+                Text::new(s, Point::new(pos_x, pos_y + 7 * ROW_DY), bright).draw(d)?;
+            }
+        }
+        Card::PatchEdit => {
+            if !lead_loaded {
+                Text::new("Lead patches only",
+                          Point::new(pos_x, pos_y + 2 * ROW_DY), dim).draw(d)?;
+
+                // Save row (row_count() - 1 == 2 in this branch since only
+                // Card + Save are navigable, matching MenuState::row_count()).
+                let save_row = st.row_count() - 1;
+                let marker = row_marker(st, save_row);
+                line.clear();
+                if st.save_cursor < 0 {
+                    let _ = write!(line, "{} Save     Cancel", marker);
+                } else {
+                    let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
+                                   save_name.unwrap_or("Empty"));
+                }
+                let style = if st.focus == save_row { bright } else { dim };
+                Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), style).draw(d)?;
+            } else {
+                let scroll = st.edit_scroll as usize;
+                let end = (scroll + PATCH_EDIT_WINDOW as usize).min(N_PARAMS);
+
+                for (slot, ix) in (scroll..end).enumerate() {
+                    let row = (ix + 1) as u8;
+                    let d_param = &params::LEAD_PARAMS[ix];
+                    let marker = row_marker(st, row);
+                    line.clear();
+                    let _ = write!(line, "{} {:<8} {}", marker, d_param.label,
+                                   st.edit_values[ix]);
+                    let style = if st.focus == row { bright } else { dim };
+                    Text::new(&line, Point::new(pos_x, pos_y + (2 + slot as i32) * ROW_DY),
+                              style).draw(d)?;
+                }
+
+                // Scroll indicators at the window edges.
+                if scroll > 0 {
+                    Text::new("^", Point::new(pos_x - 10, pos_y + 2 * ROW_DY), dim).draw(d)?;
+                }
+                if end < N_PARAMS {
+                    let last_slot = (end - scroll).max(1) as i32 - 1;
+                    Text::new("v", Point::new(pos_x - 10, pos_y + (2 + last_slot) * ROW_DY),
+                              dim).draw(d)?;
+                }
+
+                // Save row, immediately after the visible param window.
+                let save_row = st.row_count() - 1;
+                let marker = row_marker(st, save_row);
+                line.clear();
+                if st.save_cursor < 0 {
+                    let _ = write!(line, "{} Save     Cancel", marker);
+                } else {
+                    let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
+                                   save_name.unwrap_or("Empty"));
+                }
+                let style = if st.focus == save_row { bright } else { dim };
+                let visible_rows = (end - scroll) as i32;
+                let save_y = pos_y + (2 + visible_rows) * ROW_DY;
+                Text::new(&line, Point::new(pos_x, save_y), style).draw(d)?;
+            }
+        }
     }
 
     Ok(())
