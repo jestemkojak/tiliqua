@@ -378,6 +378,18 @@ fn main() -> ! {
             let ticks = encoder.poke_ticks();
             let pressed = encoder.poke_btn();
 
+            // Resync unconditionally every iteration: an inbound MIDI Program
+            // Change (timer0_handler, async w.r.t. menu navigation) can swap
+            // the engine's loaded patch without going through `need_load`
+            // below. Without this, `state.lead_loaded` can go stale between
+            // two `on_turn` calls and PatchEdit's row_count()/on_turn would
+            // treat a non-Lead patch as Lead, re-opening the byte-offset
+            // corruption the prior fix closed. Cheap point-read of engine
+            // .bss (same acceptable-staleness idiom as patch_byte/
+            // current_engine elsewhere in this crate).
+            lead_loaded = mbsid_sys::current_engine() == 0;
+            state.lead_loaded = lead_loaded;
+
             let mut need_load = false;
             if ticks != 0 {
                 match state.on_turn(ticks) {
@@ -441,8 +453,8 @@ fn main() -> ! {
                         user_detail = Some((patch_buf[0x10], patch_buf[0x50]));
                         state.refresh_params(|a| mbsid_sys::patch_byte(a));
                         state.edited = false;
-                        lead_loaded = mbsid_sys::current_engine() == 0;
-                        state.lead_loaded = lead_loaded;
+                        // lead_loaded/state.lead_loaded resynced unconditionally
+                        // at the top of the next loop iteration.
                     } else {
                         user_detail = None; // empty slot: engine untouched
                     }
@@ -452,8 +464,8 @@ fn main() -> ! {
                     });
                     state.refresh_params(|a| mbsid_sys::patch_byte(a));
                     state.edited = false;
-                    lead_loaded = mbsid_sys::current_engine() == 0;
-                    state.lead_loaded = lead_loaded;
+                    // lead_loaded/state.lead_loaded resynced unconditionally
+                    // at the top of the next loop iteration.
                 }
             }
 
