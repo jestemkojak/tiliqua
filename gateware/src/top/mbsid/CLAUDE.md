@@ -85,6 +85,15 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   Edit-card write to the same target takes effect live until the CV next crosses an LSB
   boundary — but the Edit card's write already landed in the patch body, so that's the value
   that gets persisted on Save, independent of whatever CV is currently doing to the live sound.
+- **`MenuState.lead_loaded` must be resynced unconditionally every main-loop iteration, not just
+  after a menu-driven load.** The Edit card's param rows are only meaningful for a Lead patch;
+  `row_count()` collapses them away when `!lead_loaded` so `on_turn` can't emit stray
+  `TurnResult::Param` writes into a non-Lead patch body. It's tempting to set `state.lead_loaded`
+  only inside the `need_load` block (menu bank/program change) — that's incomplete, because
+  inbound MIDI Program Change (`fw/src/main.rs`'s ISR) changes the engine's loaded patch
+  independently of `MenuState` and will leave `lead_loaded` stale if it's not re-read from
+  `mbsid_sys::current_engine()` at the top of every loop iteration, before `on_turn` is
+  dispatched (found via a whole-branch review that per-task review missed; took two fix rounds).
 - **Tiliqua's USB-C MIDI port is a host port, not a device port** (`guh.engines.midi.USBMIDIHost`,
   a genuine `USBHostEnumerator` — drives VBUS, enumerates whatever's plugged in). Tiliqua will
   **never** show up in a PC's own `lsusb`/`amidi -l`, and a plain PC-to-Tiliqua USB-C cable
