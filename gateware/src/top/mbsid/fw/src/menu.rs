@@ -10,6 +10,11 @@ use tiliqua_lib::color::HI8;
 use heapless::String;
 use core::fmt::Write;
 
+use crate::cv::CvTarget;
+use crate::params;
+
+pub const N_PARAMS: usize = params::LEAD_PARAMS.len();
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Engine { Lead, Bassline, Drum, Multi }
 
@@ -46,7 +51,33 @@ impl VoiceMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Row { Bank, Program, Save, MidiSrc }
+pub enum Card { Main, CvMod, PatchEdit }
+
+impl Card {
+    pub fn label(self) -> &'static str {
+        match self { Self::Main => "Main", Self::CvMod => "CV Mod", Self::PatchEdit => "Edit" }
+    }
+    fn step(self, delta: i8) -> Self {
+        let ix = match self { Self::Main => 0i16, Self::CvMod => 1, Self::PatchEdit => 2 };
+        match (ix + delta as i16).clamp(0, 2) {
+            0 => Self::Main, 1 => Self::CvMod, _ => Self::PatchEdit,
+        }
+    }
+}
+
+pub const ROW_CARD: u8 = 0;
+pub const MAIN_ROW_BANK: u8 = 1;
+pub const MAIN_ROW_PROGRAM: u8 = 2;
+pub const MAIN_ROW_SAVE: u8 = 3;
+pub const MAIN_ROW_MIDISRC: u8 = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TurnResult {
+    None,
+    Load,                             // (bank, program) load required
+    Param { ix: u8, value: u16 },     // patch-edit row changed -> sysex_param writes
+    SettingsChanged,                  // cv target or midi_src changed -> persist
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MidiSource { Trs, Usb }
@@ -64,12 +95,17 @@ pub enum Mode { Nav, Edit }
 pub enum PressResult { Toggled, Commit(u8), Cancel }
 
 pub struct MenuState {
-    pub focus: Row,
+    pub card: Card,
+    pub focus: u8,
     pub mode: Mode,
     pub bank: u8,
     pub program: u8,
     pub save_cursor: i16,
     pub midi_src: MidiSource,
+    pub cv_targets: [CvTarget; 4],
+    pub edit_values: [u16; N_PARAMS],
+    pub edit_scroll: u8,
+    pub edited: bool,
     bank_count: u8,
 }
 
@@ -82,62 +118,130 @@ impl MenuState {
     pub fn new(bank_count: u8, bank: u8, program: u8) -> Self {
         let bank_count = bank_count.max(1);
         Self {
-            focus: Row::Bank,
+            card: Card::Main,
+            focus: ROW_CARD,
             mode: Mode::Nav,
             bank: bank.min(bank_count - 1),
             program: program.min(127),
             save_cursor: -1,
             midi_src: MidiSource::Trs,
+            cv_targets: [CvTarget::Off; 4],
+            edit_values: [0u16; N_PARAMS],
+            edit_scroll: 0,
+            edited: false,
             bank_count,
         }
     }
 
-    /// Handle an encoder rotation. Returns true iff a (bank, program) load is required.
-    pub fn on_turn(&mut self, delta: i8) -> bool {
+    pub fn row_count(&self) -> u8 {
+        match self.card {
+            Card::Main => 5,
+            Card::CvMod => 5,                       // Card + CV1..CV4
+            Card::PatchEdit => 2 + N_PARAMS as u8,  // Card + params + Save
+        }
+    }
+
+    fn is_save_row(&self) -> bool {
+        match self.card {
+            Card::Main => self.focus == MAIN_ROW_SAVE,
+            Card::PatchEdit => self.focus == self.row_count() - 1,
+            Card::CvMod => false,
+        }
+    }
+
+    /// Handle an encoder rotation.
+    pub fn on_turn(&mut self, delta: i8) -> TurnResult {
         match self.mode {
             Mode::Nav => {
-                let ix = match self.focus {
-                    Row::Bank => 0i16, Row::Program => 1, Row::Save => 2, Row::MidiSrc => 3,
-                };
-                self.focus = match clamp_i16(ix + delta as i16, 0, 3) {
-                    0 => Row::Bank,
-                    1 => Row::Program,
-                    2 => Row::Save,
-                    _ => Row::MidiSrc,
-                };
-                false
+                let hi = (self.row_count() - 1) as i16;
+                self.focus = clamp_i16(self.focus as i16 + delta as i16, 0, hi) as u8;
+                if self.card == Card::PatchEdit && self.focus >= 1 {
+                    let ix = self.focus - 1; // 0-based row within the scrolling list
+                    const WINDOW: u8 = 6;
+                    if ix < self.edit_scroll { self.edit_scroll = ix; }
+                    if ix >= self.edit_scroll + WINDOW { self.edit_scroll = ix - WINDOW + 1; }
+                }
+                TurnResult::None
             }
-            Mode::Edit => match self.focus {
-                Row::Program => {
-                    let next = clamp_i16(self.program as i16 + delta as i16, 0, 127) as u8;
-                    let changed = next != self.program;
-                    self.program = next;
-                    changed
+            Mode::Edit => {
+                if self.focus == ROW_CARD {
+                    self.card = self.card.step(delta);
+                    self.focus = ROW_CARD;
+                    return TurnResult::None;
                 }
-                Row::Bank => {
-                    let hi = (self.bank_count - 1) as i16;
-                    let next = clamp_i16(self.bank as i16 + delta as i16, 0, hi) as u8;
-                    let changed = next != self.bank;
-                    self.bank = next;
-                    // All banks hold 128 patches, so program needs no re-clamp;
-                    // a load is required whenever the bank actually changed.
-                    changed
-                }
-                Row::Save => {
-                    self.save_cursor =
-                        clamp_i16(self.save_cursor + delta as i16, -1, 127);
-                    false // preview only; never a load, never a write
-                }
-                Row::MidiSrc => {
-                    if delta != 0 {
-                        self.midi_src = match self.midi_src {
-                            MidiSource::Trs => MidiSource::Usb,
-                            MidiSource::Usb => MidiSource::Trs,
-                        };
+                match self.card {
+                    Card::Main => match self.focus {
+                        MAIN_ROW_PROGRAM => {
+                            let next = clamp_i16(self.program as i16 + delta as i16, 0, 127) as u8;
+                            let changed = next != self.program;
+                            self.program = next;
+                            if changed { TurnResult::Load } else { TurnResult::None }
+                        }
+                        MAIN_ROW_BANK => {
+                            let hi = (self.bank_count - 1) as i16;
+                            let next = clamp_i16(self.bank as i16 + delta as i16, 0, hi) as u8;
+                            let changed = next != self.bank;
+                            self.bank = next;
+                            // All banks hold 128 patches, so program needs no re-clamp;
+                            // a load is required whenever the bank actually changed.
+                            if changed { TurnResult::Load } else { TurnResult::None }
+                        }
+                        MAIN_ROW_SAVE => {
+                            self.save_cursor =
+                                clamp_i16(self.save_cursor + delta as i16, -1, 127);
+                            TurnResult::None // preview only; never a load, never a write
+                        }
+                        MAIN_ROW_MIDISRC => {
+                            if delta != 0 {
+                                self.midi_src = match self.midi_src {
+                                    MidiSource::Trs => MidiSource::Usb,
+                                    MidiSource::Usb => MidiSource::Trs,
+                                };
+                                TurnResult::SettingsChanged
+                            } else {
+                                TurnResult::None
+                            }
+                        }
+                        _ => TurnResult::None,
+                    },
+                    Card::CvMod => {
+                        let i = (self.focus - 1) as usize;
+                        if i < 4 {
+                            let next = self.cv_targets[i].step(delta);
+                            let changed = next != self.cv_targets[i];
+                            self.cv_targets[i] = next;
+                            if changed { TurnResult::SettingsChanged } else { TurnResult::None }
+                        } else {
+                            TurnResult::None
+                        }
                     }
-                    false // never a patch load; main.rs applies it via CSR write
+                    Card::PatchEdit => {
+                        if self.is_save_row() {
+                            self.save_cursor =
+                                clamp_i16(self.save_cursor + delta as i16, -1, 127);
+                            TurnResult::None
+                        } else {
+                            let ix = (self.focus - 1) as usize;
+                            if ix < N_PARAMS {
+                                let d = &params::LEAD_PARAMS[ix];
+                                let cur = self.edit_values[ix] as i32;
+                                let step = d.step as i32;
+                                let next = (cur + delta as i32 * step).clamp(0, d.max as i32) as u16;
+                                let changed = next != self.edit_values[ix];
+                                self.edit_values[ix] = next;
+                                if changed {
+                                    self.edited = true;
+                                    TurnResult::Param { ix: ix as u8, value: next }
+                                } else {
+                                    TurnResult::None
+                                }
+                            } else {
+                                TurnResult::None
+                            }
+                        }
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -145,7 +249,7 @@ impl MenuState {
     /// write can only ever happen on the deliberate Edit->Nav confirmation on
     /// the Save row (M4 spec §6d).
     pub fn on_press(&mut self) -> PressResult {
-        let result = if self.focus == Row::Save && self.mode == Mode::Edit {
+        let result = if self.is_save_row() && self.mode == Mode::Edit {
             if self.save_cursor < 0 { PressResult::Cancel }
             else { PressResult::Commit(self.save_cursor as u8) }
         } else {
@@ -153,7 +257,7 @@ impl MenuState {
         };
         self.mode = match self.mode {
             Mode::Nav => {
-                if self.focus == Row::Save {
+                if self.is_save_row() {
                     self.save_cursor = -1; // always enter Edit at Cancel
                 }
                 Mode::Edit
@@ -165,6 +269,12 @@ impl MenuState {
 
     pub fn is_user_bank(&self) -> bool {
         self.bank == self.bank_count - 1
+    }
+
+    pub fn refresh_params(&mut self, body: impl Fn(u16) -> u8) {
+        for (i, d) in params::LEAD_PARAMS.iter().enumerate() {
+            self.edit_values[i] = params::read_value(d, &body);
+        }
     }
 }
 
@@ -225,8 +335,8 @@ where
     let mut line: String<48> = String::new();
 
     // Bank row.
-    let bank_focused = st.focus == Row::Bank;
-    let marker = row_marker(st, Row::Bank);
+    let bank_focused = st.focus == MAIN_ROW_BANK;
+    let marker = row_marker(st, MAIN_ROW_BANK);
     line.clear();
     let bank_char = if st.is_user_bank() { 'U' } else { (b'A' + st.bank) as char };
     let _ = write!(line, "{} Bank     {}", marker, bank_char);
@@ -234,16 +344,16 @@ where
     Text::new(&line, Point::new(pos_x, pos_y + ROW_DY), style).draw(d)?;
 
     // Program row (with the patch name).
-    let prog_focused = st.focus == Row::Program;
-    let marker = row_marker(st, Row::Program);
+    let prog_focused = st.focus == MAIN_ROW_PROGRAM;
+    let marker = row_marker(st, MAIN_ROW_PROGRAM);
     line.clear();
     let _ = write!(line, "{} Program  {:03}  {}", marker, st.program, name);
     let style = if prog_focused { bright } else { dim };
     Text::new(&line, Point::new(pos_x, pos_y + 2 * ROW_DY), style).draw(d)?;
 
     // Save row: destination cursor. Cancel-first (spec §6d [DEFAULT]).
-    let save_focused = st.focus == Row::Save;
-    let marker = row_marker(st, Row::Save);
+    let save_focused = st.focus == MAIN_ROW_SAVE;
+    let marker = row_marker(st, MAIN_ROW_SAVE);
     line.clear();
     if st.save_cursor < 0 {
         let _ = write!(line, "{} Save     Cancel", marker);
@@ -255,8 +365,8 @@ where
     Text::new(&line, Point::new(pos_x, pos_y + 3 * ROW_DY), style).draw(d)?;
 
     // MIDI source row: which physical input feeds the engine.
-    let midi_focused = st.focus == Row::MidiSrc;
-    let marker = row_marker(st, Row::MidiSrc);
+    let midi_focused = st.focus == MAIN_ROW_MIDISRC;
+    let marker = row_marker(st, MAIN_ROW_MIDISRC);
     line.clear();
     let _ = write!(line, "{} MIDI Src {}", marker, st.midi_src.label());
     let style = if midi_focused { bright } else { dim };
@@ -274,7 +384,7 @@ where
 }
 
 #[inline]
-fn row_marker(st: &MenuState, row: Row) -> char {
+fn row_marker(st: &MenuState, row: u8) -> char {
     if st.focus != row {
         ' '
     } else if st.mode == Mode::Edit {
@@ -290,24 +400,28 @@ mod tests {
 
     #[test]
     fn nav_turn_moves_cursor_and_clamps_no_load() {
-        let mut m = MenuState::new(1, 0, 10); // Nav, focus=Bank
-        assert_eq!(m.focus, Row::Bank);
-        assert_eq!(m.on_turn(1), false);      // -> Program, no load
-        assert_eq!(m.focus, Row::Program);
-        assert_eq!(m.on_turn(1), false);      // -> Save, no load
-        assert_eq!(m.focus, Row::Save);
-        assert_eq!(m.on_turn(1), false);      // -> MidiSrc, no load
-        assert_eq!(m.focus, Row::MidiSrc);
-        assert_eq!(m.on_turn(3), false);      // clamp: stays MidiSrc
-        assert_eq!(m.focus, Row::MidiSrc);
-        assert_eq!(m.on_turn(-1), false);     // -> Save
-        assert_eq!(m.focus, Row::Save);
-        assert_eq!(m.on_turn(-1), false);     // -> Program
-        assert_eq!(m.focus, Row::Program);
-        assert_eq!(m.on_turn(-1), false);     // -> Bank
-        assert_eq!(m.focus, Row::Bank);
-        assert_eq!(m.on_turn(-5), false);     // clamp: stays Bank
-        assert_eq!(m.focus, Row::Bank);
+        let mut m = MenuState::new(1, 0, 10); // Nav, focus=Card
+        assert_eq!(m.focus, ROW_CARD);
+        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> Bank, no load
+        assert_eq!(m.focus, MAIN_ROW_BANK);
+        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> Program, no load
+        assert_eq!(m.focus, MAIN_ROW_PROGRAM);
+        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> Save, no load
+        assert_eq!(m.focus, MAIN_ROW_SAVE);
+        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> MidiSrc, no load
+        assert_eq!(m.focus, MAIN_ROW_MIDISRC);
+        assert!(matches!(m.on_turn(3), TurnResult::None));      // clamp: stays MidiSrc
+        assert_eq!(m.focus, MAIN_ROW_MIDISRC);
+        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Save
+        assert_eq!(m.focus, MAIN_ROW_SAVE);
+        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Program
+        assert_eq!(m.focus, MAIN_ROW_PROGRAM);
+        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Bank
+        assert_eq!(m.focus, MAIN_ROW_BANK);
+        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Card
+        assert_eq!(m.focus, ROW_CARD);
+        assert!(matches!(m.on_turn(-5), TurnResult::None));     // clamp: stays Card
+        assert_eq!(m.focus, ROW_CARD);
     }
 
     #[test]
@@ -323,36 +437,36 @@ mod tests {
     #[test]
     fn edit_program_changes_value_clamps_and_loads_only_on_change() {
         let mut m = MenuState::new(1, 0, 0);
-        m.focus = Row::Program;
+        m.focus = MAIN_ROW_PROGRAM;
         let _ = m.on_press();                 // -> Edit
-        assert_eq!(m.on_turn(5), true);       // 0 -> 5, load
+        assert!(matches!(m.on_turn(5), TurnResult::Load));       // 0 -> 5, load
         assert_eq!(m.program, 5);
-        assert_eq!(m.on_turn(-100), true);    // clamp to 0, value changed -> load
+        assert!(matches!(m.on_turn(-100), TurnResult::Load));    // clamp to 0, value changed -> load
         assert_eq!(m.program, 0);
-        assert_eq!(m.on_turn(-1), false);     // already 0, no change -> no load
+        assert!(!matches!(m.on_turn(-1), TurnResult::Load));     // already 0, no change -> no load
         assert_eq!(m.program, 0);
-        assert_eq!(m.on_turn(127), true);     // -> 127
+        assert!(matches!(m.on_turn(127), TurnResult::Load));     // -> 127
         assert_eq!(m.program, 127);
-        assert_eq!(m.on_turn(10), false);     // clamp at 127, no change
+        assert!(!matches!(m.on_turn(10), TurnResult::Load));     // clamp at 127, no change
     }
 
     #[test]
     fn edit_bank_is_inert_with_one_bank_but_live_with_many() {
         let mut one = MenuState::new(1, 0, 0);
-        one.focus = Row::Bank;
+        one.focus = MAIN_ROW_BANK;
         let _ = one.on_press();
-        assert_eq!(one.on_turn(1), false);    // clamp to [0,0]: inert
+        assert!(!matches!(one.on_turn(1), TurnResult::Load));    // clamp to [0,0]: inert
         assert_eq!(one.bank, 0);
 
         let mut many = MenuState::new(3, 0, 7);
-        many.focus = Row::Bank;
+        many.focus = MAIN_ROW_BANK;
         let _ = many.on_press();
-        assert_eq!(many.on_turn(1), true);    // 0 -> 1, load at current program
+        assert!(matches!(many.on_turn(1), TurnResult::Load));    // 0 -> 1, load at current program
         assert_eq!(many.bank, 1);
         assert_eq!(many.program, 7);          // program preserved
-        assert_eq!(many.on_turn(5), true);    // clamp to 2 (bank_count-1)
+        assert!(matches!(many.on_turn(5), TurnResult::Load));    // clamp to 2 (bank_count-1)
         assert_eq!(many.bank, 2);
-        assert_eq!(many.on_turn(1), false);   // already max, no change
+        assert!(!matches!(many.on_turn(1), TurnResult::Load));   // already max, no change
     }
 
     #[test]
@@ -423,57 +537,61 @@ mod tests {
     #[test]
     fn nav_cycles_four_rows() {
         let mut m = MenuState::new(2, 0, 10);
-        assert_eq!(m.focus, Row::Bank);
+        assert_eq!(m.focus, ROW_CARD);
         m.on_turn(1);
-        assert_eq!(m.focus, Row::Program);
+        assert_eq!(m.focus, MAIN_ROW_BANK);
         m.on_turn(1);
-        assert_eq!(m.focus, Row::Save);
+        assert_eq!(m.focus, MAIN_ROW_PROGRAM);
         m.on_turn(1);
-        assert_eq!(m.focus, Row::MidiSrc);
+        assert_eq!(m.focus, MAIN_ROW_SAVE);
+        m.on_turn(1);
+        assert_eq!(m.focus, MAIN_ROW_MIDISRC);
         m.on_turn(1); // clamp
-        assert_eq!(m.focus, Row::MidiSrc);
+        assert_eq!(m.focus, MAIN_ROW_MIDISRC);
         m.on_turn(-1);
-        assert_eq!(m.focus, Row::Save);
+        assert_eq!(m.focus, MAIN_ROW_SAVE);
         m.on_turn(-1);
-        assert_eq!(m.focus, Row::Program);
+        assert_eq!(m.focus, MAIN_ROW_PROGRAM);
         m.on_turn(-1);
-        assert_eq!(m.focus, Row::Bank);
+        assert_eq!(m.focus, MAIN_ROW_BANK);
+        m.on_turn(-1);
+        assert_eq!(m.focus, ROW_CARD);
         m.on_turn(-1); // clamp
-        assert_eq!(m.focus, Row::Bank);
+        assert_eq!(m.focus, ROW_CARD);
     }
 
     #[test]
     fn user_bank_is_last() {
         let mut m = MenuState::new(2, 0, 0);
         assert!(!m.is_user_bank());
-        m.focus = Row::Bank;
+        m.focus = MAIN_ROW_BANK;
         let _ = m.on_press(); // -> Edit
-        assert!(m.on_turn(1)); // bank 0 -> 1 (User), load required
+        assert!(matches!(m.on_turn(1), TurnResult::Load)); // bank 0 -> 1 (User), load required
         assert!(m.is_user_bank());
     }
 
     #[test]
     fn save_row_edit_enters_at_cancel_and_scrolls() {
         let mut m = MenuState::new(2, 0, 0);
-        m.focus = Row::Save;
+        m.focus = MAIN_ROW_SAVE;
         m.save_cursor = 42; // stale from a previous visit
         let _ = m.on_press(); // Nav -> Edit: cursor must reset to Cancel
         assert_eq!(m.mode, Mode::Edit);
         assert_eq!(m.save_cursor, -1);
-        assert!(!m.on_turn(1));  // Cancel -> slot 0; never a load
+        assert!(!matches!(m.on_turn(1), TurnResult::Load));  // Cancel -> slot 0; never a load
         assert_eq!(m.save_cursor, 0);
-        assert!(!m.on_turn(-5)); // clamp at Cancel
+        assert!(!matches!(m.on_turn(-5), TurnResult::Load)); // clamp at Cancel
         assert_eq!(m.save_cursor, -1);
-        assert!(!m.on_turn(127)); // -1 + 127 = 126
+        assert!(!matches!(m.on_turn(127), TurnResult::Load)); // -1 + 127 = 126
         assert_eq!(m.save_cursor, 126);
-        assert!(!m.on_turn(127)); // clamp at 127
+        assert!(!matches!(m.on_turn(127), TurnResult::Load)); // clamp at 127
         assert_eq!(m.save_cursor, 127);
     }
 
     #[test]
     fn save_press_commits_at_slot_cancels_at_cancel() {
         let mut m = MenuState::new(2, 0, 0);
-        m.focus = Row::Save;
+        m.focus = MAIN_ROW_SAVE;
         assert_eq!(m.on_press(), PressResult::Toggled); // Nav -> Edit
         m.on_turn(10);
         assert_eq!(m.on_press(), PressResult::Commit(9)); // Edit -> Nav (cursor -1+10=9)
@@ -488,7 +606,7 @@ mod tests {
     #[test]
     fn non_save_rows_never_commit() {
         let mut m = MenuState::new(2, 0, 0);
-        m.focus = Row::Program;
+        m.focus = MAIN_ROW_PROGRAM;
         assert_eq!(m.on_press(), PressResult::Toggled);
         assert_eq!(m.on_press(), PressResult::Toggled);
     }
@@ -497,21 +615,59 @@ mod tests {
     fn midi_src_defaults_trs_and_toggles_on_edit_turn() {
         let mut m = MenuState::new(1, 0, 0);
         assert_eq!(m.midi_src, MidiSource::Trs);
-        m.focus = Row::MidiSrc;
+        m.focus = MAIN_ROW_MIDISRC;
         let _ = m.on_press(); // Nav -> Edit
-        assert_eq!(m.on_turn(1), false);   // never a load
+        assert!(matches!(m.on_turn(1), TurnResult::SettingsChanged));   // never a load
         assert_eq!(m.midi_src, MidiSource::Usb);
-        assert_eq!(m.on_turn(-1), false);
+        assert!(matches!(m.on_turn(-1), TurnResult::SettingsChanged));
         assert_eq!(m.midi_src, MidiSource::Trs);
-        assert_eq!(m.on_turn(0), false);   // zero delta: no change
+        assert!(matches!(m.on_turn(0), TurnResult::None));   // zero delta: no change
         assert_eq!(m.midi_src, MidiSource::Trs);
     }
 
     #[test]
     fn midi_src_press_never_commits_or_cancels() {
         let mut m = MenuState::new(1, 0, 0);
-        m.focus = Row::MidiSrc;
+        m.focus = MAIN_ROW_MIDISRC;
         assert_eq!(m.on_press(), PressResult::Toggled); // Nav -> Edit
         assert_eq!(m.on_press(), PressResult::Toggled); // Edit -> Nav
+    }
+
+    #[test]
+    fn card_row_cycles_cards_without_side_effects() {
+        let mut m = MenuState::new(2, 0, 0);
+        assert_eq!(m.card, Card::Main);
+        assert_eq!(m.focus, ROW_CARD);
+        let _ = m.on_press(); // Edit on Card row
+        assert!(matches!(m.on_turn(1), TurnResult::None));
+        assert_eq!(m.card, Card::CvMod);
+        assert!(matches!(m.on_turn(1), TurnResult::None));
+        assert_eq!(m.card, Card::PatchEdit);
+        assert!(matches!(m.on_turn(1), TurnResult::None)); // clamp
+        assert_eq!(m.card, Card::PatchEdit);
+        assert!(matches!(m.on_turn(-2), TurnResult::None));
+        assert_eq!(m.card, Card::Main);
+        let _ = m.on_press(); // back to Nav
+        assert_eq!(m.mode, Mode::Nav);
+    }
+
+    #[test]
+    fn switching_cards_keeps_per_card_focus_in_range() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.focus = MAIN_ROW_MIDISRC; // row 4 on Main
+        m.card = Card::CvMod;       // CvMod also has 5 rows: still valid
+        assert!(m.focus < m.row_count());
+        m.focus = 0;
+        m.card = Card::PatchEdit;
+        assert_eq!(m.row_count() as usize, 2 + N_PARAMS); // Card + params + Save
+    }
+
+    #[test]
+    fn main_save_commit_still_works_at_new_index() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.focus = MAIN_ROW_SAVE;
+        assert_eq!(m.on_press(), PressResult::Toggled);
+        m.on_turn(10);
+        assert_eq!(m.on_press(), PressResult::Commit(9));
     }
 }
