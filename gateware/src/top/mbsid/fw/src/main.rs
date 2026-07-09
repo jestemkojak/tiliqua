@@ -72,6 +72,9 @@ const BOOT_PATCH_INDEX: u8 = 123;
 const MENU_X: i32 = 60;
 const MENU_Y: i32 = 80;
 const MENU_HUE: u8 = 10;
+// Persist decay setting. With persist_freeze_rows=320 in top.py, the menu band
+// is frozen from decay entirely; this value only governs rows >= 320, which
+// hold nothing (mbsid has no scope) and stay in persist's all-zero fastpath.
 const MENU_PERSIST: u8 = 80;
 
 // Scoped TIMER0 interrupt + its dispatch from riscv-rt's DefaultHandler. This is
@@ -336,6 +339,7 @@ fn main() -> ! {
 
     // Total banks = engine ROM banks + the flash User bank (always last).
     let mut state = MenuState::new(mbsid_sys::bank_count() + 1, 0, BOOT_PATCH_INDEX);
+    let mut painter = menu::Painter::new();
     state.lead_loaded = lead_loaded;
     state.refresh_params(|a| mbsid_sys::patch_byte(a));
 
@@ -537,9 +541,13 @@ fn main() -> ! {
                         core::str::from_utf8(&savebuf).ok()
                     } else { None };
 
-                menu::draw(&mut display, &state, name, detail,
-                           save_name, status.as_deref(), lead_loaded,
-                           MENU_X, MENU_Y, MENU_HUE).ok();
+                // Diff-paint: blitter-only, erases stale glyphs by re-blitting
+                // old text at intensity 0 — no rectangle fill, no visible wipe
+                // (see menu::Painter).
+                let frame = menu::build_frame(&state, name, detail,
+                                              save_name, status.as_deref(), lead_loaded,
+                                              MENU_X, MENU_Y);
+                painter.paint(&mut display, frame, MENU_HUE).ok();
                 dirty = false;
             }
         }
