@@ -11,7 +11,7 @@ guide, limitations, extending) — update the relevant page when a feature lands
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
 Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
-host `cargo test --lib` (85/85, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter), full
+host `cargo test --lib` (86/86, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter), full
 bitstream build, `sync` Fmax 61.76 MHz PASS. The one thing NOT yet validated is **playback
 and the M4 SysEx/user-bank flows on real hardware** (DESIGN §7 milestones 2–3;
 `M4_USER_PATCH_BANKS.md §7` hardware checklist).
@@ -190,6 +190,19 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   (menu band exempt from phosphor decay; without it the input-only redraw
   lets the idle menu slowly fade — persistence 80 still decays ~1 step per
   256 passes).
+- **Doc test-counts can drift within a single plan, not just across plans.** A
+  final-review fix round that adds a test (e.g. new `Painter`/`build_frame`
+  coverage) lands in a commit *after* the task that already wrote the count
+  into `CLAUDE.md`/`docs/developer-guide.md` — the count goes stale the
+  moment that fix commit lands. Before closing out a plan, grep both files
+  for `cargo test --lib` / `N tests:` and reconcile against a fresh `cargo
+  test --target x86_64-unknown-linux-gnu --lib` run.
+- **Host-testing a `DrawTarget` consumer** (e.g. `Painter`): mock it with a
+  minimal struct implementing `OriginDimensions` + `DrawTarget<Color = HI8>`
+  that records every `(Point, HI8)` from `draw_iter` into a `heapless::Vec`
+  (see `menu.rs`'s `RecordingTarget`). Don't assert exact pixel columns —
+  glyph rendering spans the whole character cell, not just the pen-x column;
+  use a range like `[x, x+9)` for one `FONT_9X15` cell.
 
 ## Build & test
 
