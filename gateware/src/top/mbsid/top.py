@@ -44,6 +44,13 @@ class MBSIDSoc(SIDSoc):
     def __init__(self, **kwargs):
         kwargs.setdefault("mainram_size", 0x8000)
         kwargs.setdefault("with_scope", False)
+        # Freeze framebuffer rows < 320 from persist phosphor decay. mbsid has
+        # no scope, so decay's only effect was slowly fading the menu text
+        # (drawn on input only; menu box spans y=62..306 at MENU_X/Y in fw).
+        # Same mechanism as sid_player_sw's header freeze; build-time param,
+        # no CSR/PAC change. Firmware relies on this: menu redraw is a blit
+        # diff with no background fill (fw/src/menu.rs Painter).
+        kwargs.setdefault("persist_freeze_rows", 320)
         kwargs.setdefault("n_sids", 2)
         kwargs.setdefault("with_sysex", True)
         super().__init__(**kwargs)
