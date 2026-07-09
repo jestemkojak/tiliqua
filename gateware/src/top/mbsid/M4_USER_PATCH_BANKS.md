@@ -343,6 +343,10 @@ SysEx items use `amidi`/`sendmidi` scripting, which sidesteps the ACK-wait probl
       USB MIDI device that can transmit SysEx *into Tiliqua's USB-C port* (Tiliqua is the
       USB host here — a PC's own USB port cannot act as that device; see §1's host-port
       note). Mid-dump unplug → recovers ≤ 500 ms idle, next dump OK.
+- [ ] Menu redraw: turning the encoder shows no blanking wipe over the menu
+      (diff painter; compare against pre-fix build if in doubt).
+- [ ] Idle fade: leave the menu untouched ≥10 min — text must not dim
+      (persist_freeze_rows=320).
 
 ## 8. Known limitation — no ACK/DISACK (MIDI TX)
 
