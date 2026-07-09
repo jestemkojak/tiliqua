@@ -75,8 +75,8 @@ cd gateware/src/top/mbsid/fw
 cargo test --target x86_64-unknown-linux-gnu --lib
 ```
 
-41 tests: regdiff, patch store, SysEx capture, menu state machine, param
-encodings, CV quantizer. The `riscv32` FFI is cfg-stubbed on host. Note:
+85 tests: regdiff, patch store, SysEx capture, menu state machine, frame
+diff/painter, param encodings, CV quantizer. The `riscv32` FFI is cfg-stubbed on host. Note:
 you must pass the explicit host target — the crate's default target is
 `riscv32im`.
 
@@ -115,6 +115,29 @@ plumbing, flash writes, CV ADCs, and the display.
 | Amaranth CSR layout | `--pac-only` **first**, then `--fw-only` |
 | Any gateware | full `pdm mbsid build` + check post-route Fmax in `top.tim` |
 | Vendored `mios32/` | **don't.** Never edit vendored C++ — see [extending.md](extending.md) |
+
+## Menu rendering (diff painter)
+
+The menu never clears its background. `menu::build_frame` produces a
+`frame::Frame` — up to 12 positioned text items — and `menu::Painter::paint`
+diffs it against the previously painted frame (`frame::diff`), emitting only:
+
+- **Erase**: re-blit an old item's text at intensity 0. The blitter draws
+  glyph 1-bits in REPLACE mode (no zero-color skip), so this clears exactly
+  the pixels the old draw touched.
+- **Draw**: blit a new/changed item in its dim/bright style. Items whose text
+  is unchanged but whose style changed are redrawn without an erase (identical
+  glyph pixels are simply overwritten).
+
+Erases always precede draws, and both go through the single blitter command
+FIFO, so ordering is exact. A typical encoder detent costs two rows of glyph
+blits; the old implementation cleared the whole 380×244 box per-pixel through
+the pixel_plot FIFO first, which was visible as a black wipe.
+
+`frame.rs` (model + diff) and `build_frame` are host-pure and covered by
+`cargo test --target x86_64-unknown-linux-gnu --lib`. The persist peripheral
+is prevented from decaying the menu band by `persist_freeze_rows=320`
+(`top.py`); mbsid has no scope, so phosphor decay has no other consumer.
 
 ## Debugging tips
 
