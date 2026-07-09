@@ -76,9 +76,9 @@ cargo test --target x86_64-unknown-linux-gnu --lib
 ```
 
 85 tests: regdiff, patch store, SysEx capture, menu state machine, frame
-diff/painter, param encodings, CV quantizer. The `riscv32` FFI is cfg-stubbed on host. Note:
-you must pass the explicit host target — the crate's default target is
-`riscv32im`.
+diff/painter, param encodings, CV quantizer. The `riscv32` FFI is
+cfg-stubbed on host. Note: you must pass the explicit host target — the
+crate's default target is `riscv32im`.
 
 ### 2. Host oracle (the keystone, ~a minute)
 
