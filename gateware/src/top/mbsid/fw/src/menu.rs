@@ -12,6 +12,7 @@ use core::fmt::Write;
 
 use crate::cv::CvTarget;
 use crate::params;
+use crate::frame::Frame;
 
 pub const N_PARAMS: usize = params::LEAD_PARAMS.len();
 
@@ -322,6 +323,147 @@ pub fn detail_line(detail: Option<(Engine, Option<VoiceMode>)>) -> String<48> {
         }
     }
     line
+}
+
+/// Build the menu's frame description at (pos_x, pos_y). Pure: same inputs as
+/// the old draw() (minus target/hue), returns the Item list that Painter
+/// diffs+blits. `bright` on each item maps to intensity 15 vs 9 at paint time.
+pub fn build_frame(st: &MenuState, name: &str,
+                   detail: Option<(Engine, Option<VoiceMode>)>,
+                   save_name: Option<&str>, status: Option<&str>,
+                   lead_loaded: bool,
+                   pos_x: i32, pos_y: i32) -> Frame {
+    let mut f = Frame::default();
+
+    // Title, with an edited-patch marker (" *") to the right of "MBSID".
+    let mut title: String<32> = String::new();
+    if st.edited {
+        let _ = write!(title, "MBSID  {} *", name);
+    } else {
+        let _ = write!(title, "MBSID  {}", name);
+    }
+    f.push(pos_x, pos_y, true, &title);
+
+    let mut line: String<48> = String::new();
+
+    // Row 0 on every card: Card selector.
+    let marker = row_marker(st, ROW_CARD);
+    line.clear();
+    let _ = write!(line, "{} Card     {}", marker, st.card.label());
+    f.push(pos_x, pos_y + ROW_DY, st.focus == ROW_CARD, &line);
+
+    match st.card {
+        Card::Main => {
+            // Bank row.
+            let marker = row_marker(st, MAIN_ROW_BANK);
+            line.clear();
+            let bank_char = if st.is_user_bank() { 'U' } else { (b'A' + st.bank) as char };
+            let _ = write!(line, "{} Bank     {}", marker, bank_char);
+            f.push(pos_x, pos_y + 2 * ROW_DY, st.focus == MAIN_ROW_BANK, &line);
+
+            // Program row (with the patch name).
+            let marker = row_marker(st, MAIN_ROW_PROGRAM);
+            line.clear();
+            let _ = write!(line, "{} Program  {:03}  {}", marker, st.program, name);
+            f.push(pos_x, pos_y + 3 * ROW_DY, st.focus == MAIN_ROW_PROGRAM, &line);
+
+            // Save row: destination cursor. Cancel-first (spec §6d [DEFAULT]).
+            let marker = row_marker(st, MAIN_ROW_SAVE);
+            line.clear();
+            if st.save_cursor < 0 {
+                let _ = write!(line, "{} Save     Cancel", marker);
+            } else {
+                let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
+                               save_name.unwrap_or("Empty"));
+            }
+            f.push(pos_x, pos_y + 4 * ROW_DY, st.focus == MAIN_ROW_SAVE, &line);
+
+            // MIDI source row: which physical input feeds the engine.
+            let marker = row_marker(st, MAIN_ROW_MIDISRC);
+            line.clear();
+            let _ = write!(line, "{} MIDI Src {}", marker, st.midi_src.label());
+            f.push(pos_x, pos_y + 5 * ROW_DY, st.focus == MAIN_ROW_MIDISRC, &line);
+
+            // Detail row: engine label + voice mode (Lead only) + channel map, or "---".
+            f.push(pos_x, pos_y + 6 * ROW_DY, false, &detail_line(detail));
+
+            if let Some(s) = status {
+                f.push(pos_x, pos_y + 7 * ROW_DY, true, s);
+            }
+        }
+        Card::CvMod => {
+            for i in 0..4u8 {
+                let row = i + 1;
+                let marker = row_marker(st, row);
+                line.clear();
+                let _ = write!(line, "{} CV{}      {}", marker, i + 1,
+                               st.cv_targets[i as usize].label());
+                f.push(pos_x, pos_y + (2 + i as i32) * ROW_DY, st.focus == row, &line);
+            }
+            // Dim footer line in place of Main's detail line.
+            f.push(pos_x, pos_y + 6 * ROW_DY, false, "mods engine knobs/params");
+
+            if let Some(s) = status {
+                f.push(pos_x, pos_y + 7 * ROW_DY, true, s);
+            }
+        }
+        Card::PatchEdit => {
+            if !lead_loaded {
+                f.push(pos_x, pos_y + 2 * ROW_DY, false, "Lead patches only");
+
+                // Save row (visual gate only — see draw()'s original NOTE:
+                // row_count()/is_save_row() don't know about lead_loaded).
+                let save_row = st.row_count() - 1;
+                let marker = row_marker(st, save_row);
+                line.clear();
+                if st.save_cursor < 0 {
+                    let _ = write!(line, "{} Save     Cancel", marker);
+                } else {
+                    let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
+                                   save_name.unwrap_or("Empty"));
+                }
+                f.push(pos_x, pos_y + 3 * ROW_DY, st.focus == save_row, &line);
+            } else {
+                let scroll = st.edit_scroll as usize;
+                let end = (scroll + PATCH_EDIT_WINDOW as usize).min(N_PARAMS);
+
+                for (slot, ix) in (scroll..end).enumerate() {
+                    let row = (ix + 1) as u8;
+                    let d_param = &params::LEAD_PARAMS[ix];
+                    let marker = row_marker(st, row);
+                    line.clear();
+                    let _ = write!(line, "{} {:<8} {}", marker, d_param.label,
+                                   st.edit_values[ix]);
+                    f.push(pos_x, pos_y + (2 + slot as i32) * ROW_DY, st.focus == row, &line);
+                }
+
+                // Scroll indicators at the window edges.
+                if scroll > 0 {
+                    f.push(pos_x - 10, pos_y + 2 * ROW_DY, false, "^");
+                }
+                if end < N_PARAMS {
+                    let last_slot = (end - scroll).max(1) as i32 - 1;
+                    f.push(pos_x - 10, pos_y + (2 + last_slot) * ROW_DY, false, "v");
+                }
+
+                // Save row, immediately after the visible param window.
+                let save_row = st.row_count() - 1;
+                let marker = row_marker(st, save_row);
+                line.clear();
+                if st.save_cursor < 0 {
+                    let _ = write!(line, "{} Save     Cancel", marker);
+                } else {
+                    let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
+                                   save_name.unwrap_or("Empty"));
+                }
+                let visible_rows = (end - scroll) as i32;
+                f.push(pos_x, pos_y + (2 + visible_rows) * ROW_DY,
+                       st.focus == save_row, &line);
+            }
+        }
+    }
+
+    f
 }
 
 /// Draw the menu into its own opaque box at (pos_x, pos_y). `name` is the
@@ -909,5 +1051,104 @@ mod tests {
         let dec_ix = params::LEAD_PARAMS.iter().position(|d| d.label == "O1 Dec").unwrap();
         assert_eq!(m.edit_values[atk_ix], 8);
         assert_eq!(m.edit_values[dec_ix], 4);
+    }
+
+    // --- build_frame / diff renderer tests (flicker fix) ---
+
+    #[test]
+    fn build_frame_main_card_rows_and_styles() {
+        let m = MenuState::new(2, 0, 5);
+        let fr = build_frame(&m, "TestPatch",
+                             Some((Engine::Lead, Some(VoiceMode::Mono))),
+                             None, None, true, 60, 80);
+        // title + Card + Bank + Program + Save + MidiSrc + detail (no status)
+        assert_eq!(fr.items.len(), 7);
+        assert!(fr.items[0].text.starts_with("MBSID"));
+        assert!(fr.items[0].bright);                    // title always bright
+        assert!(fr.items[1].bright);                    // Card row focused (default)
+        assert!(fr.items[1].text.contains("> Card"));   // nav marker on focus
+        assert!(!fr.items[2].bright);                   // Bank unfocused -> dim
+        assert!(fr.items[3].text.contains("Program  005  TestPatch"));
+        assert!(!fr.items[6].bright);                   // detail row always dim
+        // Rows stack at ROW_DY spacing from pos_y.
+        assert_eq!(fr.items[0].y, 80);
+        assert_eq!(fr.items[1].y, 80 + 24);
+        assert_eq!(fr.items[6].y, 80 + 6 * 24);
+    }
+
+    #[test]
+    fn focus_move_changes_exactly_two_rows() {
+        let mut m = MenuState::new(2, 0, 0);
+        let f0 = build_frame(&m, "P", None, None, None, true, 60, 80);
+        m.on_turn(1); // Card -> Bank
+        let f1 = build_frame(&m, "P", None, None, None, true, 60, 80);
+        let ops = crate::frame::diff(&f0, &f1);
+        // Marker moved: both rows' text changed -> 2 erases + 2 draws, and
+        // nothing else (title/program/save/midisrc/detail untouched). This is
+        // the flicker-fix regression test: an encoder detent must NOT repaint
+        // the whole menu.
+        assert_eq!(ops.len(), 4);
+        let card_y = 80 + 24;
+        let bank_y = 80 + 2 * 24;
+        for op in ops.iter() {
+            let y = match *op {
+                crate::frame::PaintOp::Erase(i) => f0.items[i as usize].y,
+                crate::frame::PaintOp::Draw(i) => f1.items[i as usize].y,
+            };
+            assert!(y == card_y || y == bank_y, "op outside the two focus rows: y={}", y);
+        }
+    }
+
+    #[test]
+    fn status_disappearance_is_single_erase() {
+        let m = MenuState::new(2, 0, 0);
+        let f0 = build_frame(&m, "P", None, None, Some("Saved U000"), true, 60, 80);
+        let f1 = build_frame(&m, "P", None, None, None, true, 60, 80);
+        let ops = crate::frame::diff(&f0, &f1);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], crate::frame::PaintOp::Erase(_)));
+    }
+
+    #[test]
+    fn card_switch_replaces_body_rows() {
+        let mut m = MenuState::new(2, 0, 0);
+        let f0 = build_frame(&m, "P", None, None, None, true, 60, 80);
+        let _ = m.on_press();          // Edit on Card row
+        let _ = m.on_turn(1);          // Main -> CvMod
+        let f1 = build_frame(&m, "P", None, None, None, true, 60, 80);
+        let ops = crate::frame::diff(&f0, &f1);
+        // Title is unchanged; everything under it differs. No panic on
+        // capacity, ops bounded by MAX_OPS.
+        assert!(!ops.is_empty() && ops.len() <= crate::frame::MAX_OPS);
+        assert!(ops.iter().all(|op| {
+            let (fr, i) = match *op {
+                crate::frame::PaintOp::Erase(i) => (&f0, i),
+                crate::frame::PaintOp::Draw(i) => (&f1, i),
+            };
+            fr.items[i as usize].y > 80 // never touches the title line
+        }));
+    }
+
+    #[test]
+    fn patch_edit_frame_has_indicators_and_save() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::PatchEdit;
+        m.edit_scroll = 1; // both indicators visible (1 above, more below)
+        let fr = build_frame(&m, "P", None, Some("SlotName"), None, true, 60, 80);
+        // title + Card + 6 params + "^" + "v" + Save = 11
+        assert_eq!(fr.items.len(), 11);
+        assert!(fr.items.iter().any(|it| it.text.as_str() == "^" && it.x == 50));
+        assert!(fr.items.iter().any(|it| it.text.as_str() == "v" && it.x == 50));
+        assert!(fr.items.last().unwrap().text.contains("Save"));
+    }
+
+    #[test]
+    fn non_lead_patch_edit_frame_is_gated() {
+        let mut m = MenuState::new(2, 0, 0);
+        m.card = Card::PatchEdit;
+        let fr = build_frame(&m, "P", None, None, None, false, 60, 80);
+        // title + Card + "Lead patches only" + Save = 4
+        assert_eq!(fr.items.len(), 4);
+        assert!(fr.items[2].text.contains("Lead patches only"));
     }
 }
