@@ -1,4 +1,4 @@
-//! Minimal patch-browser menu: host-pure state machine + cstr helper + draw.
+//! Minimal patch-browser menu: host-pure state machine + cstr helper + build_frame/Painter.
 
 use tiliqua_hal::embedded_graphics::{
     mono_font::{ascii::FONT_9X15, MonoTextStyle},
@@ -1005,5 +1005,94 @@ mod tests {
         // title + Card + "Lead patches only" + Save = 4
         assert_eq!(fr.items.len(), 4);
         assert!(fr.items[2].text.contains("Lead patches only"));
+    }
+
+    /// Minimal mock `DrawTarget`: records every pixel it's asked to draw.
+    /// No hardware, no acceleration -- just enough for `Text::draw` to run
+    /// its normal (non-blitter) glyph rendering against `draw_iter`.
+    struct RecordingTarget {
+        pixels: heapless::Vec<(Point, HI8), 16384>,
+    }
+
+    impl RecordingTarget {
+        fn new() -> Self {
+            Self { pixels: heapless::Vec::new() }
+        }
+    }
+
+    impl OriginDimensions for RecordingTarget {
+        fn size(&self) -> Size {
+            Size::new(400, 300)
+        }
+    }
+
+    impl DrawTarget for RecordingTarget {
+        type Color = HI8;
+        type Error = core::convert::Infallible;
+
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            for Pixel(point, color) in pixels.into_iter() {
+                let _ = self.pixels.push((point, color));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn painter_erases_old_frame_and_draws_new_frame_not_transposed() {
+        // Mirrors focus_move_changes_exactly_two_rows: Card -> Bank focus
+        // move touches exactly the Card and Bank rows, each losing/gaining
+        // the '>' marker glyph. If Painter::paint transposed which frame it
+        // indexes for Erase vs Draw, the Card row's erase would blit f1's
+        // markerless text (nothing to erase) and the Bank row's draw would
+        // blit f0's markerless text (nothing new drawn) -- the opposite of
+        // what's asserted below.
+        let mut m = MenuState::new(2, 0, 0);
+        let f0 = build_frame(&m, "P", None, None, None, true, 60, 80);
+        m.on_turn(1); // Card -> Bank
+        let f1 = build_frame(&m, "P", None, None, None, true, 60, 80);
+
+        let card_x = 60;
+        let card_y = 80 + ROW_DY;
+        let bank_y = 80 + 2 * ROW_DY;
+
+        let mut painter = Painter::new();
+        let mut d = RecordingTarget::new();
+
+        // First paint: prev is empty (Frame::default), so every op is a Draw
+        // and none is an Erase -- no intensity-0 pixels should appear at all.
+        painter.paint(&mut d, f0.clone(), 0).unwrap();
+        assert!(!d.pixels.is_empty());
+        assert!(d.pixels.iter().all(|&(_, c)| c.intensity() != 0),
+                "first paint (empty prev) must contain no erase pixels");
+        assert!(d.pixels.iter().any(|&(p, _)| p.x >= card_x && p.x < card_x + 9
+                                     && (p.y - card_y).abs() < ROW_DY),
+                "expected the focused Card row's '>' marker glyph in the first paint");
+
+        // Second paint: focus moves off Card onto Bank.
+        d.pixels.clear();
+        painter.paint(&mut d, f1.clone(), 0).unwrap();
+
+        // Erase output (intensity 0) must draw the OLD (f0) Card row, which
+        // had the marker -- proving Erase indexes `self.prev`, not `frame`.
+        assert!(d.pixels.iter().any(|&(p, c)| c.intensity() == 0
+                                     && p.x >= card_x && p.x < card_x + 9
+                                     && (p.y - card_y).abs() < ROW_DY),
+                "erase must re-blit the OLD frame's Card marker glyph");
+
+        // Draw output (nonzero intensity) must draw the NEW (f1) Bank row,
+        // which now has the marker -- proving Draw indexes the passed-in
+        // `frame`, not `self.prev`.
+        assert!(d.pixels.iter().any(|&(p, c)| c.intensity() != 0
+                                     && p.x >= card_x && p.x < card_x + 9
+                                     && (p.y - bank_y).abs() < ROW_DY),
+                "draw must blit the NEW frame's Bank marker glyph");
+
+        // After painting, `prev` must become the just-painted frame so the
+        // next diff() call compares against what's actually on screen.
+        assert_eq!(painter.prev, f1);
     }
 }
