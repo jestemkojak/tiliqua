@@ -11,7 +11,7 @@ guide, limitations, extending) — update the relevant page when a feature lands
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
 Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
-host `cargo test --lib` (41/41, incl. `patch_store`/`sysex_capture`/menu Save-row), full
+host `cargo test --lib` (85/85, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter), full
 bitstream build, `sync` Fmax 61.76 MHz PASS. The one thing NOT yet validated is **playback
 and the M4 SysEx/user-bank flows on real hardware** (DESIGN §7 milestones 2–3;
 `M4_USER_PATCH_BANKS.md §7` hardware checklist).
@@ -176,6 +176,20 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **`sysex_read` was the first CSR change since M2's `phi2_sel`** — touching
   `SIDPeripheral` registers again needs `pdm mbsid build --pac-only` before `--fw-only`,
   same as any other CSR change (root `CLAUDE.md`).
+- **Menu rendering is a blit-diff, never a background fill.** Rectangle fills
+  are NOT hardware-accelerated (per-pixel via the pixel_plot FIFO, ~93k CSR
+  writes for the old full-box clear — scanout films it as a top-to-bottom
+  wipe); text IS (blitter, REPLACE mode, 0-bits transparent). So `menu.rs`
+  builds a `frame::Frame` (list of positioned strings) and `Painter::paint`
+  diffs it against the last-painted frame: stale text is erased by re-blitting
+  the OLD string at intensity 0 (glyph-exact eraser; REPLACE mode has no
+  zero-color skip), changed rows are re-blitted. Don't reintroduce
+  `Rectangle`/`fill` into the redraw path, and don't draw menu text outside
+  `build_frame` — anything the Painter doesn't know about never gets erased.
+  The gateware side of the contract is `persist_freeze_rows=320` in `top.py`
+  (menu band exempt from phosphor decay; without it the input-only redraw
+  lets the idle menu slowly fade — persistence 80 still decays ~1 step per
+  256 passes).
 
 ## Build & test
 
