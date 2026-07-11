@@ -6,12 +6,8 @@ import os
 import sys
 
 from amaranth import *
-from amaranth.lib import data, stream, wiring
-from amaranth.lib.fifo import SyncFIFO, SyncFIFOBuffered
-from amaranth.lib.wiring import In, Out, connect, flipped
-from amaranth import ResetInserter
-
-from luna.gateware.stream.future import Packet
+from amaranth.lib import data, wiring
+from amaranth.lib.fifo import SyncFIFO
 
 from tiliqua import dsp
 from tiliqua.build import sim
@@ -21,7 +17,6 @@ from tiliqua.raster import PSQ, scope
 from tiliqua.raster.plot import FramebufferPlotter, PlotRequest
 from tiliqua.tiliqua_soc import TiliquaSoc
 from tiliqua.usb_msc_csr import USBMSCPeripheral
-from amaranth_soc import csr
 
 
 def _load_by_path(relpath, modname):
