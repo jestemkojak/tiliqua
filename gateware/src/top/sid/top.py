@@ -495,7 +495,8 @@ class SIDSoc(TiliquaSoc):
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 
-    def __init__(self, *, with_scope=True, n_sids=1, with_sysex=False, **kwargs):
+    def __init__(self, *, with_scope=True, n_sids=1, with_sysex=False,
+                 with_usb_msc=False, **kwargs):
         # Don't finalize CSR bridge yet. Default mainram (BRAM) is 0x4000 — the big
         # opts struct eats stack. Subclasses (e.g. top/mbsid, whose by-value C++
         # engine state needs more .bss) may override via the mainram_size kwarg.
@@ -506,6 +507,7 @@ class SIDSoc(TiliquaSoc):
         self.with_scope = with_scope
         self.n_sids = n_sids
         self.with_sysex = with_sysex
+        self.with_usb_msc = with_usb_msc
 
         # Add SID peripheral
         self.sid_periph = SIDPeripheral(with_sysex=with_sysex)
@@ -529,6 +531,13 @@ class SIDSoc(TiliquaSoc):
             self.csr_decoder.add(self.scope_periph.bus, addr=0x1100, name="scope_periph")
 
             # Note: Arbiter is now built into the FramebufferPlotter
+
+        if self.with_usb_msc:
+            # USB mass-storage CSR block (M6). 0x1300: 0x1000/0x1200 taken by
+            # the two SIDPeripherals. with_mode adds the MIDI/Storage mux bit.
+            from tiliqua.usb_msc_csr import USBMSCPeripheral
+            self.usb_msc = USBMSCPeripheral(with_mode=True)
+            self.csr_decoder.add(self.usb_msc.bus, addr=0x1300, name="usb_msc")
 
         # Now finalize the CSR bridge
         self.finalize_csr_bridge()
@@ -615,16 +624,84 @@ class SIDSoc(TiliquaSoc):
 
             # USB MIDI host
             ulpi = platform.request(platform.default_usb_connection)
-            m.submodules.usb = usb = USBMIDIHost(bus=ulpi)
+            vbus_o = platform.request("usb_vbus_en").o
+
+            if not self.with_usb_msc:
+                m.submodules.usb = usb = USBMIDIHost(bus=ulpi)
+            else:
+                # M6 Option A: one UTMITranslator owns the ULPI PHY; both class
+                # engines are built with bus=None (raw UTMIInterface records)
+                # and a CSR mode bit muxes them. The unselected engine is held
+                # in usb-domain reset so a mode flip re-enumerates from scratch
+                # (composes with each engine's internal watchdog ResetInserter).
+                from guh.engines.msc import USBMSCHost
+                from luna.gateware.interface.ulpi import UTMITranslator
+                from amaranth import ResetInserter as _RI
+
+                m.submodules.utmi_phy = phy = UTMITranslator(
+                    ulpi=ulpi, handle_clocking=True)
+
+                storage_mode = Signal()
+                m.d.comb += storage_mode.eq(self.usb_msc.mode_o)
+
+                usb = USBMIDIHost(bus=None)
+                msc = USBMSCHost(bus=None)
+                m.submodules.usb = _RI({"usb": storage_mode})(usb)
+                m.submodules.usb_msc_host = _RI({"usb": ~storage_mode})(msc)
+
+                midi_utmi = usb.enumerator.sie.utmi
+                msc_utmi = msc.sie.utmi
+                # PHY -> engines: fan out to both (the parked engine is in
+                # reset; feeding it RX is harmless).
+                for name in ("rx_data", "rx_active", "rx_valid", "tx_ready",
+                             "line_state", "vbus_valid", "session_valid",
+                             "session_end", "rx_error", "host_disconnect",
+                             "id_digital"):
+                    src = getattr(phy, name, None)
+                    for eng in (midi_utmi, msc_utmi):
+                        m.d.comb += getattr(eng, name).eq(
+                            src if src is not None else 0)
+                # engines -> PHY: mux by mode bit.
+                for name in ("tx_data", "tx_valid", "xcvr_select",
+                             "term_select", "op_mode", "suspend", "id_pullup",
+                             "dm_pulldown", "dp_pulldown", "chrg_vbus",
+                             "dischrg_vbus", "use_external_vbus_indicator"):
+                    dst = getattr(phy, name, None)
+                    if dst is not None:
+                        m.d.comb += dst.eq(Mux(storage_mode,
+                                               getattr(msc_utmi, name),
+                                               getattr(midi_utmi, name)))
+
+                # MSC engine <-> CSR peripheral (same wiring as
+                # sid_player_sw/top.py:258-268).
+                m.submodules.usb_msc = self.usb_msc
+                wiring.connect(m, msc.rx_data, self.usb_msc.rx_data)
+                m.d.comb += [
+                    self.usb_msc.status_i.connected.eq(msc.status.connected),
+                    self.usb_msc.status_i.ready.eq(msc.status.ready),
+                    self.usb_msc.status_i.busy.eq(msc.status.busy),
+                    self.usb_msc.status_i.block_size.eq(msc.status.block_size),
+                    self.usb_msc.status_i.block_count.eq(msc.status.block_count),
+                    msc.cmd.lba.eq(self.usb_msc.lba_o),
+                    msc.cmd.start.eq(self.usb_msc.start_o),
+                    self.usb_msc.resp_i.done.eq(msc.resp.done),
+                    self.usb_msc.resp_i.error.eq(msc.resp.error),
+                ]
+
             m.submodules.midi_decode_usb = midi_decode_usb = midi.MidiDecodeUSB(
                 forward_rt=True, forward_sysex=self.with_sysex)
             wiring.connect(m, usb.o_midi, midi_decode_usb.i)
 
-            # Source mux: USB host or TRS, controlled by CSR bit
-            vbus_o = platform.request("usb_vbus_en").o
+            # Source mux: USB host or TRS, controlled by CSR bit. VBUS: with
+            # the MSC option a thumb drive needs power in Storage mode even
+            # though usb_midi_host=0, so drive it constantly; otherwise keep
+            # the M5 behavior (VBUS only in USB-MIDI mode).
+            if self.with_usb_msc:
+                m.d.comb += vbus_o.eq(1)
             with m.If(self.sid_periph.usb_midi_host):
                 wiring.connect(m, midi_decode_usb.o, self.sid_periph.i_midi)
-                m.d.comb += vbus_o.eq(1)
+                if not self.with_usb_msc:
+                    m.d.comb += vbus_o.eq(1)
                 if self.with_sysex:
                     wiring.connect(m, midi_decode_usb.o_sysex, self.sid_periph.i_sysex)
                     # unselected side drained so a source switch mid-dump
@@ -632,7 +709,8 @@ class SIDSoc(TiliquaSoc):
                     m.d.comb += midi_decode_trs.o_sysex.ready.eq(1)
             with m.Else():
                 wiring.connect(m, midi_decode_trs.o, self.sid_periph.i_midi)
-                m.d.comb += vbus_o.eq(0)
+                if not self.with_usb_msc:
+                    m.d.comb += vbus_o.eq(0)
                 if self.with_sysex:
                     wiring.connect(m, midi_decode_trs.o_sysex, self.sid_periph.i_sysex)
                     m.d.comb += midi_decode_usb.o_sysex.ready.eq(1)
