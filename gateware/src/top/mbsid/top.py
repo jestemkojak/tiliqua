@@ -53,6 +53,9 @@ class MBSIDSoc(SIDSoc):
         kwargs.setdefault("persist_freeze_rows", 320)
         kwargs.setdefault("n_sids", 2)
         kwargs.setdefault("with_sysex", True)
+        # M6: USB mass-storage patch load/export (M6_USB_STORAGE.md). Adds the
+        # USBMSCHost + UTMI mux + usb_msc CSR block at 0x1300 (PAC regen!).
+        kwargs.setdefault("with_usb_msc", True)
         super().__init__(**kwargs)
 
 
