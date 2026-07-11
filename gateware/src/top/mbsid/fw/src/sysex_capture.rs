@@ -41,13 +41,24 @@ pub struct SysexCapture {
     lnibble: bool,    // true = low nibble already stored for buf[data_ix/2]
     bank: u8,
     patch: u8,
+    file_mode: bool,
 }
 
 impl SysexCapture {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::with_mode(false) }
+
+    /// File-import mode (M6 spec §6c): accept ANY cmd-0x02 patch dump —
+    /// type/bank/patch bytes are ignored (a file explicitly chosen by the
+    /// user carries its own intent) — while still enforcing header, nibble
+    /// count, checksum, and the F7 terminator. The live MIDI path keeps
+    /// `new()`'s strict Bank-Write/bank-1 rule.
+    pub fn file_mode() -> Self { Self::with_mode(true) }
+
+    fn with_mode(file_mode: bool) -> Self {
         Self {
             state: State::Idle, hdr_ix: 0, buf: [0u8; 512],
             data_ix: 0, checksum: 0, lnibble: false, bank: 0, patch: 0,
+            file_mode,
         }
     }
 
@@ -80,7 +91,7 @@ impl SysexCapture {
             let done = b == 0xF7 && self.state == State::Term;
             let (bank, complete) = (self.bank, done);
             self.reset();
-            return complete && bank == USER_BANK;
+            return complete && (self.file_mode || bank == USER_BANK);
         }
 
         // Data byte (< 0x80).
@@ -101,9 +112,9 @@ impl SysexCapture {
                 self.state = if b == CMD_PATCH_WRITE { State::Type } else { State::Skip };
             }
             State::Type => {
-                // Only Bank Write to sid 0 (exact type byte 0x00) is captured.
-                // RAM Writes (0x08..0x0F) are audition-only; other sids/types skipped.
-                if b == TYPE_BANK_WRITE_SID0 {
+                // Strict: only Bank Write to sid 0. File mode: any type — the
+                // body framing (bank+patch+1024 nibbles) is identical.
+                if b == TYPE_BANK_WRITE_SID0 || self.file_mode {
                     self.state = State::Bank;
                     self.data_ix = 0;
                     self.checksum = 0;
@@ -299,5 +310,38 @@ mod tests {
         }
         assert_eq!(captured, 1);
         assert_eq!(cap.slot(), 11);
+    }
+
+    #[test]
+    fn file_mode_accepts_factory_bank0_dump() {
+        let p = test_patch();
+        let msg = encode(0x00, 0x00, 3, &p); // bank 0: strict mode rejects this
+        let mut cap = SysexCapture::file_mode();
+        assert_eq!(feed_all(&mut cap, &msg), 1);
+        assert_eq!(cap.data(), &p);
+    }
+
+    #[test]
+    fn file_mode_accepts_ram_write_type() {
+        let p = test_patch();
+        let msg = encode(0x08, 0x00, 0, &p); // RAM Write framing, same body
+        let mut cap = SysexCapture::file_mode();
+        assert_eq!(feed_all(&mut cap, &msg), 1);
+        assert_eq!(cap.data(), &p);
+    }
+
+    #[test]
+    fn file_mode_still_rejects_bad_checksum() {
+        let mut msg = encode(0x00, 0x00, 7, &test_patch());
+        msg[1034] = (msg[1034] + 1) & 0x7F;
+        let mut cap = SysexCapture::file_mode();
+        assert_eq!(feed_all(&mut cap, &msg), 0);
+    }
+
+    #[test]
+    fn strict_mode_unchanged_by_file_mode_addition() {
+        let msg = encode(0x00, 0x00, 3, &test_patch());
+        let mut cap = SysexCapture::new();
+        assert_eq!(feed_all(&mut cap, &msg), 0); // bank 0 still read-only live
     }
 }
