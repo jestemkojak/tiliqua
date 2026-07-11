@@ -11,6 +11,6 @@ pub mod params;
 pub mod settings_store;
 pub mod partition;
 pub mod fat;
-// pub mod usb_patch;          // Task 6 (add the file in that task; keep this line commented until then)
+pub mod usb_patch;
 #[cfg(not(test))]
 pub mod usb_msc;            // pac-dependent: embedded only
