@@ -177,9 +177,13 @@ class USBMSCPeripheral(wiring.Component):
             m.d.comb += self.mode_o.eq(self._mode.f.storage.data)
 
         if self._with_write:
-            m.submodules.tx_fifo = txf = self._tx_fifo
             start_write = (self._start_write.f.strobe.w_stb
                            & self._start_write.f.strobe.w_data)
+            # Wrap the TX word FIFO with ResetInserter so start_write flushes
+            # any leftover words from a prior (partial/failed) write before
+            # the new one begins — symmetric to the RX word FIFO's
+            # ResetInserter(start_strobe) above.
+            m.submodules.tx_fifo = txf = ResetInserter(start_write)(self._tx_fifo)
             m.d.comb += [
                 txf.w_en.eq(self._tx_data.f.word.w_stb),
                 txf.w_data.eq(self._tx_data.f.word.w_data),
