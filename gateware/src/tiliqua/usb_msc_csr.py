@@ -60,30 +60,58 @@ class USBMSCPeripheral(wiring.Component):
         Firmware mirrors the menu's `USB Mode` row here every redraw."""
         storage: csr.Field(csr.action.RW, unsigned(1))
 
-    # Ports — all class-level so no dict/annotation conflict.
-    bus:       In(csr.Signature(addr_width=5, data_width=8))
-    rx_data:   In(stream.Signature(Packet(unsigned(8))))
-    lba_o:     Out(32)
-    start_o:   Out(1)
-    status_i:  In(USB_STATUS_LAYOUT)
-    resp_i:    In(USB_RESP_LAYOUT)
-    mode_o:    Out(1)   # with_mode only: 0 = USB-MIDI owns the PHY, 1 = MSC
+    class TxData(csr.Register, access="w"):
+        """One little-endian 32-bit word of write-payload. Push exactly 128
+        words (512 B), then strobe start_write."""
+        word: csr.Field(csr.action.W, unsigned(32))
 
-    def __init__(self, *, word_fifo_depth=256, with_mode=False):
+    class StartWrite(csr.Register, access="w"):
+        strobe: csr.Field(csr.action.W, unsigned(1))
+
+    class RespW(csr.Register, access="r"):
+        error: csr.Field(csr.action.R, unsigned(1))
+        done:  csr.Field(csr.action.R, unsigned(1))
+
+    # Ports — bus addr_width varies (5 bits normally, 6 once with_write adds
+    # tx_data/start_write past 0x1F), so the whole signature is built
+    # per-instance in __init__ rather than as class-level annotations
+    # (amaranth.lib.wiring.Component disallows mixing the two).
+
+    def __init__(self, *, word_fifo_depth=256, with_mode=False, with_write=False):
         self._with_mode = with_mode
+        self._with_write = with_write
         self._word_fifo = SyncFIFOBuffered(width=32, depth=word_fifo_depth)
-        regs = csr.Builder(addr_width=5, data_width=8)
+        if with_write:
+            self._tx_fifo = SyncFIFOBuffered(width=32, depth=128)
+        addr_width = 6 if with_write else 5
+        regs = csr.Builder(addr_width=addr_width, data_width=8)
         self._status      = regs.add("status",      self.Status(),     offset=0x00)
         self._block_size  = regs.add("block_size",  self.BlockSize(),  offset=0x04)
         self._block_count = regs.add("block_count", self.BlockCount(), offset=0x08)
         self._lba         = regs.add("lba",         self.Lba(),        offset=0x0C)
         self._start       = regs.add("start",       self.Start(),      offset=0x10)
         self._rx_data_reg = regs.add("rx_data",     self.RxData(),     offset=0x14)
-        self._resp        = regs.add("resp",        self.Resp(),       offset=0x18)
+        if with_write:
+            self._resp    = regs.add("resp",        self.RespW(),      offset=0x18)
+        else:
+            self._resp    = regs.add("resp",        self.Resp(),       offset=0x18)
         if with_mode:
             self._mode = regs.add("mode", self.Mode(), offset=0x1C)
+        if with_write:
+            self._tx_data     = regs.add("tx_data",     self.TxData(),     offset=0x20)
+            self._start_write = regs.add("start_write", self.StartWrite(), offset=0x24)
         self._bridge = csr.Bridge(regs.as_memory_map())
-        super().__init__()
+        super().__init__({
+            "bus":           In(csr.Signature(addr_width=addr_width, data_width=8)),
+            "rx_data":       In(stream.Signature(Packet(unsigned(8)))),
+            "lba_o":         Out(32),
+            "start_o":       Out(1),
+            "status_i":      In(USB_STATUS_LAYOUT),
+            "resp_i":        In(USB_RESP_LAYOUT),
+            "mode_o":        Out(1),   # with_mode only: 0=MIDI owns PHY, 1=MSC
+            "tx_data_o":     Out(stream.Signature(unsigned(8))),  # with_write only
+            "start_write_o": Out(1),                              # with_write only
+        })
         self.bus.memory_map = self._bridge.bus.memory_map
 
     def elaborate(self, platform):
@@ -147,5 +175,38 @@ class USBMSCPeripheral(wiring.Component):
 
         if self._with_mode:
             m.d.comb += self.mode_o.eq(self._mode.f.storage.data)
+
+        if self._with_write:
+            m.submodules.tx_fifo = txf = self._tx_fifo
+            start_write = (self._start_write.f.strobe.w_stb
+                           & self._start_write.f.strobe.w_data)
+            m.d.comb += [
+                txf.w_en.eq(self._tx_data.f.word.w_stb),
+                txf.w_data.eq(self._tx_data.f.word.w_data),
+                self.start_write_o.eq(start_write),
+            ]
+            # word -> byte unpacker (mirror of the RX byte->word packer)
+            tx_ix = Signal(2)
+            m.d.comb += [
+                self.tx_data_o.valid.eq(txf.r_rdy),
+                self.tx_data_o.payload.eq(
+                    txf.r_data.word_select(tx_ix, 8)),
+                txf.r_en.eq(0),
+            ]
+            with m.If(self.tx_data_o.valid & self.tx_data_o.ready):
+                m.d.sync += tx_ix.eq(tx_ix + 1)
+                with m.If(tx_ix == 3):
+                    m.d.comb += txf.r_en.eq(1)
+            with m.If(start_write):
+                m.d.sync += tx_ix.eq(0)
+            # sticky done (with_write resp variant); extends the existing
+            # resp_error_r clear term rather than duplicating the register.
+            # Cleared by EITHER start (read) or start_write, per spec.
+            resp_done_r = Signal()
+            with m.If(self.resp_i.done):
+                m.d.sync += resp_done_r.eq(1)
+            with m.If(start_strobe | start_write):
+                m.d.sync += [resp_done_r.eq(0), resp_error_r.eq(0)]
+            m.d.comb += self._resp.f.done.r_data.eq(resp_done_r)
 
         return m
