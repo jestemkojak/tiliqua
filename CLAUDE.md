@@ -20,6 +20,7 @@ Single-context setup. Domain reference is `CLAUDE.md` (gateware/firmware project
 - `pdm test` — run all tests (`pytest -n auto tests/`); or `pdm run pytest tests/test_x.py -v`
 - Full bitstream build ≈ 4–5 min. Achieved (post-route) Fmax is the **second** `Max frequency for clock '$glbnet$clk'` occurrence in `build/<target>-r5/top.tim` (~line 1390+); the first (~line 345) is the pre-route estimate. The post-route line is `Warning:` only when that clock **fails**; on a PASS it's `Info:` — distinguish by order/line-number, not the Warning tag.
 - A failed build surfaces only as `CalledProcessError: 'build_top.sh' returned non-zero`; the real cause (e.g. yosys `found logic loop` / abc9 `no_loops`) is in stdout — grep for it.
+- A subagent running a full build (~5 min) may return early saying it's "waiting for the build-completion notification" — that notification goes to the *dispatching* controller, not the subagent itself. Resume it with a status-check message (it'll then actually block on the build) rather than assuming it's done or stuck.
 - Generated synthesis artifacts (`cpu.v`, `top.ys`, `top.rpt`, `top.il`) land in `gateware/build/<target>-r5/`, but with **underscores→hyphens**: target `sid_player_sw` → `build/sid-player-sw-r5/` (globbing with underscores finds nothing).
 - Flash a built bitstream: `pdm run flash archive build/<target>-r5/<name>.tar.gz` (archive name = git HEAD short hash at build time; a timing-fail build still produces a flashable bitstream).
 
