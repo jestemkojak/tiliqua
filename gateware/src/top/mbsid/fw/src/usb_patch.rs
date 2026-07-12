@@ -7,7 +7,7 @@
 //! dump (*.SYX, parsed by SysexCapture::file_mode) or a raw 512-byte
 //! sid_patch_t (exact size match).
 
-use fatfs::{Dir, DefaultTimeProvider, FileSystem, LossyOemCpConverter, Read, ReadWriteSeek};
+use fatfs::{Dir, DefaultTimeProvider, FileSystem, LossyOemCpConverter, Read, ReadWriteSeek, Write};
 use crate::sysex_capture::SysexCapture;
 
 pub type FileName = heapless::String<16>;
@@ -95,6 +95,67 @@ pub fn load_patch_by_index<IO: ReadWriteSeek>(
         count += 1;
     }
     false
+}
+
+/// Encode `patch` as a standard MBSID v2 single-patch dump (bank 1 = User,
+/// so the exported file re-sent over MIDI lands in the user bank).
+pub fn encode_syx(patch: &[u8; 512], slot: u8, out: &mut [u8; 1036]) {
+    const HEADER: [u8; 6] = [0xF0, 0x00, 0x00, 0x7E, 0x4B, 0x00];
+    out[..6].copy_from_slice(&HEADER);
+    out[6] = 0x02;        // cmd: Patch Write
+    out[7] = 0x00;        // type: Bank Write, sid 0
+    out[8] = 0x01;        // bank: User
+    out[9] = slot & 0x7F;
+    let mut sum: u32 = 0;
+    for (i, &d) in patch.iter().enumerate() {
+        let (lo, hi) = (d & 0x0F, (d >> 4) & 0x0F);
+        out[10 + 2 * i] = lo;
+        out[11 + 2 * i] = hi;
+        sum += (lo + hi) as u32;
+    }
+    out[1034] = ((sum as i32).wrapping_neg() & 0x7F) as u8;
+    out[1035] = 0xF7;
+}
+
+/// Export `patch` as `/MBSID/<name>`; flush; verify by readback+reparse.
+pub fn export_patch<IO: ReadWriteSeek>(
+    fs: &FileSystem<IO>, name: &str, patch: &[u8; 512], slot: u8) -> bool {
+    let root = fs.root_dir();
+    let dir = match root.open_dir("MBSID") {
+        Ok(d) => d,
+        Err(_) => match root.create_dir("MBSID") {
+            Ok(d) => d,
+            Err(_) => root, // e.g. read-only quirk: fall back to root
+        },
+    };
+    let mut syx = [0u8; 1036];
+    encode_syx(patch, slot, &mut syx);
+    {
+        let Ok(mut f) = dir.create_file(name) else { return false };
+        if f.truncate().is_err() { return false; }
+        let mut rest: &[u8] = &syx;
+        while !rest.is_empty() {
+            match f.write(rest) {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => rest = &rest[n..],
+            }
+        }
+        if f.flush().is_err() { return false; }
+    }
+    // Verify: re-open, re-read, re-parse, byte-compare (cheap end-to-end
+    // check that the write path actually landed — spec §6b).
+    let Ok(mut f) = dir.open_file(name) else { return false };
+    let mut back = [0u8; 1036];
+    let mut total = 0usize;
+    while total < back.len() {
+        match f.read(&mut back[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(_) => return false,
+        }
+    }
+    let mut dst = [0u8; 512];
+    total == 1036 && parse_patch_file(&back, &mut dst) && dst == *patch
 }
 
 #[cfg(test)]
@@ -325,5 +386,54 @@ mod tests {
         let fs = FileSystem::new(part, FsOptions::new()).unwrap();
         let mut dst = [0u8; 512];
         assert!(!load_patch_by_index(&fs, 0, &mut dst));
+    }
+
+    #[test]
+    fn encode_syx_roundtrips_through_file_parser() {
+        let p = test_patch(9);
+        let mut syx = [0u8; 1036];
+        encode_syx(&p, 5, &mut syx);
+        let mut dst = [0u8; 512];
+        assert!(parse_patch_file(&syx, &mut dst));
+        assert_eq!(dst, p);
+        assert_eq!(syx[8], 0x01); // bank byte 1 = User (re-sendable over MIDI)
+        assert_eq!(syx[9], 5);    // slot
+    }
+
+    #[test]
+    fn export_then_reimport_is_byte_identical() {
+        let p = test_patch(10);
+        let mut img = build_gpt_fat_image(&[("SEED.TXT", b"x")]);
+        let base = BASE_LBA as usize * SECTOR;
+        {
+            let part = VecDisk::new(&mut img[base..]);
+            let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+            assert!(export_patch(&fs, "P007.SYX", &p, 7));
+        }
+        let part = VecDisk::new(&mut img[base..]);
+        let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+        let mut out = FileList::new();
+        assert_eq!(list_patch_files(&fs, &mut out), 1); // in /MBSID/, .SYX
+        assert_eq!(out[0].as_str(), "P007.SYX");
+        let mut dst = [0u8; 512];
+        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert_eq!(dst, p);
+    }
+
+    #[test]
+    fn export_overwrites_existing_file() {
+        let (p1, p2) = (test_patch(11), test_patch(12));
+        let mut img = build_gpt_fat_image(&[("SEED.TXT", b"x")]);
+        let base = BASE_LBA as usize * SECTOR;
+        for p in [&p1, &p2] {
+            let part = VecDisk::new(&mut img[base..]);
+            let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+            assert!(export_patch(&fs, "EDIT.SYX", p, 0));
+        }
+        let part = VecDisk::new(&mut img[base..]);
+        let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+        let mut dst = [0u8; 512];
+        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert_eq!(dst, p2); // second export won, file not duplicated
     }
 }

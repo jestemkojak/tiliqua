@@ -86,6 +86,7 @@ pub const MAIN_ROW_MIDISRC: u8 = 4;
 pub const MAIN_ROW_USBMODE: u8 = 5;
 pub const USB_ROW_FILE: u8 = 1;
 pub const USB_ROW_LOADSLOT: u8 = 2;
+pub const USB_ROW_EXPORT: u8 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TurnResult {
@@ -114,7 +115,13 @@ pub enum PressResult {
     Cancel,
     UsbLoad(u8),                        // audition file idx (M6a; Task 9 wires I/O)
     UsbLoadToSlot { file: u8, slot: u8 },
+    UsbExport { source: ExportSource },
 }
+
+/// Source patch for a USB export (M6b): the live EDIT buffer (current engine
+/// state) or a saved user-bank slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExportSource { Edit, Slot(u8) }
 
 pub struct MenuState {
     pub card: Card,
@@ -146,6 +153,9 @@ pub struct MenuState {
     pub usb_file_count: u8,
     /// Load>Slot destination cursor; -1 = Cancel (Cancel-first, like Save).
     pub usb_slot: i16,
+    /// Export source cursor: -1 = Cancel, 0 = EDIT buffer, 1..=128 = slot n-1
+    /// (Cancel-first, like Save/Load>Slot).
+    pub usb_export: i16,
     bank_count: u8,
 }
 
@@ -174,6 +184,7 @@ impl MenuState {
             usb_file: -1,
             usb_file_count: 0,
             usb_slot: -1,
+            usb_export: -1,
             bank_count,
         }
     }
@@ -188,7 +199,7 @@ impl MenuState {
             // param branch in `on_turn`'s Edit-mode PatchEdit arm becomes
             // unreachable by construction).
             Card::PatchEdit => if self.lead_loaded { 2 + N_PARAMS as u8 } else { 2 },
-            Card::Usb => 3,                         // Card + File + Load>Slot (Export in M6b)
+            Card::Usb => 4,                         // Card + File + Load>Slot + Export
         }
     }
 
@@ -311,6 +322,11 @@ impl MenuState {
                                 clamp_i16(self.usb_slot + delta as i16, -1, 127);
                             TurnResult::None
                         }
+                        USB_ROW_EXPORT => {
+                            self.usb_export =
+                                clamp_i16(self.usb_export + delta as i16, -1, 128);
+                            TurnResult::None
+                        }
                         _ => TurnResult::None,
                     },
                 }
@@ -334,6 +350,12 @@ impl MenuState {
                             file: self.usb_file as u8, slot: self.usb_slot as u8 }
                     } else { PressResult::Cancel }
                 }
+                USB_ROW_EXPORT => match self.usb_export {
+                    -1 => PressResult::Cancel,
+                    0 => PressResult::UsbExport { source: ExportSource::Edit },
+                    n => PressResult::UsbExport {
+                        source: ExportSource::Slot((n - 1) as u8) },
+                }
                 _ => PressResult::Toggled,
             }
         } else if self.is_save_row() && self.mode == Mode::Edit {
@@ -349,6 +371,9 @@ impl MenuState {
                 }
                 if self.card == Card::Usb && self.focus == USB_ROW_LOADSLOT {
                     self.usb_slot = -1; // Cancel-first, same as Save
+                }
+                if self.card == Card::Usb && self.focus == USB_ROW_EXPORT {
+                    self.usb_export = -1; // Cancel-first, same as Save
                 }
                 Mode::Edit
             }
@@ -592,6 +617,15 @@ pub fn build_frame(st: &MenuState, name: &str,
                                sname.unwrap_or("Empty"));
             }
             f.push(pos_x, pos_y + 4 * ROW_DY, st.focus == USB_ROW_LOADSLOT, &line);
+
+            let marker = row_marker(st, USB_ROW_EXPORT);
+            line.clear();
+            match st.usb_export {
+                -1 => { let _ = write!(line, "{} Export   Cancel", marker); }
+                0 => { let _ = write!(line, "{} Export   EDIT -> USB", marker); }
+                n => { let _ = write!(line, "{} Export   U{:03} -> USB", marker, n - 1); }
+            }
+            f.push(pos_x, pos_y + 5 * ROW_DY, st.focus == USB_ROW_EXPORT, &line);
 
             if let Some(s) = status {
                 f.push(pos_x, pos_y + 7 * ROW_DY, true, s);
@@ -1337,11 +1371,30 @@ mod tests {
                             slot_name: None };
         let fr = build_frame(&m, "P", None, None, None, true,
                              Some(&usb), 60, 80);
-        // title + Card + Drive + File + Load>Slot = 5 (no status)
-        assert_eq!(fr.items.len(), 5);
+        // title + Card + Drive + File + Load>Slot + Export = 6 (no status)
+        assert_eq!(fr.items.len(), 6);
         assert!(fr.items[2].text.contains("Ready"));
         assert!(fr.items[3].text.contains("LEAD1.SYX"));
         assert!(fr.items[4].text.contains("Load>Slot"));
+        assert!(fr.items[5].text.contains("Export"));
+    }
+
+    #[test]
+    fn usb_export_row_selects_edit_or_slot() {
+        let mut m = MenuState::new(1, 0, 0);
+        m.usb_storage = true;
+        m.card = Card::Usb;
+        m.focus = USB_ROW_EXPORT;
+        assert_eq!(m.on_press(), PressResult::Toggled);
+        assert_eq!(m.usb_export, -1);                      // Cancel-first
+        let _ = m.on_turn(1);                              // -> EDIT
+        assert_eq!(m.on_press(), PressResult::UsbExport { source: ExportSource::Edit });
+        let _ = m.on_press();                              // re-enter Edit
+        let _ = m.on_turn(3);                              // -> slot 1 (0-based: 1+? )
+        assert_eq!(m.on_press(),
+                   PressResult::UsbExport { source: ExportSource::Slot(1) });
+        let _ = m.on_press();
+        assert_eq!(m.on_press(), PressResult::Cancel);     // press at Cancel
     }
 
     #[test]

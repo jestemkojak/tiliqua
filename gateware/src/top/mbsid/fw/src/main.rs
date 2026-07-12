@@ -544,6 +544,38 @@ fn main() -> ! {
                                                &mut store, &mut patch_buf,
                                                &mut state, &mut user_detail));
                     }
+                    PressResult::UsbExport { source } => {
+                        let (slot, got) = match source {
+                            menu::ExportSource::Edit => {
+                                critical_section::with(|_cs| {
+                                    mbsid_sys::current_patch_raw(&mut patch_buf);
+                                });
+                                (0u8, true)
+                            }
+                            menu::ExportSource::Slot(n) =>
+                                (n, store.load(n, &mut patch_buf)),
+                        };
+                        let mut fname: heapless::String<16> = heapless::String::new();
+                        let _ = match source {
+                            menu::ExportSource::Edit =>
+                                core::fmt::Write::write_str(&mut fname, "EDIT.SYX"),
+                            menu::ExportSource::Slot(n) =>
+                                core::fmt::Write::write_fmt(&mut fname,
+                                    format_args!("P{:03}.SYX", n)),
+                        };
+                        let ok = got && with_fat(&usb_msc, |fs| {
+                            usb_patch::export_patch(fs, &fname, &patch_buf, slot)
+                        }).unwrap_or(false);
+                        let mut s: heapless::String<24> = heapless::String::new();
+                        let _ = if ok {
+                            core::fmt::Write::write_fmt(&mut s,
+                                format_args!("Exported {}", fname))
+                        } else {
+                            core::fmt::Write::write_str(&mut s, "Export FAILED")
+                        };
+                        status = Some(s);
+                        usb_listed = false;   // new file: refresh the list
+                    }
                 }
                 dirty = true;
             }
