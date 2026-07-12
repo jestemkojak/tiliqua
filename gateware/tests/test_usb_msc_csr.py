@@ -110,6 +110,45 @@ class UsbMscCsrTests(unittest.TestCase):
         sim.add_testbench(testbench)
         sim.run()
 
+    def test_start_write_resets_tx_fifo(self):
+        # A leftover word from a prior (partial/failed) write must not
+        # survive into the next write — start_write should flush the TX
+        # FIFO, mirroring the RX FIFO's ResetInserter(start_strobe).
+        dut = USBMSCPeripheral(with_mode=True, with_write=True)
+        m = Module()
+        m.submodules.dut = dut
+
+        async def testbench(ctx):
+            # Push one leftover word (0x11 22 33 44) but never drain it
+            # (tx_data_o.ready stays 0) — simulates a write that aborted
+            # partway through.
+            ctx.set(dut.tx_data_o.ready, 0)
+            for i, b in enumerate([0x11, 0x22, 0x33, 0x44]):
+                await csr_write(ctx, dut, 0x20 + i, b)
+            await ctx.tick()
+
+            # New write command: flush via start_write, then push a fresh
+            # word (0xAA BB CC DD).
+            await csr_write(ctx, dut, 0x24, 1)   # start_write strobe
+            for i, b in enumerate([0xAA, 0xBB, 0xCC, 0xDD]):
+                await csr_write(ctx, dut, 0x20 + i, b)
+
+            ctx.set(dut.tx_data_o.ready, 1)
+            got = []
+            for _ in range(32):
+                await ctx.tick()
+                if ctx.get(dut.tx_data_o.valid):
+                    got.append(ctx.get(dut.tx_data_o.payload))
+                if len(got) == 4:
+                    break
+            # Only the fresh word should appear — no leftover 0x11 first.
+            self.assertEqual(got, [0xAA, 0xBB, 0xCC, 0xDD])
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
 
 if __name__ == "__main__":
     unittest.main()
