@@ -634,7 +634,7 @@ class SIDSoc(TiliquaSoc):
                 # and a CSR mode bit muxes them. The unselected engine is held
                 # in usb-domain reset so a mode flip re-enumerates from scratch
                 # (composes with each engine's internal watchdog ResetInserter).
-                from guh.engines.msc import USBMSCHost
+                from vendor.guh_msc.msc import USBMSCHost
                 from luna.gateware.interface.ulpi import UTMITranslator
                 from amaranth import ResetInserter as _RI
 
