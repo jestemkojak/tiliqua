@@ -4,21 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-07-12): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented; M6a USB mass-storage patch load (read-only) implemented — dual USB engines (MIDI host + MSC host) behind a UTMI mux, browse/load from a FAT USB drive from the menu (`M6_USB_STORAGE.md`) — M6b (export/write) is spec only. Hardware bring-up pending for all of the above.**
+**Status (2026-07-12): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented; M6 USB mass-storage patch load/export implemented end-to-end — dual USB engines (MIDI host + MSC host) behind a UTMI mux; M6a (read) browses/loads `.syx` files from a FAT USB drive from the menu; M6b (write) exports the live EDIT buffer or any User-bank slot as a standard MBSID SysEx `.syx` file back to the drive (`M6_USB_STORAGE.md`). This closes out the whole M6 plan — code-complete and host/sim/timing-verified. Hardware bring-up pending for all of the above (M1–M6 alike).**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `docs/` holds the narrative documentation set (user guide, architecture, developer
 guide, limitations, extending) — update the relevant page when a feature lands.
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
 Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
-host `cargo test --lib` (110/110, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
-`usb_patch`/FAT-fixture/menu Usb-card coverage), full bitstream build with the M6a USB engine
-+ mux included, `sync` Fmax 66.41 MHz PASS (60 MHz target), 22127/24288 (91%) `TRELLIS_COMB`
+host `cargo test --lib` (118/118, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
+`usb_patch`/FAT-fixture/menu Usb-card coverage, `export_patch`/encode_syx round-trip), full bitstream
+build with **both** the M6a read path and the M6b write path (TX FIFO + WRITE(10) engine) included,
+`sync` Fmax 64.29 MHz PASS (60 MHz target), 22872/24288 (94%) `TRELLIS_COMB`
 (`build/mbsid-r5/top.tim`) — post-route Fmax swings several MHz build-to-build on
 placement-seed noise alone (root `CLAUDE.md`), so treat this exact number as a snapshot, not
-a promise. The one thing NOT yet validated is **playback and the M4 SysEx/user-bank and M6a USB-drive flows
-on real hardware** (DESIGN §7 milestones 2–3; `M4_USER_PATCH_BANKS.md §7`,
-`M6_USB_STORAGE.md`'s hardware checklist).
+a promise; LUT climbed from M6a's 91% as expected with the write leg added, still comfortably
+routable. The one thing NOT yet validated is **playback and the M4 SysEx/user-bank and M6
+USB-drive load/export flows on real hardware** (DESIGN §7 milestones 2–3;
+`M4_USER_PATCH_BANKS.md §7`, `M6_USB_STORAGE.md`'s hardware checklists for both M6a and M6b).
 
 ## Vendored engine (not in this repo)
 
@@ -178,6 +180,11 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **No MIDI TX — ACK/DISACK is swallowed** (the facade has no route back to any MIDI
   output). Editors/workflows that wait for a per-patch ACK before sending the next dump
   will stall or time out; use scripted fire-and-forget sends (`amidi`/`sendmidi`) instead.
+  **This used to mean the device had no patch egress at all — that's no longer true.**
+  M6b's USB export (below) writes the live EDIT buffer or any User-bank slot to a
+  standard MBSID SysEx `.syx` file on a plugged drive, re-sendable from a PC over TRS or
+  reloadable via M6a. MIDI itself is still TX-less; USB storage is the way a patch leaves
+  the device.
 - **`sysex_read` was the first CSR change since M2's `phi2_sel`** — touching
   `SIDPeripheral` registers again needs `pdm mbsid build --pac-only` before `--fw-only`,
   same as any other CSR change (root `CLAUDE.md`).
@@ -224,6 +231,50 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     `lead_loaded` bug: deriving `Card::Usb`'s validity only from menu navigation events
     (instead of every iteration) would let a stale file list survive an unplug until the
     user happened to turn the encoder again.
+- **M6b: USB patch export (write) — `M6_USB_STORAGE.md §4b/§6`.** Adds a SCSI
+  WRITE(10) + bulk-OUT data path to the `guh` MSC host, a TX CSR block on
+  `USBMSCPeripheral`, and the fat write-back cache + `export_syx` firmware flow. Landed
+  in five commits (vendor engine, CSR write path, FAT write-back, patch-store partial-write
+  fix, `export_syx`+menu row); host tests green throughout, full bitstream PASS with the
+  write leg included (see status line above).
+  - **Vendored engine lives at `src/vendor/guh_msc/msc.py`** (BSD-3 header kept), NOT the
+    pip-installed `guh` under `.venv/` — the pinned upstream `guh/engines/msc.py` is
+    read-only by design (its CBW builder can't express a host→device data phase; see
+    `M6_USB_STORAGE.md §2`). Never edit the `.venv` copy — changes there are silently lost
+    on the next `pdm install`/lockfile resolve and don't reach the build. The vendored
+    file's own header notes it as an **upstream-PR candidate**: the diff from stock `guh`
+    is self-contained (`SCSIBulkHost.Command.data_dir`, a `DATA-TX` state, `WRITE_10 =
+    0x2A`) and could be offered back rather than carried as a permanent fork.
+  - **Write CSR contract** (`src/tiliqua/usb_msc_csr.py`, `USBMSCPeripheral(with_write=True)`,
+    instantiated at `../sid/top.py:539` alongside `with_mode=True`): push exactly 128
+    little-endian 32-bit words to `tx_data` (offset `0x20`) — one full 512-byte block, no
+    partial fills accepted — then strobe `start_write` (offset `0x24`, `0x18` is the shared
+    `resp` register reused from the read path). Firmware then polls the **sticky**
+    `resp.done` bit (cleared by either a new `start`/read strobe or a new `start_write`
+    strobe, not by the poll itself) and only then checks `resp.error`. `fw/src/usb_msc.rs`'s
+    `write_block` is the reference implementation: fill loop, one `start_write` strobe, then
+    a capped poll loop (`MAX_SPIN = 10_000_000`, looser than `read_block`'s 1,000,000 — a
+    block write is expected to take longer than a read). Getting the done/error read order
+    wrong (checking `error` before `done` is set, or polling a non-sticky bit) was exactly
+    the class of bug the CSR-side review round caught — the fix is what made `resp.done`
+    sticky in gateware rather than a single-cycle pulse firmware could race past.
+  - **8.3 filenames, no long-filename support** — `fw/src/usb_patch.rs`'s `export_patch`
+    writes `EDIT.SYX` (live buffer) or `P{:03}.SYX` (User slot `n`, e.g. `P042.SYX`),
+    chosen because `Cargo.toml` builds `fatfs` with `default-features = false` (no `lfn`
+    feature), matching `sid_player_sw`'s existing fatfs config — anything past 8.3 would
+    silently truncate/mangle rather than round-trip. `export_patch` verifies its own write
+    by re-opening, re-reading, and re-parsing the file, byte-comparing the 512-byte payload
+    against the source patch before reporting success — a write that lands in the
+    filesystem but garbles in transit (or truncates) is caught immediately, not on next
+    load.
+  - **No live "BUSY" indicator during a write** — `menu.rs`'s `DriveState::Busy` variant
+    exists and renders, but nothing in `main.rs` ever constructs it (grep confirms
+    `DriveState::Busy` is written in exactly one place: the match arm that renders it).
+    `write_block`/`export_patch` run synchronously in the main loop with no yield, so the
+    **screen freezing** (unresponsive to encoder turns) for the write's duration *is* the
+    only "busy" signal a user gets — don't write doc copy implying a `BUSY` row appears
+    during export; it doesn't. The safe-unplug rule is "don't unplug while the menu is
+    unresponsive," not "don't unplug while it says BUSY."
 - **Menu rendering is a blit-diff, never a background fill.** Rectangle fills
   are NOT hardware-accelerated (per-pixel via the pixel_plot FIFO, ~93k CSR
   writes for the old full-box clear — scanout films it as a top-to-bottom
