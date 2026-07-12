@@ -238,15 +238,16 @@ the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/
   cards (Main/CV Mod/Edit), four CV inputs assignable to knobs/parSet targets/a
   pitch+gate note machine, and live Lead-patch parameter editing. See
   `M5_MENU_CARDS_CV_MOD.md`.
-- **M6 — USB mass-storage patch load/export.** **M6a (read-only load) done** — browse
-  `.syx` patch files on a FAT-formatted USB drive from the menu, load = audition,
-  Load→Slot = audition + persist to a User bank slot. Gateware adds a second USB host
-  engine (`USBMSCHost`) behind a UTMI mux alongside the existing `USBMIDIHost`, muxed
-  by a CSR mode bit (Option A from the feasibility investigation — fit without needing
-  the shared-enumerator fallback). **M6b (export/write to USB) is spec-only**, not yet
-  implemented — writing needs a vendored/extended `guh` MSC engine (SCSI WRITE(10) +
-  bulk-OUT), unlike M6a which was pure reuse of read-only infrastructure already
-  proven in `top/sid_player_sw`. See `M6_USB_STORAGE.md`.
+- **M6 — USB mass-storage patch load/export.** **Done** (code-complete, hardware
+  bring-up pending) — both M6a (read-only load) and M6b (export/write) are
+  implemented. M6a: browse `.syx` patch files on a FAT-formatted USB drive from
+  the menu, load = audition, Load→Slot = audition + persist to a User bank slot.
+  M6b: export a User bank slot to a `.syx` file on the drive via a vendored/
+  extended `guh_msc` write engine (SCSI WRITE(10) + bulk-OUT), a FAT write-back
+  cache, and a readback-verify step. Gateware adds a second USB host engine
+  (`USBMSCHost`) behind a UTMI mux alongside the existing `USBMIDIHost`, muxed
+  by a CSR mode bit (Option A from the feasibility investigation — fit without
+  needing the shared-enumerator fallback). See `M6_USB_STORAGE.md`.
 - **Wave-sequencer / full MBSID UI** (the macro_osc `opts`/`ui`/`draw` pattern is the model).
 - **ASID** (`MbSidAsid` — currently excluded from the Lead subset, §3).
 
