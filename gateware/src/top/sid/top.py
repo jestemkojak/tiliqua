@@ -679,6 +679,12 @@ class SIDSoc(TiliquaSoc):
                 # must already be valid ON the start cycle (the strobe cycle
                 # itself), so it's start_write_o | write_pending, not
                 # write_pending alone (which would be one cycle late).
+                # write_pending's d.sync clear-on-start_o only takes effect
+                # the cycle AFTER start_o fires, so on start_o's own cycle a
+                # stale write_pending=1 (from a just-finished write) would
+                # misroute a plain read into msc's WRITE state. Mask it off
+                # combinationally on start_o's own cycle with `& ~start_o`
+                # (review fix, task 12 M6 plan).
                 m.submodules.usb_msc = self.usb_msc
                 wiring.connect(m, msc.rx_data, self.usb_msc.rx_data)
                 wiring.connect(m, self.usb_msc.tx_data_o, msc.tx_data)
@@ -695,7 +701,8 @@ class SIDSoc(TiliquaSoc):
                     self.usb_msc.status_i.block_count.eq(msc.status.block_count),
                     msc.cmd.lba.eq(self.usb_msc.lba_o),
                     msc.cmd.start.eq(self.usb_msc.start_o | self.usb_msc.start_write_o),
-                    msc.cmd.write.eq(self.usb_msc.start_write_o | write_pending),
+                    msc.cmd.write.eq(self.usb_msc.start_write_o |
+                                      (write_pending & ~self.usb_msc.start_o)),
                     self.usb_msc.resp_i.done.eq(msc.resp.done),
                     self.usb_msc.resp_i.error.eq(msc.resp.error),
                 ]
