@@ -253,10 +253,13 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     strobe, not by the poll itself) and only then checks `resp.error`. `fw/src/usb_msc.rs`'s
     `write_block` is the reference implementation: fill loop, one `start_write` strobe, then
     a capped poll loop (`MAX_SPIN = 10_000_000`, looser than `read_block`'s 1,000,000 — a
-    block write is expected to take longer than a read). Getting the done/error read order
-    wrong (checking `error` before `done` is set, or polling a non-sticky bit) was exactly
-    the class of bug the CSR-side review round caught — the fix is what made `resp.done`
-    sticky in gateware rather than a single-cycle pulse firmware could race past.
+    block write is expected to take longer than a read). The CSR-side review round (task 12)
+    caught a different read/write interaction bug: `write_pending`'s `m.d.sync` clear on
+    `start_o` lands one cycle late, so a plain read issued right after a write saw a stale
+    `write_pending=1` and got misrouted into `msc`'s WRITE state instead of READ, silently
+    corrupting the read — fixed by masking it combinationally on the read-start cycle,
+    `msc.cmd.write.eq(start_write_o | (write_pending & ~start_o))` (`../sid/top.py`,
+    commit `1c330fa`).
   - **8.3 filenames, no long-filename support** — `fw/src/usb_patch.rs`'s `export_patch`
     writes `EDIT.SYX` (live buffer) or `P{:03}.SYX` (User slot `n`, e.g. `P042.SYX`),
     chosen because `Cargo.toml` builds `fatfs` with `default-features = false` (no `lfn`
