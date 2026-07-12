@@ -142,11 +142,13 @@ plugged device. The Main card's `USB Mode` row switches between them:
 1. Set `USB Mode` to `Storage` on the Main card, plug in a drive.
 2. The Card selector gains a **Usb** card (only reachable in Storage mode)
    with:
-   - **Drive** — status: `No drive`, `BUSY` (mounting/reading), or
-     `Ready (N files)`.
+   - **Drive** — status: `No drive` or `Ready (N files)`.
    - **File** — scroll through the found `.syx`/raw-patch files by name.
    - **Load>Slot** — same file, but also persists it into a User bank slot
      you pick (like the Main card's Save row).
+   - **Export** — write the live edit buffer or a User slot back to the
+     drive as a `.syx` file (see [Exporting patches to a
+     drive](#exporting-patches-to-a-drive) below).
 3. Turn to the **File** row and press to enter it, scroll to the patch you
    want, press again to commit — this **loads the patch into the engine
    immediately** (audition only, same as an incoming SysEx RAM Write — it
@@ -162,7 +164,44 @@ there's no separate "USB patch" code path in the engine.
 
 Unplugging the drive at any point (mid-browse, mid-load) is safe: the
 `Drive` row falls back to `No drive`, the file list clears, and the menu
-never hangs waiting on a lost drive.
+never hangs waiting on a lost drive. (A load itself briefly blocks the
+menu — see the note on this in the export section below, which applies
+equally here.)
+
+### Exporting patches to a drive
+
+The `Usb` card's **Export** row writes a patch *to* the drive as a
+standard MBSID v2 single-patch SysEx dump — this is currently the module's
+only way to get a patch off the device (MIDI is receive-only; see
+[Uploading patches over SysEx](#uploading-patches-over-sysex) below).
+
+1. With `USB Mode` = `Storage` and a drive plugged in, open the `Usb`
+   card and turn to the **Export** row.
+2. Press to enter it, then scroll to choose a source:
+   - **EDIT → USB** — the currently loaded/edited patch (the same buffer
+     the Main card's `Save` row would write), exported as `/MBSID/EDIT.SYX`.
+   - **Unnn → USB** — a specific User bank slot, exported as
+     `/MBSID/Pnnn.SYX` (e.g. slot 42 → `P042.SYX`).
+3. Press again to commit. The status line reports `Exported <filename>` on
+   success or `Export FAILED` if the write didn't go through (drive
+   removed, filesystem full, or the peripheral reported a SCSI write
+   error) — nothing is left half-written on a `FAILED` result.
+
+**Don't unplug the drive while an export is in progress.** There is no
+separate `BUSY` indicator for this — the whole menu (encoder input,
+redraw) is unresponsive for the short duration of the write, because the
+write runs synchronously in the firmware's main loop. Treat "the screen
+isn't responding to the encoder" as the busy signal and wait for the
+status line to update before touching the drive. Audio playback is
+unaffected either way (the real-time engine tick runs from a separate
+interrupt, not the main loop).
+
+Filenames are plain 8.3 (`EDIT.SYX`, `P042.SYX`) — there is no long
+filename support, matching `sid_player_sw`'s drive-access conventions.
+Exported files are byte-compatible with MIOS Studio `.syx`
+patches: they can be re-imported on this device via the `File` row above,
+sent to another MIDIbox SID over MIDI, or opened in the MIDIbox SID
+Editor on a PC.
 
 ### CV Mod card
 
@@ -250,3 +289,5 @@ Practical notes:
 | CV wiggling does nothing | Target set to Off; or Pitch assigned without Gate (both are needed for notes); or the change is below the 8-bit deadband |
 | `Drive` row stuck on `No drive` in Storage mode | Not FAT32/MBR-first-partition, or the drive needs more init time than a cheap flash stick — try a different drive; block size must be 512 bytes |
 | My MIDI keyboard stopped responding after I plugged in a drive | `USB Mode` is `Storage` — a plugged drive and a plugged MIDI device are mutually exclusive on the one USB-C port. Switch `USB Mode` back to `MIDI`, or play over TRS in the meantime (TRS stays live in Storage mode) |
+| `Export FAILED` on the Usb card | Drive removed mid-write, filesystem full, or the drive rejected the SCSI write — nothing is left half-written; try again with the drive freshly re-plugged |
+| Menu froze for a moment during Load or Export | Expected — USB block reads/writes run synchronously in the main loop with no live `BUSY` indicator; it un-freezes when the operation finishes. Don't unplug the drive while it's frozen |
