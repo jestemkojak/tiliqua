@@ -14,6 +14,8 @@ use heapless::{String, Vec};
 
 /// Max text items on screen at once. Worst case is the PatchEdit card:
 /// title + Card row + 6 param rows + 2 scroll indicators + Save row = 11.
+/// (Main gained a USB Mode row in M6a: title + 6 rows + detail + status = 9,
+/// still under PatchEdit's 11, so 12 still suffices.)
 pub const MAX_ITEMS: usize = 12;
 /// Worst-case op count: every old item erased + every new item drawn.
 pub const MAX_OPS: usize = 2 * MAX_ITEMS;
