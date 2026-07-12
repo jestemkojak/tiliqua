@@ -92,7 +92,17 @@ impl<B: BlockIo> Write for MscStorage<B> {
         while written < buf.len() {
             let lba = self.base_lba + (self.pos / 512) as u32;
             let off = (self.pos % 512) as usize;
-            self.ensure_block(lba)?;           // RMW: sector loaded first
+            // Don't propagate a mid-loop ensure_block error with `?`: the
+            // `Write` contract requires an `Err` return to mean "no bytes
+            // written this call". If earlier sectors in this same call
+            // already landed in the cache (dirty=true, pos advanced), a
+            // later sector's I/O error must not discard that progress —
+            // return Ok(written) for what succeeded so far, and only
+            // surface Err if the very first sector failed (written == 0).
+            if let Err(e) = self.ensure_block(lba) {
+                if written > 0 { return Ok(written); }
+                return Err(e);
+            }
             let n = (512 - off).min(buf.len() - written);
             self.cache[off..off + n].copy_from_slice(&buf[written..written + n]);
             self.dirty = true;
@@ -122,9 +132,16 @@ mod tests {
     use super::*;
 
     /// In-memory BlockIo over a byte vec; counts writes for flush assertions.
-    struct MemDisk { data: std::vec::Vec<u8>, writes: usize }
+    /// `fail_read_lba`: if set, the next `read_block` for that LBA errors
+    /// once (then clears itself) — used to inject a mid-multi-sector I/O
+    /// failure without a larger test-double restructure.
+    struct MemDisk { data: std::vec::Vec<u8>, writes: usize, fail_read_lba: Option<u32> }
     impl crate::fat::BlockIo for &mut MemDisk {
         fn read_block(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), ()> {
+            if self.fail_read_lba == Some(lba) {
+                self.fail_read_lba = None;
+                return Err(());
+            }
             let o = lba as usize * 512;
             if o + 512 > self.data.len() { return Err(()); }
             buf.copy_from_slice(&self.data[o..o + 512]);
@@ -141,7 +158,7 @@ mod tests {
 
     #[test]
     fn write_rmw_lands_after_flush() {
-        let mut disk = MemDisk { data: std::vec![0xAAu8; 8 * 512], writes: 0 };
+        let mut disk = MemDisk { data: std::vec![0xAAu8; 8 * 512], writes: 0, fail_read_lba: None };
         // superfloppy layout (no partition table) -> base_lba 0 fallback is
         // fine: we drive MscStorage directly, not through fatfs here.
         {
@@ -158,7 +175,7 @@ mod tests {
 
     #[test]
     fn crossing_sector_boundary_writes_back_dirty_sector() {
-        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0 };
+        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0, fail_read_lba: None };
         {
             let mut s = MscStorage::new(&mut disk);
             use fatfs::{Seek, SeekFrom, Write};
@@ -172,7 +189,7 @@ mod tests {
 
     #[test]
     fn read_of_other_sector_evicts_dirty_cache_first() {
-        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0 };
+        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0, fail_read_lba: None };
         {
             let mut s = MscStorage::new(&mut disk);
             use fatfs::{Read, Seek, SeekFrom, Write};
@@ -183,5 +200,29 @@ mod tests {
             s.read(&mut b).unwrap();   // must not lose sector 0's dirty data
         }
         assert_eq!(&disk.data[0..8], &[7; 8]);
+    }
+
+    #[test]
+    fn write_spanning_sectors_returns_partial_count_on_second_sector_error() {
+        // Write straddles sector 0 and sector 1; sector 1's underlying
+        // read_block (via ensure_block) fails once. The call must return
+        // Ok(n) for only the first sector's bytes, not propagate Err and
+        // discard the already-cached, already-dirty first-sector progress
+        // (the bug: the old `ensure_block(lba)?` in the loop threw away
+        // `written` on any later-sector failure).
+        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0, fail_read_lba: Some(1) };
+        let n = {
+            let mut s = MscStorage::new(&mut disk);
+            use fatfs::{Seek, SeekFrom, Write};
+            s.seek(SeekFrom::Start(510)).unwrap();
+            // 4 bytes: 2 land in sector 0 (offsets 510,511), 2 would land
+            // in sector 1 (offsets 0,1) but sector 1's read fails.
+            let n = s.write(&[9; 4]).expect("partial write must succeed, not error out");
+            s.flush().unwrap(); // flush only touches the still-cached sector 0
+            n
+        };
+        assert_eq!(n, 2, "only sector 0's 2 bytes were written this call");
+        assert_eq!(&disk.data[510..512], &[9, 9], "sector 0's dirty data was not lost/orphaned");
+        assert_eq!(disk.writes, 1, "only sector 0 was ever flushed to the disk");
     }
 }
