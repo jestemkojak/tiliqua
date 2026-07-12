@@ -36,6 +36,9 @@ use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
 use tiliqua_fw::menu::PressResult;
 use tiliqua_fw::cv::{self, CvSink};
 use tiliqua_fw::{params, settings_store};
+use tiliqua_fw::usb_patch;
+use tiliqua_fw::fat::{FileSystem, FsOptions, MscStorage};
+use tiliqua_fw::menu::{DriveState, UsbInfo};
 
 use midi_types::MidiMessage;
 use midi_convert::parse::MidiTryParseSlice;
@@ -282,6 +285,62 @@ fn save_status(ok: bool, slot: u8) -> heapless::String<24> {
     s
 }
 
+/// Mount the drive's first FAT volume and run `f` on it. Every USB menu
+/// action re-mounts (sid_player_sw idiom): no FileSystem lifetime to hold
+/// across drive unplugs, and patch files are tiny so the cost is a few
+/// 512-byte reads.
+fn with_fat<R>(msc: &tiliqua_fw::usb_msc::UsbMsc,
+               f: impl FnOnce(&FileSystem<MscStorage<&tiliqua_fw::usb_msc::UsbMsc>>) -> R)
+               -> Option<R> {
+    let storage = MscStorage::new(msc);
+    match FileSystem::new(storage, FsOptions::new()) {
+        Ok(fs) => Some(f(&fs)),
+        Err(_) => None,
+    }
+}
+
+/// Load USB patch file `ix` into the engine (audition); optionally also
+/// persist it to user-bank `slot`. Same engine entry as the SysEx path
+/// (`load_patch`), so behavior is provably identical to a MIDI upload of
+/// the same bytes (spec §6e).
+fn usb_load<F: tiliqua_hal::nor_flash::NorFlash + tiliqua_hal::nor_flash::ReadNorFlash>(
+    msc: &tiliqua_fw::usb_msc::UsbMsc,
+    ix: usize,
+    slot: Option<u8>,
+    store: &mut UserPatchStore<F>,
+    patch_buf: &mut [u8; 512],
+    state: &mut MenuState,
+    user_detail: &mut Option<(u8, u8)>,
+) -> heapless::String<24> {
+    let mut s = heapless::String::new();
+    let ok = with_fat(msc, |fs| {
+        usb_patch::load_patch_by_index(fs, ix, patch_buf)
+    }).unwrap_or(false);
+    if !ok {
+        let _ = core::fmt::Write::write_str(&mut s, "USB load FAILED");
+        return s;
+    }
+    critical_section::with(|_cs| {
+        mbsid_sys::load_patch(patch_buf);
+    });
+    *user_detail = Some((patch_buf[0x10], patch_buf[0x50]));
+    state.refresh_params(|a| mbsid_sys::patch_byte(a));
+    state.edited = false;
+    match slot {
+        Some(n) => {
+            if store.save(n, patch_buf).is_ok() {
+                let _ = core::fmt::Write::write_fmt(&mut s,
+                    format_args!("Loaded -> U{:03}", n));
+            } else {
+                let _ = core::fmt::Write::write_fmt(&mut s,
+                    format_args!("Save FAILED U{:03}", n));
+            }
+        }
+        None => { let _ = core::fmt::Write::write_str(&mut s, "Loaded (audition)"); }
+    }
+    s
+}
+
 #[entry]
 fn main() -> ! {
     let peripherals = pac::Peripherals::take().unwrap();
@@ -354,6 +413,7 @@ fn main() -> ! {
     };
     state.midi_src = if settings.midi_src == 1 { menu::MidiSource::Usb } else { menu::MidiSource::Trs };
     state.cv_targets = settings.cv_targets.map(cv::CvTarget::from_u8);
+    state.usb_storage = settings.usb_mode == 1;
     let mut settings_dirty_at: Option<u32> = None;
     let mut last_saved = settings;
 
@@ -369,6 +429,12 @@ fn main() -> ! {
     // CSR, inherited unchanged — see menu.rs's MidiSrc row). Bound once here;
     // the ISR's own SID_PERIPH access uses an independent `Peripherals::steal()`.
     let sid = peripherals.SID_PERIPH;
+
+    // M6a: USB mass-storage. All access is main-loop-only; a slow drive
+    // stalls UI redraw, never audio (the ISR keeps ticking the engine).
+    let usb_msc = tiliqua_fw::usb_msc::UsbMsc::new(peripherals.USB_MSC);
+    let mut usb_files: usb_patch::FileList = usb_patch::FileList::new();
+    let mut usb_listed = false;
 
     handler!(timer0 = || timer0_handler(&app));
 
@@ -393,6 +459,40 @@ fn main() -> ! {
             // current_engine elsewhere in this crate).
             lead_loaded = mbsid_sys::current_engine() == 0;
             state.lead_loaded = lead_loaded;
+
+            // M6: derive USB state every iteration (M5 lesson). Leaving
+            // Storage mode (or losing the drive) collapses the Usb card and
+            // invalidates the cached file list. `state.card` is reassigned
+            // directly here (not via `Card::step`) because this is an
+            // unconditional collapse, not a navigation event — but it lands
+            // on the same value `step` would clamp to on the very next Card
+            // turn once `usb_storage` is false (see `Card::step`'s doc
+            // comment), so there is no window where `state.card == Usb`
+            // survives with `usb_storage == false`.
+            if !state.usb_storage && state.card == menu::Card::Usb {
+                state.card = menu::Card::Main;
+                state.focus = menu::ROW_CARD;
+                dirty = true;
+            }
+            let drive_ready = state.usb_storage && usb_msc.ready()
+                && usb_msc.block_size() == 512;
+            if !drive_ready && usb_listed {
+                usb_listed = false;           // drive unplugged / mode left
+                usb_files.clear();
+                state.usb_file = -1;
+                state.usb_file_count = 0;
+                if state.card == menu::Card::Usb { dirty = true; }
+            }
+            if drive_ready && !usb_listed && state.card == menu::Card::Usb {
+                usb_files.clear();
+                let n = with_fat(&usb_msc, |fs| {
+                    usb_patch::list_patch_files(fs, &mut usb_files)
+                }).unwrap_or(0);
+                state.usb_file_count = n as u8;
+                state.usb_file = if n > 0 { 0 } else { -1 };
+                usb_listed = true;
+                dirty = true;
+            }
 
             let mut need_load = false;
             if ticks != 0 {
@@ -433,6 +533,16 @@ fn main() -> ! {
                         let ok = store.save(slot, &patch_buf).is_ok();
                         if ok { state.edited = false; }
                         status = Some(save_status(ok, slot));
+                    }
+                    PressResult::UsbLoad(ix) => {
+                        status = Some(usb_load(&usb_msc, ix as usize, None,
+                                               &mut store, &mut patch_buf,
+                                               &mut state, &mut user_detail));
+                    }
+                    PressResult::UsbLoadToSlot { file, slot } => {
+                        status = Some(usb_load(&usb_msc, file as usize, Some(slot),
+                                               &mut store, &mut patch_buf,
+                                               &mut state, &mut user_detail));
                     }
                 }
                 dirty = true;
@@ -479,6 +589,7 @@ fn main() -> ! {
                     let s = settings_store::Settings {
                         midi_src: (state.midi_src == menu::MidiSource::Usb) as u8,
                         cv_targets: state.cv_targets.map(|t| t.to_u8()),
+                        usb_mode: state.usb_storage as u8,
                     };
                     if s != last_saved {
                         let _ = settings_store::save(store.flash_mut(), w.start, &s);
@@ -493,8 +604,10 @@ fn main() -> ! {
                 // idempotent (mirrors top/sid's identical call) — cheap
                 // enough to run every redraw, no change-tracking needed.
                 sid.usb_midi_host().write(|w| unsafe {
-                    w.host().bit(state.midi_src == menu::MidiSource::Usb)
+                    w.host().bit(state.midi_src == menu::MidiSource::Usb
+                                 && !state.usb_storage)
                 });
+                usb_msc.set_mode(state.usb_storage);
 
                 let mut namebuf = [0u8; 17];
                 let name_ok;
@@ -541,12 +654,33 @@ fn main() -> ! {
                         core::str::from_utf8(&savebuf).ok()
                     } else { None };
 
+                // Usb card detail: drive/file/slot names, built only while
+                // the card is focused (borrows usb_files/slotbuf).
+                let mut slotbuf = [0u8; 16];
+                let usb_info = if state.card == menu::Card::Usb {
+                    let slot_name: Option<&str> =
+                        if state.usb_slot >= 0
+                            && store.name(state.usb_slot as u8, &mut slotbuf) {
+                            core::str::from_utf8(&slotbuf).ok()
+                        } else { None };
+                    Some(UsbInfo {
+                        drive: if drive_ready { DriveState::Ready }
+                               else { DriveState::NoDrive },
+                        file_name: if state.usb_file >= 0 {
+                            usb_files.get(state.usb_file as usize)
+                                     .map(|n| n.as_str())
+                        } else { None },
+                        file_count: state.usb_file_count,
+                        slot_name,
+                    })
+                } else { None };
+
                 // Diff-paint: blitter-only, erases stale glyphs by re-blitting
                 // old text at intensity 0 — no rectangle fill, no visible wipe
                 // (see menu::Painter).
                 let frame = menu::build_frame(&state, name, detail,
                                               save_name, status.as_deref(), lead_loaded,
-                                              MENU_X, MENU_Y);
+                                              usb_info.as_ref(), MENU_X, MENU_Y);
                 painter.paint(&mut display, frame, MENU_HUE).ok();
                 dirty = false;
             }
