@@ -4,7 +4,7 @@ use tiliqua_pac as pac;
 pub struct UsbMsc { regs: pac::USB_MSC }
 
 #[derive(Debug)]
-pub enum MscError { NotReady, ReadError }
+pub enum MscError { NotReady, ReadError, WriteError }
 
 impl UsbMsc {
     pub fn new(regs: pac::USB_MSC) -> Self { Self { regs } }
@@ -62,10 +62,38 @@ impl UsbMsc {
         }
         Ok(())
     }
+
+    /// Write one 512-byte block at `lba`. Same block_size()==512 precondition
+    /// as read_block. Contract (Task 12): lba -> 128 tx words -> start_write
+    /// -> poll sticky resp.done, then resp.error.
+    pub fn write_block(&self, lba: u32, buf: &[u8; 512]) -> Result<(), MscError> {
+        if !self.ready() { return Err(MscError::NotReady); }
+        self.regs.lba().write(|w| unsafe { w.value().bits(lba) });
+        for i in 0..128usize {
+            let w32 = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            self.regs.tx_data().write(|w| unsafe { w.word().bits(w32) });
+        }
+        self.regs.start_write().write(|w| w.strobe().set_bit());
+        const MAX_SPIN: u32 = 10_000_000; // writes can be slower than reads
+        let mut spins: u32 = 0;
+        loop {
+            let r = self.regs.resp().read();
+            if r.done().bit_is_set() {
+                return if r.error().bit_is_set() {
+                    Err(MscError::WriteError)
+                } else { Ok(()) };
+            }
+            spins += 1;
+            if spins >= MAX_SPIN { return Err(MscError::WriteError); }
+        }
+    }
 }
 
 impl crate::fat::BlockIo for &UsbMsc {
     fn read_block(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), ()> {
         UsbMsc::read_block(self, lba, buf).map_err(|_| ())
+    }
+    fn write_block(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), ()> {
+        UsbMsc::write_block(self, lba, buf).map_err(|_| ())
     }
 }
