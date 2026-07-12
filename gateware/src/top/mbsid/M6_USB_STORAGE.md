@@ -1,16 +1,30 @@
 # MBSID USB Mass-Storage Patch Load/Export — Feasibility + Design (M6)
 
-Status: **M6a implemented (hardware bring-up pending); M6b spec only** (2026-07-12).
-Read-only USB patch load (browse a FAT drive from the menu, load = audition, Load→Slot =
-audition + persist to a User bank slot) is built end-to-end: gateware (`usb_msc` CSR at
-`0x1300`, dual USB engines behind a UTMI mux per §3's Option A, decided without needing the
-Option B fallback), firmware (MSC block-read driver, FAT adapter, `usb_patch.rs` file finder/
-loader, file-mode SysEx parser, settings persistence, `Card::Usb` menu card, main-loop
-wiring). Host tests are green (110/110, `cd fw && cargo test --target x86_64-unknown-linux-gnu
---lib`) and a full bitstream build passes timing — see `CLAUDE.md`'s status line for the
-current numbers. Not yet exercised on real hardware — see the hardware checklist below.
-M6b (export/write) remains spec-only (§4b/§4c below); no vendored `guh` MSC write path or
-`export_syx` firmware exists yet.
+Status: **M6a and M6b both implemented (hardware bring-up pending)** (2026-07-12). This is
+the final status for the whole M6 plan — read (M6a) and write/export (M6b) are both
+code-complete and reviewed.
+
+**M6a (read).** Browse a FAT drive from the menu, load = audition, Load→Slot = audition +
+persist to a User bank slot. Built end-to-end: gateware (`usb_msc` CSR at `0x1300`, dual USB
+engines behind a UTMI mux per §3's Option A, decided without needing the Option B fallback),
+firmware (MSC block-read driver, FAT adapter, `usb_patch.rs` file finder/loader, file-mode
+SysEx parser, settings persistence, `Card::Usb` menu card, main-loop wiring).
+
+**M6b (write/export).** Export the live EDIT buffer or any User-bank slot as a standard MBSID
+v2 single-patch SysEx `.syx` file back to the drive. Built end-to-end: gateware (vendored
+`guh` MSC engine at `src/vendor/guh_msc/msc.py` extended with SCSI WRITE(10) + a bulk-OUT
+`DATA-TX` state, `USBMSCPeripheral(with_write=True)`'s `tx_data`/`start_write` CSR pair),
+firmware (`usb_msc.rs`'s `write_block`, `fat.rs`'s write-back sector cache, `usb_patch.rs`'s
+`export_patch`/`encode_syx`, the menu's `Export` row on `Card::Usb`). Landed across five
+commits including two review-round fixes (a CSR read-after-write timing bug on the write
+path, a partial-write-progress bug in the FAT write-back cache) — see `CLAUDE.md`'s M6b
+gotcha block for both.
+
+Host tests are green (118/118, `cd fw && cargo test --target x86_64-unknown-linux-gnu --lib`)
+and a full bitstream build with **both** the M6a read path and the M6b write path included
+passes timing — see `CLAUDE.md`'s status line for the current numbers. **Neither M6a nor M6b
+has been exercised on real hardware** — see the hardware checklists below (§7a for M6a, §7b
+for M6b).
 
 Original investigation below is kept for context. Loading patches *from* a USB drive turned
 out cheap as predicted — the whole read-only MSC stack (gateware + FAT firmware) already
@@ -253,10 +267,10 @@ ULPI mux (Option A). Judge LUT% + post-route sync Fmax over 2 seeds (read the *s
 `Max frequency` line in `top.tim`). Decides Option A vs B before any real work.
 
 **M6a — load (read-only).** Gateware §4a + firmware §6 minus export. Host tests: fat/scan/
-parser suites (all runnable on PC, fixtures = MBSID v2 `.syx` + generated FAT images, same
-harness as `sid_scan.rs`) — **110/110 green**, see `CLAUDE.md`. Gateware built and passing
-timing — see `CLAUDE.md`'s status line for the current post-route sync Fmax. **Not yet run
-on real hardware.**
+parser suites (all runnable on PC, fixtures = reference `.syx` files + generated FAT images,
+same harness as `sid_scan.rs`) — part of the **118/118 green** host suite, see `CLAUDE.md`.
+Gateware built and passing timing — see `CLAUDE.md`'s status line for the current post-route
+sync Fmax. **Not yet run on real hardware.**
 
 ### 7a. M6a hardware checklist (record results here once hardware is available)
 
@@ -294,47 +308,100 @@ drive containing a few `.syx` files under `/MBSID/`:
   post-M4 (the `FileSystem` + caches + name list adds an estimated 2–3 KB, per §6f above —
   this step turns that estimate into a real hardware number).
 
-**M6b — export (write).** Gateware §4b (vendored engine + TX CSR path, sim-tested), fat
-write-back, `export_syx` + menu rows. Hardware checklist: exported file mounts clean on a PC
-(`fsck.vfat` clean), byte-identical round-trip (export → PC → send same file over TRS SysEx
-→ engine state identical; and export → re-import on device → 512-byte compare equal),
-unplug during export leaves a mountable filesystem with at worst a truncated/missing file
-(export writes payload before directory-entry finalize where fatfs ordering allows; verify
-empirically), repeated exports don't leak clusters (`fsck.vfat` after 50 exports).
+**M6b — export (write).** Gateware §4b (vendored `guh` MSC engine with SCSI WRITE(10) +
+bulk-OUT `DATA-TX`, `USBMSCPeripheral(with_write=True)`'s `tx_data`/`start_write` CSR pair,
+sim-tested), firmware §6a/6b (FAT write-back sector cache in `fat.rs`, `usb_patch.rs`'s
+`export_patch`/`encode_syx`), menu §6d (`Card::Usb`'s `Export` row). All implemented and part
+of the 118/118 host test suite; full bitstream build with the write path included passes
+timing (see `CLAUDE.md`'s status line). **Not yet run on real hardware** — see §7b below.
 
-**Stopgap export (zero gateware, available today):** the M4 user bank lives at flash
-`0xF00000..0xF80000` in 4 KiB slots with an 8-byte `MBUP` header. PC-side flash tooling can
-read that region over the debug/bootloader USB and a small host script can emit `.syx` files
-(header parse + 512-byte payload + nibblize). Developer-grade UX (reboot to bootloader), but
-worth having as a recovery/backup path regardless of M6 — and it de-risks "patches are
-trapped in flash" immediately.
+### 7b. M6b hardware checklist (record results here once hardware is available)
+
+Plain checklist, not something executable in this environment — no hardware is available
+here. Walk this in order on a real Tiliqua r5 with a USB-C-to-A adapter and a writable
+FAT32 thumb drive, after first confirming the M6a checklist (§7a) passes on the same drive:
+
+- [ ] **Exported file mounts clean on a PC.** From the `Usb` card, `Export` the live EDIT
+  buffer (or a User slot) to the drive. Unplug from Tiliqua, plug into a PC/Linux box, run
+  `fsck.vfat -n <device>` — clean, no errors, no lost chains. Confirm the file appears under
+  `/MBSID/<name>.SYX` (`EDIT.SYX` for the live buffer, `Pnnn.SYX` for slot `nnn`) with
+  plausible size (1036 bytes — 6-byte header + cmd/type/bank/slot + 1024 nibblized data +
+  checksum + `F7`).
+- [ ] **Byte-identical round-trip via MIDI.** Export a patch, note its sound/register image.
+  Send the exported `.syx` file back to Tiliqua over **TRS** SysEx (`amidi -s <file>` per the
+  user guide's SysEx section) — the resulting engine state (audition) must be indistinguishable
+  from the original, since `encode_syx`'s output is a standard MBSID v2 Bank Write dump
+  addressed to User bank 1 and lands through the same `SysexCapture`/engine entry point as any
+  other upload.
+- [ ] **Byte-identical round-trip via re-import.** Export a patch, then use the `Usb` card's
+  `File`/`Load` row to re-import the same file from the same drive. The re-imported 512-byte
+  patch body must compare equal to the original (this is also asserted automatically by
+  `export_patch`'s own internal readback-verify — this checklist item is the same check one
+  layer up, exercising the *load* path too, not just the write+verify the firmware already
+  does on every export).
+- [ ] **Unplug during export leaves a mountable filesystem.** Start an `Export`, physically
+  unplug the drive partway through (the screen will be frozen/unresponsive for the write's
+  duration — see `CLAUDE.md`'s M6b gotcha on the missing live `BUSY` indicator; unplug at any
+  point while it's unresponsive). Re-mount on a PC: `fsck.vfat` should find, at worst, a
+  truncated or missing target file — never a corrupted directory structure or an
+  unmountable volume.
+- [ ] **50 repeated exports, then `fsck.vfat`.** Export the same (or varying) patches 50
+  times in a row (overwriting or using distinct filenames). Unmount, run `fsck.vfat -n` on a
+  PC — no leaked clusters, no orphaned chains, free-space accounting still correct.
+- [ ] **Quirky-drive sweep.** Repeat the core export+round-trip checks (first three items
+  above) on at least two different drives: a cheap/slow flash stick and a USB-SSD enclosure.
+  This also covers Task 11's known, accepted risk: the vendored write path's OUT data phase
+  is chunked in 64-byte packets, which is technically out-of-spec-ish for a mid-transfer
+  non-max-size packet on some USB implementations — a drive that's picky about this should
+  surface as a write error (visible `Export FAILED` status), not silent corruption; confirm
+  which behavior actually occurs on the quirkier of the two drives.
+- [ ] **Stack-paint re-measure.** Same methodology as §7a's stack-paint item, but exercise the
+  deepest M6b path instead: menu navigation into `Usb`, an `Export` of a User slot (the write
+  leg adds the `tx_data` fill loop + FAT write-back cache on top of whatever the read leg
+  already uses). Confirm actual peak stack usage stays inside headroom — §7a's M6a
+  re-measurement is the more relevant prior data point once it exists; until then compare
+  against the pre-M6 baseline (`M4_USER_PATCH_BANKS.md §6f`, 4016/25824 B).
 
 ## 8. Risks
 
 | Risk | Exposure | Mitigation |
 |---|---|---|
-| Area/Fmax: +USB engine on an 80%-full, 61.76 MHz design | High (project-gating) | Phase 0 probe; Option B fallback; last resort: `with_sysex` and MSC engine made build-time exclusive (two bitstream variants — ugly, avoid) — superseded: M6a measured 91% LUT, 66.41 MHz post-route sync Fmax PASS |
-| FAT corruption on unplug during export | Medium | Writes only on explicit user action; flush eagerly; `BUSY` indicator; verify-by-readback; document "don't unplug while BUSY" |
+| Area/Fmax: +USB engine on an 80%-full, 61.76 MHz design | High (project-gating) | Phase 0 probe; Option B fallback; last resort: `with_sysex` and MSC engine made build-time exclusive (two bitstream variants — ugly, avoid) — superseded: M6a measured 91% LUT, 66.41 MHz post-route sync Fmax PASS; M6b (read+write path both included) measured **94% LUT, 64.29 MHz post-route sync Fmax PASS** — LUT climbed as expected with the write leg, still routes with margin over the 60 MHz target |
+| FAT corruption on unplug during export | Medium | Writes only on explicit user action; flush eagerly; verify-by-readback (`export_patch` re-reads+re-parses+byte-compares before reporting success); document "don't unplug while the menu is unresponsive" — note there is no live `BUSY` row during a write (`CLAUDE.md`'s M6b gotcha: `DriveState::Busy` exists but is never constructed), the frozen screen itself is the busy signal |
 | Quirky drives (slow spin-up, non-512 blocks) | Medium | `block_size()==512` guard already in driver (reject others visibly); `guh` 10 s init watchdog handles slow SSDs; test a cheap flash stick + an SSD enclosure |
 | `guh` fork drift | Low | Vendor only `engines/msc.py`; `usbh/*` internals stay upstream-pinned; offer write support upstream as a PR |
 | Mode-switch wedge (half-enumerated device) | Low | Mode bit resets the incoming engine; both engines already watchdog-reset on stall |
 | Main-loop stall from a stalling drive | Low | Per-block spin cap already in `usb_msc.rs`; per-op block-count cap in `usb_patch.rs` |
 
-## 9. Documentation follow-ups (with the implementation, not before)
+## 9. Documentation follow-ups
 
-- `docs/` user guide: USB Mode row, patch load/export walkthrough, drive format
-  requirements (FAT32, MBR, ≤1 partition tested), unplug warning.
-- `CLAUDE.md` (this dir): USB mode mux + `0x1300` CSR + PAC-regen note; update the "no
-  export path" framing in the no-MIDI-TX gotcha once export lands.
-- `DESIGN.md`: add M6 to the milestone table.
+- `docs/` user guide: **done.** USB Mode row, patch load walkthrough (M6a), export
+  walkthrough (M6b), drive format requirements (FAT32, MBR, ≤1 partition tested), unplug
+  warnings for both load and export.
+- `CLAUDE.md` (this dir): **done.** USB mode mux + `0x1300` CSR + PAC-regen note (M6a); M6b
+  gotcha block (vendored `guh_msc`, write CSR contract, 8.3 filenames, missing live `BUSY`
+  indicator); the "no export path" framing in the no-MIDI-TX gotcha updated now that export
+  exists.
+- `DESIGN.md`: M6 (both halves) is in the milestone table (§7) as of M6a; not touched by this
+  checkpoint — see `DESIGN.md §7`'s own M6 entry for the up-to-date phrasing if it needs a
+  pass.
 
 ## 10. Reference pointers
 
 - Read stack (proven): `../sid_player_sw/top.py:61-270` (CSR periph + wiring),
   `../sid_player_sw/fw/src/{usb_msc,fat,partition,sid_scan}.rs`.
-- MSC engine to vendor/extend: `.venv/…/guh/engines/msc.py` (`SCSIBulkHost`, `USBMSCHost`).
+- MSC engine, read-only upstream: `.venv/…/guh/engines/msc.py` (`SCSIBulkHost`,
+  `USBMSCHost`) — read-only reference only, never edited.
+- MSC engine, vendored + write-extended (M6b): `src/vendor/guh_msc/msc.py` — the file
+  actually built; adds `data_dir`, `DATA-TX`, `WRITE_10`.
+- Write CSR peripheral: `src/tiliqua/usb_msc_csr.py` (`USBMSCPeripheral(with_write=True)`,
+  `tx_data`/`start_write` at offsets `0x20`/`0x24`); instantiated `../sid/top.py:539`.
 - MIDI host being displaced/muxed: `.venv/…/guh/engines/midi.py`; instantiation
   `../sid/top.py:607-644` (incl. the VBUS gating to change).
 - Patch/SysEx formats: `fw/src/sysex_capture.rs` (framing), `fw/src/patch_store.rs` (flash
   bank), `M4_USER_PATCH_BANKS.md §6b-c`.
-- Area/Fmax baseline: `build/mbsid-r5/top.tim` (19444/24288 COMB, 61.76 MHz).
+- Export firmware: `fw/src/usb_patch.rs` (`encode_syx`, `export_patch`); `fw/src/usb_msc.rs`
+  (`write_block`); `fw/src/fat.rs` (write-back sector cache).
+- Area/Fmax baseline: `build/mbsid-r5/top.tim` — pre-M6 19444/24288 COMB, 61.76 MHz; M6a-only
+  22127/24288 (91%), 66.41 MHz; M6a+M6b (this checkpoint) 22872/24288 (94%), 64.29 MHz, all
+  PASS at the 60 MHz target.
