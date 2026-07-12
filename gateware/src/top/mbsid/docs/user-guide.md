@@ -99,9 +99,70 @@ turn to change the value, press again to commit.
 | Program | 0–127; loading happens when you commit |
 | MIDI Src | `TRS` or `USB` — which physical MIDI input is live |
 | Save | write the currently loaded (possibly edited) patch into a User slot you pick — "save as"/duplicate semantics |
+| USB Mode | `MIDI` (default) or `Storage` — see [USB Mode: loading patches from a drive](#usb-mode-loading-patches-from-a-drive) |
 
-`MIDI Src` and the CV assignments persist across power cycles (written to
-flash a couple of seconds after you change them).
+`MIDI Src`, `USB Mode`, and the CV assignments persist across power cycles
+(written to flash a couple of seconds after you change them).
+
+## USB Mode: loading patches from a drive
+
+Tiliqua's USB-C port can host **either** a MIDI device **or** a USB thumb
+drive — never both at once, because it's one physical connector with one
+plugged device. The Main card's `USB Mode` row switches between them:
+
+- **MIDI** (default) — the port behaves as documented above: plug in a MIDI
+  keyboard/controller, it enumerates as a MIDI source.
+- **Storage** — the port instead hosts a USB drive for browsing and loading
+  `.syx` patch files. Switching to Storage mode:
+  - forces the live MIDI source to **TRS**, regardless of the `MIDI Src`
+    row's setting — TRS MIDI keeps working the whole time you're browsing,
+    so you can still play while you load patches;
+  - powers the port (VBUS) unconditionally, so a drive is recognized as
+    soon as it's plugged in;
+  - re-enumerates whatever's plugged in — switching back to MIDI mode later
+    re-enumerates a keyboard the same way.
+
+### Drive format requirements
+
+- **FAT32, MBR-partitioned** (or a bare FAT filesystem with no partition
+  table). Only the **first partition** is read; a drive with multiple
+  partitions only exposes the first one. exFAT and NTFS are not supported.
+  Use a drive fresh out of a normal "format as FAT32" from Windows/macOS/
+  Linux — no special tooling needed.
+- Patch files go in a **`/MBSID/`** directory at the drive's root — create
+  it and drop `.syx` files in. If no `/MBSID/` directory exists, the root
+  directory itself is scanned as a fallback, so a drive with `.syx` files
+  just dropped at the top level also works.
+- Any file whose SysEx body parses as an MBSID v2 single-patch dump is
+  accepted (the same format MIOS Studio use), plus bare 512-byte
+  raw patch files (exact size match, no SysEx wrapper).
+
+### Browsing and loading
+
+1. Set `USB Mode` to `Storage` on the Main card, plug in a drive.
+2. The Card selector gains a **Usb** card (only reachable in Storage mode)
+   with:
+   - **Drive** — status: `No drive`, `BUSY` (mounting/reading), or
+     `Ready (N files)`.
+   - **File** — scroll through the found `.syx`/raw-patch files by name.
+   - **Load>Slot** — same file, but also persists it into a User bank slot
+     you pick (like the Main card's Save row).
+3. Turn to the **File** row and press to enter it, scroll to the patch you
+   want, press again to commit — this **loads the patch into the engine
+   immediately** (audition only, same as an incoming SysEx RAM Write — it
+   is *not* saved anywhere until you use Load>Slot or the Main card's Save).
+4. To keep the patch, use **Load>Slot** instead: pick the file, then pick a
+   User slot the same way the Save row works — this loads it *and* writes
+   it into that flash slot, so it survives a power cycle and shows up in
+   the User bank afterwards.
+
+A patch loaded this way goes through the exact same engine entry point as
+a MIDI SysEx upload of the same bytes, so it sounds identical either way —
+there's no separate "USB patch" code path in the engine.
+
+Unplugging the drive at any point (mid-browse, mid-load) is safe: the
+`Drive` row falls back to `No drive`, the file list clears, and the menu
+never hangs waiting on a lost drive.
 
 ### CV Mod card
 
@@ -187,3 +248,5 @@ Practical notes:
 | SysEx dump from an editor stalls after the first patch | The editor is waiting for an ACK that never comes (no MIDI TX). Use scripted fire-and-forget sends |
 | My edits vanished | Loading any other patch (menu or MIDI Program Change) discards unsaved edits — the `*` was the warning. Save to a User slot first |
 | CV wiggling does nothing | Target set to Off; or Pitch assigned without Gate (both are needed for notes); or the change is below the 8-bit deadband |
+| `Drive` row stuck on `No drive` in Storage mode | Not FAT32/MBR-first-partition, or the drive needs more init time than a cheap flash stick — try a different drive; block size must be 512 bytes |
+| My MIDI keyboard stopped responding after I plugged in a drive | `USB Mode` is `Storage` — a plugged drive and a plugged MIDI device are mutually exclusive on the one USB-C port. Switch `USB Mode` back to `MIDI`, or play over TRS in the meantime (TRS stays live in Storage mode) |

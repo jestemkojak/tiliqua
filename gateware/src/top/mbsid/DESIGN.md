@@ -232,6 +232,19 @@ the `sync` critical path; M2 places SID #1 in that *same* domain — no new PLL/
   `M3_PATCH_BANKS.md` (all 128 factory patches selectable over MIDI Program Change).
   Writable user banks (flash), the on-device browse/save UI, and MIDI SysEx patch
   upload are also **done** — see `M4_USER_PATCH_BANKS.md`.
+- **M5 — menu cards + CV modulation + on-device patch edit.** **Done** — three menu
+  cards (Main/CV Mod/Edit), four CV inputs assignable to knobs/parSet targets/a
+  pitch+gate note machine, and live Lead-patch parameter editing. See
+  `M5_MENU_CARDS_CV_MOD.md`.
+- **M6 — USB mass-storage patch load/export.** **M6a (read-only load) done** — browse
+  `.syx` patch files on a FAT-formatted USB drive from the menu, load = audition,
+  Load→Slot = audition + persist to a User bank slot. Gateware adds a second USB host
+  engine (`USBMSCHost`) behind a UTMI mux alongside the existing `USBMIDIHost`, muxed
+  by a CSR mode bit (Option A from the feasibility investigation — fit without needing
+  the shared-enumerator fallback). **M6b (export/write to USB) is spec-only**, not yet
+  implemented — writing needs a vendored/extended `guh` MSC engine (SCSI WRITE(10) +
+  bulk-OUT), unlike M6a which was pure reuse of read-only infrastructure already
+  proven in `top/sid_player_sw`. See `M6_USB_STORAGE.md`.
 - **Wave-sequencer / full MBSID UI** (the macro_osc `opts`/`ui`/`draw` pattern is the model).
 - **ASID** (`MbSidAsid` — currently excluded from the Lead subset, §3).
 
