@@ -4,17 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-07-03): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented, hardware bring-up pending for all of the above.**
+**Status (2026-07-12): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented; M6a USB mass-storage patch load (read-only) implemented — dual USB engines (MIDI host + MSC host) behind a UTMI mux, browse/load from a FAT USB drive from the menu (`M6_USB_STORAGE.md`) — M6b (export/write) is spec only. Hardware bring-up pending for all of the above.**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `docs/` holds the narrative documentation set (user guide, architecture, developer
 guide, limitations, extending) — update the relevant page when a feature lands.
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
 Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
-host `cargo test --lib` (86/86, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter), full
-bitstream build, `sync` Fmax 61.76 MHz PASS. The one thing NOT yet validated is **playback
-and the M4 SysEx/user-bank flows on real hardware** (DESIGN §7 milestones 2–3;
-`M4_USER_PATCH_BANKS.md §7` hardware checklist).
+host `cargo test --lib` (110/110, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
+`usb_patch`/FAT-fixture/menu Usb-card coverage), full bitstream build with the M6a USB engine
++ mux included, `sync` Fmax 66.41 MHz PASS (60 MHz target), 22127/24288 (91%) `TRELLIS_COMB`
+(`build/mbsid-r5/top.tim`) — post-route Fmax swings several MHz build-to-build on
+placement-seed noise alone (root `CLAUDE.md`), so treat this exact number as a snapshot, not
+a promise. The one thing NOT yet validated is **playback and the M4 SysEx/user-bank and M6a USB-drive flows
+on real hardware** (DESIGN §7 milestones 2–3; `M4_USER_PATCH_BANKS.md §7`,
+`M6_USB_STORAGE.md`'s hardware checklist).
 
 ## Vendored engine (not in this repo)
 
@@ -176,6 +180,49 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **`sysex_read` was the first CSR change since M2's `phi2_sel`** — touching
   `SIDPeripheral` registers again needs `pdm mbsid build --pac-only` before `--fw-only`,
   same as any other CSR change (root `CLAUDE.md`).
+- **M6a: USB mass-storage patch load (`M6_USB_STORAGE.md`).** New `usb_msc` CSR block
+  at **`0x1300`** (`0x1000`/`0x1200` are the two `SIDPeripheral`s), built with
+  `USBMSCPeripheral(with_mode=True)` (`src/tiliqua/usb_msc_csr.py`) — this is another
+  CSR change, needs `pdm mbsid build --pac-only` before `--fw-only`. The mode bit lives
+  at register offset **`0x1C`** (`mode`, bit 0 = storage), read in gateware as
+  `usb_msc.mode_o` and driven by firmware's `usb_msc.set_mode(state.usb_storage)`
+  (`fw/src/main.rs:610`).
+  - **Option A shape, confirmed at 25F scale (`../sid/top.py:629-690`):** one
+    `UTMITranslator` owns the physical ULPI PHY; `USBMIDIHost` and `USBMSCHost` are both
+    instantiated with `bus=None` (raw `UTMIInterface` records) and each wrapped in its
+    own `ResetInserter({"usb": ...})` keyed off `storage_mode` (one term per engine, so
+    exactly one is out of reset at a time — a mode flip re-enumerates the newly-selected
+    engine from scratch, composing with each engine's own watchdog reset). PHY→engine
+    signals fan out to both (harmless — the parked engine is in reset); engine→PHY
+    signals are `Mux(storage_mode, msc_utmi.x, midi_utmi.x)` per wire. This is the
+    "two engines + mux" option the plan called Option A, not the shared-enumerator
+    Option B fallback — it fit without an Fmax fallback being needed.
+  - **Storage mode forces TRS MIDI + VBUS always on.** `with_usb_msc=True` makes
+    `vbus_o` combinationally `1` unconditionally (`../sid/top.py:696-699` — a thumb
+    drive needs bus power even though `usb_midi_host=0`); the M5-inherited USB/TRS
+    source mux (`sid_periph.usb_midi_host` CSR bit) is untouched in gateware, but
+    firmware only ever sets it when **not** in storage mode
+    (`sid.usb_midi_host().write(... && !state.usb_storage)`, `main.rs:606-608`) — so
+    entering Storage mode silently falls back to TRS as the live MIDI source, and TRS
+    keeps working the whole time (the ISR/register-write path is untouched by USB mode).
+  - **Mount-per-op, no held `FileSystem` lifetime** (`fw/src/main.rs`'s `with_fat`
+    helper, the `sid_player_sw` idiom): every USB menu action (list, load, load→slot)
+    calls `with_fat(&usb_msc, |fs| ...)`, which constructs a fresh `MscStorage` +
+    `FileSystem::new` and drops it when the closure returns. Nothing holds a `FileSystem`
+    across loop iterations, so a drive yanked mid-browse can't leave a dangling mount —
+    the next op's `FileSystem::new` just fails and returns `None`. Costs a few extra
+    512-byte block reads (BPB + root dir) per action; patch files are tiny so this is
+    cheap.
+  - **M5-lesson-shaped per-iteration resync, load-bearing here too**
+    (`fw/src/main.rs`'s main loop, ~line 463 on): `drive_ready` is recomputed every
+    iteration from live state (`state.usb_storage && usb_msc.ready() && block_size() ==
+    512`), and both directions are handled unconditionally, not just on a menu event —
+    losing the drive (or leaving Storage mode) collapses `Card::Usb` back to `Card::Main`
+    and clears the cached file list in the same iteration it's detected, and a
+    newly-ready drive triggers the directory scan the same way. Same shape as the M5
+    `lead_loaded` bug: deriving `Card::Usb`'s validity only from menu navigation events
+    (instead of every iteration) would let a stale file list survive an unplug until the
+    user happened to turn the encoder again.
 - **Menu rendering is a blit-diff, never a background fill.** Rectangle fills
   are NOT hardware-accelerated (per-pixel via the pixel_plot FIFO, ~93k CSR
   writes for the old full-box clear — scanout films it as a top-to-bottom
