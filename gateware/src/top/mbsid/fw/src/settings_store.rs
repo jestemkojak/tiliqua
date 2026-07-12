@@ -1,21 +1,22 @@
 //! Persisted menu settings (M5_MENU_CARDS_CV_MOD.md §6d): one 16-byte record
 //! in the option-storage flash window (`manifest.get_option_storage_window()`).
-//! Layout: "MBS5" | version | midi_src | cv_targets[4] | reserved[5] | chk.
+//! Layout: "MBS5" | version | midi_src | cv_targets[4] | usb_mode | reserved[4] | chk.
 //! chk = two's-complement byte making the whole record sum to 0 (mod 256) —
 //! same family as patch_store's payload checksum. Any validation failure
-//! loads defaults (TRS, all CV Off). Saves are debounced by the caller and
+//! loads defaults (TRS, all CV Off, MIDI). Saves are debounced by the caller and
 //! skipped when the stored record is already identical (flash wear).
 
 use tiliqua_hal::nor_flash::{NorFlash, ReadNorFlash};
 
 const MAGIC: [u8; 4] = *b"MBS5";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;   // v2 adds usb_mode (M6); v1 records still decode.
 pub const RECORD_LEN: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Settings {
     pub midi_src: u8,        // 0 = TRS, 1 = USB
     pub cv_targets: [u8; 4], // CvTarget::to_u8 encoding
+    pub usb_mode: u8,        // 0 = MIDI, 1 = Storage (M6)
 }
 
 pub fn encode(s: &Settings) -> [u8; RECORD_LEN] {
@@ -24,17 +25,20 @@ pub fn encode(s: &Settings) -> [u8; RECORD_LEN] {
     r[4] = VERSION;
     r[5] = s.midi_src;
     r[6..10].copy_from_slice(&s.cv_targets);
+    r[10] = s.usb_mode;
     let sum: u8 = r[..15].iter().fold(0u8, |a, &b| a.wrapping_add(b));
     r[15] = sum.wrapping_neg();
     r
 }
 
 pub fn decode(r: &[u8; RECORD_LEN]) -> Option<Settings> {
-    if r[0..4] != MAGIC || r[4] != VERSION { return None; }
+    if r[0..4] != MAGIC || !(r[4] == 1 || r[4] == 2) { return None; }
     if r.iter().fold(0u8, |a, &b| a.wrapping_add(b)) != 0 { return None; }
     let mut cv = [0u8; 4];
     cv.copy_from_slice(&r[6..10]);
-    Some(Settings { midi_src: r[5], cv_targets: cv })
+    // v1 records carry reserved-zero at byte 10, so reading it as usb_mode
+    // is exactly the intended "old records default to MIDI" behavior.
+    Some(Settings { midi_src: r[5], cv_targets: cv, usb_mode: r[10] & 1 })
 }
 
 pub fn load<F: ReadNorFlash>(flash: &mut F, base: u32) -> Settings {
@@ -111,13 +115,13 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let s = Settings { midi_src: 1, cv_targets: [0, 3, 11, 12] };
+        let s = Settings { midi_src: 1, cv_targets: [0, 3, 11, 12], usb_mode: 0 };
         assert_eq!(decode(&encode(&s)), Some(s));
     }
 
     #[test]
     fn corrupt_records_rejected() {
-        let s = Settings { midi_src: 1, cv_targets: [1, 2, 3, 4] };
+        let s = Settings { midi_src: 1, cv_targets: [1, 2, 3, 4], usb_mode: 0 };
         let good = encode(&s);
         let mut bad_magic = good; bad_magic[0] ^= 0xFF;
         assert_eq!(decode(&bad_magic), None);
@@ -137,11 +141,38 @@ mod tests {
     #[test]
     fn save_then_load_and_identical_save_skips_erase() {
         let mut f = MockFlash::new();
-        let s = Settings { midi_src: 1, cv_targets: [12, 11, 0, 0] };
+        let s = Settings { midi_src: 1, cv_targets: [12, 11, 0, 0], usb_mode: 0 };
         save(&mut f, 0, &s).unwrap();
         assert_eq!(load(&mut f, 0), s);
         let erases_before = f.erase_count;
         save(&mut f, 0, &s).unwrap(); // identical: must not erase again
         assert_eq!(f.erase_count, erases_before);
+    }
+
+    #[test]
+    fn v2_roundtrip_with_usb_mode() {
+        let s = Settings { midi_src: 1, cv_targets: [0, 3, 11, 12], usb_mode: 1 };
+        assert_eq!(decode(&encode(&s)), Some(s));
+    }
+
+    #[test]
+    fn v1_record_decodes_with_usb_mode_default() {
+        // A v1 record as M5 wrote it: version byte 1, byte 10 reserved-zero.
+        let s = Settings { midi_src: 1, cv_targets: [1, 2, 3, 4], usb_mode: 0 };
+        let mut r = encode(&s);
+        r[4] = 1; // rewrite as v1
+        let sum: u8 = r[..15].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        r[15] = sum.wrapping_neg();
+        assert_eq!(decode(&r), Some(s)); // decodes, usb_mode defaults to 0
+    }
+
+    #[test]
+    fn unknown_version_rejected() {
+        let s = Settings::default();
+        let mut r = encode(&s);
+        r[4] = 3;
+        let sum: u8 = r[..15].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        r[15] = sum.wrapping_neg();
+        assert_eq!(decode(&r), None);
     }
 }
