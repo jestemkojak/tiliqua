@@ -536,7 +536,7 @@ class SIDSoc(TiliquaSoc):
             # USB mass-storage CSR block (M6). 0x1300: 0x1000/0x1200 taken by
             # the two SIDPeripherals. with_mode adds the MIDI/Storage mux bit.
             from tiliqua.usb_msc_csr import USBMSCPeripheral
-            self.usb_msc = USBMSCPeripheral(with_mode=True)
+            self.usb_msc = USBMSCPeripheral(with_mode=True, with_write=True)
             self.csr_decoder.add(self.usb_msc.bus, addr=0x1300, name="usb_msc")
 
         # Now finalize the CSR bridge
@@ -673,9 +673,20 @@ class SIDSoc(TiliquaSoc):
                                                getattr(midi_utmi, name)))
 
                 # MSC engine <-> CSR peripheral (same wiring as
-                # sid_player_sw/top.py:258-268).
+                # sid_player_sw/top.py:258-268), plus the M6b write path
+                # (Task 12): tx_data_o feeds msc.tx_data, and start_write_o
+                # sets a write_pending latch driving msc.cmd.write. cmd.write
+                # must already be valid ON the start cycle (the strobe cycle
+                # itself), so it's start_write_o | write_pending, not
+                # write_pending alone (which would be one cycle late).
                 m.submodules.usb_msc = self.usb_msc
                 wiring.connect(m, msc.rx_data, self.usb_msc.rx_data)
+                wiring.connect(m, self.usb_msc.tx_data_o, msc.tx_data)
+                write_pending = Signal()
+                with m.If(self.usb_msc.start_write_o):
+                    m.d.sync += write_pending.eq(1)
+                with m.If(self.usb_msc.start_o):
+                    m.d.sync += write_pending.eq(0)
                 m.d.comb += [
                     self.usb_msc.status_i.connected.eq(msc.status.connected),
                     self.usb_msc.status_i.ready.eq(msc.status.ready),
@@ -683,7 +694,8 @@ class SIDSoc(TiliquaSoc):
                     self.usb_msc.status_i.block_size.eq(msc.status.block_size),
                     self.usb_msc.status_i.block_count.eq(msc.status.block_count),
                     msc.cmd.lba.eq(self.usb_msc.lba_o),
-                    msc.cmd.start.eq(self.usb_msc.start_o),
+                    msc.cmd.start.eq(self.usb_msc.start_o | self.usb_msc.start_write_o),
+                    msc.cmd.write.eq(self.usb_msc.start_write_o | write_pending),
                     self.usb_msc.resp_i.done.eq(msc.resp.done),
                     self.usb_msc.resp_i.error.eq(msc.resp.error),
                 ]
