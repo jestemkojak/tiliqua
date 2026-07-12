@@ -52,10 +52,10 @@ pdm mbsid build --pac-only       # regenerate Rust PAC from SVD
   `build/mbsid-r5/top.tim` (~line 1390+); the first occurrence is the
   pre-route estimate. On a PASS the post-route line is `Info:`, on a FAIL
   it's `Warning:` — distinguish by order, not by the tag. Current
-  reference (post-M6a, with the USB-MSC engine + mux included): `sync`
-  66.41 MHz PASS (60 MHz target), 22127/24288 (91%) `TRELLIS_COMB`. This
-  number swings several MHz build-to-build on placement-seed noise alone —
-  treat it as a snapshot, not a promise.
+  reference (post-M6, with the USB-MSC engine + mux **and** the M6b write
+  leg included): `sync` 64.29 MHz PASS (60 MHz target), 22872/24288 (94%)
+  `TRELLIS_COMB`. This number swings several MHz build-to-build on
+  placement-seed noise alone — treat it as a snapshot, not a promise.
 
 ## Flashing
 
@@ -78,9 +78,10 @@ cd gateware/src/top/mbsid/fw
 cargo test --target x86_64-unknown-linux-gnu --lib
 ```
 
-110 tests: regdiff, patch store, SysEx capture, menu state machine, frame
-diff/painter, param encodings, CV quantizer, USB patch list/load
-(`usb_patch`, FAT-image fixtures) and the menu's USB card. The `riscv32`
+118 tests: regdiff, patch store, SysEx capture, menu state machine, frame
+diff/painter, param encodings, CV quantizer, USB patch list/load/export
+(`usb_patch`: `encode_syx`/`export_patch` round-trip, FAT-image fixtures)
+and the menu's USB card (including the M6b `Export` row). The `riscv32`
 FFI is cfg-stubbed on host. Note: you must pass the explicit host
 target — the crate's default target is `riscv32im`.
 
