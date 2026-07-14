@@ -30,6 +30,16 @@ bank ships in the bitstream.
    browse the factory bank with the encoder. See the channel map below for which
    MIDI channels each engine listens on.
 
+   > **The USB-C MIDI port is a *host* port, not a device port.** Tiliqua powers
+   > and enumerates devices plugged *into it* (keyboards, controllers). It will
+   > never show up in a PC's `lsusb`/`amidi -l`, and a plain PC↔Tiliqua USB cable
+   > carries no MIDI in either direction (two hosts can't enumerate each other) —
+   > this is by design. To send MIDI/SysEx from a PC, use **TRS**: a
+   > class-compliant USB-MIDI interface on the PC with a TRS/MIDI cable into
+   > Tiliqua's MIDI-in jack. (If your PC does detect *something* when cabled to
+   > Tiliqua, that's the separate debug-USB serial console, not MIDI.) See
+   > `docs/limitations.md` for details.
+
 ---
 
 ## Sound engines & MIDI channels
