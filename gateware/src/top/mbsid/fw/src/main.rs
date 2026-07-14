@@ -435,6 +435,7 @@ fn main() -> ! {
     let usb_msc = tiliqua_fw::usb_msc::UsbMsc::new(peripherals.USB_MSC);
     let mut usb_files: usb_patch::FileList = usb_patch::FileList::new();
     let mut usb_listed = false;
+    let mut msc_keepalive_at: u32 = 0;
 
     handler!(timer0 = || timer0_handler(&app));
 
@@ -476,6 +477,25 @@ fn main() -> ! {
             }
             let drive_ready = state.usb_storage && usb_msc.ready()
                 && usb_msc.block_size() == 512;
+            // Idle keepalive: the MSC engine's watchdog (vendor msc.py,
+            // _WATCHDOG_CYCLES = 10 s) is only fed by a *completed* SCSI
+            // command and keeps counting in the READY state, so an idle
+            // drive gets the whole USB engine reset + re-enumerated every
+            // 10 s (menu flickers Ready -> No drive -> Ready). That reset
+            // is also the only unplug detection the enumerator has, so
+            // instead of silencing it in gateware we feed it: read one
+            // block every couple of seconds while ready. A failed read
+            // (drive yanked) is deliberately ignored -- the watchdog then
+            // fires as designed and `ready` drops.
+            if drive_ready {
+                const MSC_KEEPALIVE_MS: u32 = 2000;
+                let now = now_ms(&app);
+                if now.wrapping_sub(msc_keepalive_at) >= MSC_KEEPALIVE_MS {
+                    msc_keepalive_at = now;
+                    let mut scratch = [0u8; 512];
+                    let _ = usb_msc.read_block(0, &mut scratch);
+                }
+            }
             if !drive_ready && usb_listed {
                 usb_listed = false;           // drive unplugged / mode left
                 usb_files.clear();
