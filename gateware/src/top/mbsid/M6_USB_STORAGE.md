@@ -281,6 +281,14 @@ drive containing a few `.syx` files under `/MBSID/`:
 - [ ] **Drive enumerates.** Switch `USB Mode` to `Storage`, plug in the drive, open the
   `Usb` card. `Drive` row goes `No drive` → (briefly `BUSY`) → `Ready (N files)` with `N`
   matching the number of `.syx`/512-byte files actually on the drive.
+- [ ] **Drive stays Ready while idle (≥ 30 s).** First real-hardware bug (2026-07-14): the
+  MSC engine's 10 s watchdog is only fed by a completed SCSI command and keeps counting in
+  its `READY` state (inherited from stock `guh`, not an M6b regression), so an idle drive
+  was hard-reset + re-enumerated every 10 s (`Ready` → `No drive` → scanning → `Ready`
+  loop). Fixed firmware-side: `main.rs` reads LBA 0 every 2 s while `drive_ready`
+  (keepalive), chosen over silencing the watchdog in gateware because the watchdog reset is
+  the *only* unplug detection the enumerator has (`enumerated` is set once, never cleared).
+  Leave the `Usb` card open and untouched for 30+ s — `Drive` must stay `Ready`.
 - [ ] **Files listed correctly.** Scroll the `File` row through all `N` entries; names match
   the files on the drive (spot-check a few, including one in `/MBSID/` and, if tested, one
   falling back to the root-dir scan).
