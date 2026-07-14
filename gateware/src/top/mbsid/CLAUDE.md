@@ -230,6 +230,19 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     `lead_loaded` bug: deriving `Card::Usb`'s validity only from menu navigation events
     (instead of every iteration) would let a stale file list survive an unplug until the
     user happened to turn the encoder again.
+  - **An idle-but-ready drive needs a firmware keepalive — don't remove it.** The MSC
+    engine's 10 s watchdog (`src/vendor/guh_msc/msc.py`, `_WATCHDOG_CYCLES`, inherited
+    from stock `guh`) is only fed by a *completed* SCSI command and keeps counting in the
+    `READY` state, so with no keepalive an idle drive is hard-reset + re-enumerated every
+    10 s (`Ready` → `No drive` → `Ready` menu loop — first bug found in M6 hardware
+    bring-up, 2026-07-14). `main.rs` reads LBA 0 every 2 s while `drive_ready`. Don't
+    "fix" this by clearing the watchdog in the gateware `READY` state instead: the
+    watchdog reset is the only unplug detection there is (the `guh` enumerator's
+    `enumerated` flag is set once and never cleared), and the keepalive preserves it — a
+    yanked drive fails the poll, the watchdog fires as designed, `ready` drops. Note
+    `sid_player_sw` shares the stock engine and likely idles into the same 10 s
+    reset cycle on hardware; it just never surfaced (its UI doesn't live-render drive
+    state the way the mbsid `Usb` card does).
 - **M6b: USB patch export (write) — `M6_USB_STORAGE.md §4b/§6`.** Adds a SCSI
   WRITE(10) + bulk-OUT data path to the `guh` MSC host, a TX CSR block on
   `USBMSCPeripheral`, and the fat write-back cache + `export_syx` firmware flow. Landed
