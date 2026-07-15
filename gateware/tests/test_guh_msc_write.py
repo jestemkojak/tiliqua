@@ -166,6 +166,51 @@ def _failing_csw():
 
 class GuhMscWriteTests(unittest.TestCase):
 
+    def test_read_byte_diagnostic_saturates_at_1023(self):
+        """The 10-bit live diagnostic clamps instead of wrapping when the
+        functional transport counter accepts a 1024th byte."""
+        m, dut, stub = _build()
+
+        async def tb(ctx):
+            sie = _Sie(dut, stub)
+            await sie.to_idle_and_start(
+                ctx, data_dir=0, opcode=SCSIOpCode.READ_10, data_len=1024)
+            await sie.expect_out(ctx, TransferResponse.ACK, [])
+            for _ in range(16):
+                await sie.do_in(ctx, [0xA5] * 64, TransferResponse.ACK)
+            self.assertEqual(ctx.get(dut.rx_bytes_o), 0x3FF)
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6, domain="usb")
+        sim.add_testbench(tb)
+        sim.run()
+
+    def test_read_byte_diagnostic_resets_on_command_start(self):
+        """A new command clears the prior byte count before its CBW is ACKed."""
+        m, dut, stub = _build()
+
+        async def tb(ctx):
+            sie = _Sie(dut, stub)
+            await sie.to_idle_and_start(
+                ctx, data_dir=0, opcode=SCSIOpCode.READ_10, data_len=1)
+            await sie.expect_out(ctx, TransferResponse.ACK, [])
+            await sie.do_in(ctx, [0xA5], TransferResponse.ACK)
+            await sie.do_in(ctx, _passing_csw(), TransferResponse.ACK)
+            self.assertEqual(ctx.get(dut.rx_bytes_o), 1)
+
+            ctx.set(dut.cmd.start, 1)
+            ctx.set(dut.cmd.data_len, 1)
+            ctx.set(dut.cmd.data_dir, 0)
+            ctx.set(dut.cmd.stream_data, 0)
+            ctx.set(dut.cmd.cdb.cdb10.opcode, SCSIOpCode.READ_10)
+            await sie.tick(ctx)
+            self.assertEqual(ctx.get(dut.rx_bytes_o), 0)
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6, domain="usb")
+        sim.add_testbench(tb)
+        sim.run()
+
     def test_write_cbw_fields(self):
         """(1) A write command emits a 31-byte CBW: flags=0x00 (DATA_OUT),
         opcode=0x2A (WRITE_10), LBA big-endian 11 22 33 44."""
