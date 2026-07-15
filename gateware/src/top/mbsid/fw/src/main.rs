@@ -347,6 +347,37 @@ fn main() -> ! {
     let sysclk = pac::clock::sysclk();
     let mut timer = Timer0::new(peripherals.TIMER0, sysclk);
 
+    // --- TEMPORARY stack-paint probe (M6_USB_STORAGE.md §7a's last hardware
+    // checklist item) --------------------------------------------------------
+    // mbsid has no logger/UI wiring (unlike sid_player_sw's
+    // `handlers::logger_init`) — this bypasses that entirely and just talks
+    // to UART0 directly, matching the throwaway technique root CLAUDE.md's
+    // RAM-budget gotcha describes and M4 already used once (measured
+    // 4016/25824 B; that probe was never committed, see CLAUDE.md/
+    // M4_USER_PATCH_BANKS.md §6f). Paint the region between the end of .bss
+    // and the current stack pointer with a sentinel byte; the main loop below
+    // scans for the high-water mark and logs new peaks. Remove this whole
+    // block (and its main-loop counterpart, search "end TEMPORARY") once the
+    // hardware number is recorded in M6_USB_STORAGE.md §7a.
+    let mut stack_probe_serial = Serial0::new(peripherals.UART0);
+    unsafe {
+        extern "C" {
+            static _eheap: u8;
+            static _stack_start: u8;
+        }
+        let low = &_eheap as *const u8 as usize;
+        let sp: usize;
+        core::arch::asm!("mv {0}, sp", out(reg) sp);
+        // Leave a safety margin below the live call frame so we don't
+        // clobber locals `main()` has already pushed getting here.
+        let paint_until = sp.saturating_sub(256);
+        if paint_until > low {
+            core::ptr::write_bytes(low as *mut u8, 0xAA, paint_until - low);
+        }
+    }
+    core::fmt::Write::write_str(&mut stack_probe_serial, "\r\nstack-paint probe armed\r\n").ok();
+    // --- end TEMPORARY (probe continues in the main loop below) -------------
+
     // Engine bring-up + boot patch (unchanged).
     mbsid_sys::init();
     mbsid_sys::program_change(BOOT_PATCH_INDEX);
@@ -439,12 +470,47 @@ fn main() -> ! {
 
     handler!(timer0 = || timer0_handler(&app));
 
+    // TEMPORARY stack-paint probe state (see the block at the top of main()
+    // for why this exists / how to remove it).
+    let mut stack_probe_max: usize = 0;
+    let mut stack_probe_ctr: u32 = 0;
+    // TEMPORARY M6b diag: last-seen MSC status for transition logging.
+    let mut usb_diag_last: (bool, bool, u16) = (false, false, 0);
+
     irq::scope(|s| {
         s.register(Interrupt::TIMER0, timer0);
         timer.enable_tick_isr(TIMER0_ISR_PERIOD_MS, pac::Interrupt::TIMER0);
 
         let mut dirty = true; // draw once on startup
         loop {
+            // --- TEMPORARY stack-paint probe: scan every 64 iterations (a
+            // full-region byte scan every iteration would be wasteful for a
+            // menu-driven loop) and log only when the high-water mark grows.
+            stack_probe_ctr = stack_probe_ctr.wrapping_add(1);
+            if stack_probe_ctr % 64 == 0 {
+                unsafe {
+                    extern "C" {
+                        static _eheap: u8;
+                        static _stack_start: u8;
+                    }
+                    let low = &_eheap as *const u8 as usize;
+                    let high = &_stack_start as *const u8 as usize;
+                    let mut addr = low;
+                    while addr < high && *(addr as *const u8) == 0xAA {
+                        addr += 1;
+                    }
+                    let used = high - addr;
+                    if used > stack_probe_max {
+                        stack_probe_max = used;
+                        let mut msg: heapless::String<48> = heapless::String::new();
+                        let _ = core::fmt::Write::write_fmt(&mut msg,
+                            format_args!("stack peak: {} / {} B\r\n", used, high - low));
+                        core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
+                    }
+                }
+            }
+            // --- end TEMPORARY --------------------------------------------
+
             encoder.update();
             let ticks = encoder.poke_ticks();
             let pressed = encoder.poke_btn();
@@ -477,6 +543,25 @@ fn main() -> ! {
             }
             let drive_ready = state.usb_storage && usb_msc.ready()
                 && usb_msc.block_size() == 512;
+            // --- TEMPORARY M6b diag: log MSC status transitions over UART0.
+            // A watchdog reset / re-enumeration cycle shows up here as
+            // conn/rdy flapping; steady state should print once and go quiet
+            // (constant drive-LED blinking otherwise unexplained).
+            {
+                let snap = (usb_msc.connected(), usb_msc.ready(),
+                            usb_msc.block_size());
+                if snap != usb_diag_last {
+                    usb_diag_last = snap;
+                    let mut msg: heapless::String<80> = heapless::String::new();
+                    let _ = core::fmt::Write::write_fmt(&mut msg,
+                        format_args!("usb: conn={} rdy={} bs={} spd={} t={}ms\r\n",
+                            snap.0 as u8, snap.1 as u8, snap.2,
+                            usb_msc.speed(), now_ms(&app)));
+                    core::fmt::Write::write_str(
+                        &mut stack_probe_serial, msg.as_str()).ok();
+                }
+            }
+            // --- end TEMPORARY --------------------------------------------
             // Idle keepalive: the MSC engine's watchdog (vendor msc.py,
             // _WATCHDOG_CYCLES = 10 s) is only fed by a *completed* SCSI
             // command and keeps counting in the READY state, so an idle
@@ -565,6 +650,13 @@ fn main() -> ! {
                                                &mut state, &mut user_detail));
                     }
                     PressResult::UsbExport { source } => {
+                        // Re-enabled 2026-07-14 after the drive-corruption
+                        // incident was root-caused and fixed (payload-less
+                        // WRITE(10) from the CSR TX-FIFO flush-on-strobe; now
+                        // strobe-then-fill + deferred engine start, see
+                        // M6_USB_STORAGE.md's incident writeup). Hardware
+                        // validation per §7b: DISPOSABLE MEDIA ONLY until the
+                        // checklist passes.
                         let (slot, got) = match source {
                             menu::ExportSource::Edit => {
                                 critical_section::with(|_cs| {
@@ -583,9 +675,81 @@ fn main() -> ! {
                                 core::fmt::Write::write_fmt(&mut fname,
                                     format_args!("P{:03}.SYX", n)),
                         };
+                        // --- TEMPORARY M6b diag: stage-level export trace ---
+                        let d = &usb_msc.diag;
+                        d.begin();   // capture FIRST failure of this attempt
+                        let snap0 = (d.rd.get(), d.rd_err.get(), d.wr.get(),
+                                     d.wr_ok.get(), d.wr_notready.get(),
+                                     d.wr_resp_err.get(), d.wr_timeout.get());
+                        {
+                            let mut msg: heapless::String<96> = heapless::String::new();
+                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                                format_args!(
+                                    "export: begin {} got={} rdy={} conn={} bs={}\r\n",
+                                    fname, got as u8, usb_msc.ready() as u8,
+                                    usb_msc.connected() as u8, usb_msc.block_size()));
+                            core::fmt::Write::write_str(
+                                &mut stack_probe_serial, msg.as_str()).ok();
+                        }
+                        let mounted = core::cell::Cell::new(false);
                         let ok = got && with_fat(&usb_msc, |fs| {
+                            mounted.set(true);
                             usb_patch::export_patch(fs, &fname, &patch_buf, slot)
                         }).unwrap_or(false);
+                        {
+                            let mut msg: heapless::String<320> = heapless::String::new();
+                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                                format_args!(
+                                    "export: ok={} mount={} d_rd={} d_rderr={} d_wr={} \
+                                     d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} spins={}\r\n",
+                                    ok as u8, mounted.get() as u8,
+                                    d.rd.get().wrapping_sub(snap0.0),
+                                    d.rd_err.get().wrapping_sub(snap0.1),
+                                    d.wr.get().wrapping_sub(snap0.2),
+                                    d.wr_ok.get().wrapping_sub(snap0.3),
+                                    d.wr_notready.get().wrapping_sub(snap0.4),
+                                    d.wr_resp_err.get().wrapping_sub(snap0.5),
+                                    d.wr_timeout.get().wrapping_sub(snap0.6),
+                                    d.wr_spins_last.get()));
+                            let (cs, cr) = d.wr_csw.get();
+                            let (rr, rp, rt, rn, rl) = d.wr_reject.get();
+                            let (fcs, fcr) = d.wr_csw_first.get();
+                            let (frr, frp, frt, frn, frl) = d.wr_reject_first.get();
+                            let (sv, sk, sa, sq) = usb_msc.sense_info();
+                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                                format_args!(
+                                    "export: first csw={}/{} rej={}/{}/{} ny={} lph={} \
+                                     last csw={}/{} rej={}/{}/{} ny={} lph={}\r\n\
+                                     export: sense valid={} key={:x} asc={:02x} ascq={:02x}\r\n",
+                                    fcs, fcr, frr, frp, frt, frn, frl,
+                                    cs, cr, rr, rp, rt, rn, rl,
+                                    sv as u8, sk, sa, sq));
+                            core::fmt::Write::write_str(
+                                &mut stack_probe_serial, msg.as_str()).ok();
+                        }
+                        {
+                            // Round-six read-failure diag: reason 1=notready
+                            // 2=resp_err 3=spin_timeout, at word w of lba,
+                            // after sp spins; rej/ny/lph = reject_info CSR
+                            // snapshot at the failure.
+                            let (r1, w1, l1, s1, rr1, rp1, n1, p1) =
+                                d.rd_fail_first.get();
+                            let (r2, w2, l2, s2, rr2, rp2, n2, p2) =
+                                d.rd_fail.get();
+                            let mut msg: heapless::String<256> =
+                                heapless::String::new();
+                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                                format_args!(
+                                    "export: rd1 rsn={} w={} lba={} sp={} \
+                                     rej={}/{} ny={} lph={}\r\n\
+                                     export: rdL rsn={} w={} lba={} sp={} \
+                                     rej={}/{} ny={} lph={}\r\n",
+                                    r1, w1, l1, s1, rr1, rp1, n1, p1,
+                                    r2, w2, l2, s2, rr2, rp2, n2, p2));
+                            core::fmt::Write::write_str(
+                                &mut stack_probe_serial, msg.as_str()).ok();
+                        }
+                        // --- end TEMPORARY ----------------------------------
                         let mut s: heapless::String<24> = heapless::String::new();
                         let _ = if ok {
                             core::fmt::Write::write_fmt(&mut s,

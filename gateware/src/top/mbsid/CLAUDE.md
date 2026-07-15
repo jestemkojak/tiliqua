@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-07-12): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented; M6 USB mass-storage patch load/export implemented end-to-end — dual USB engines (MIDI host + MSC host) behind a UTMI mux; M6a (read) browses/loads `.syx` files from a FAT USB drive from the menu; M6b (write) exports the live EDIT buffer or any User-bank slot as a standard MBSID SysEx `.syx` file back to the drive (`M6_USB_STORAGE.md`). This closes out the whole M6 plan — code-complete and host/sim/timing-verified. Hardware bring-up pending for all of the above (M1–M6 alike).**
+**Status (2026-07-14): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented; M6a (USB read/load) hardware-verified and working. M6b (USB write/export): first real-hardware exercise (2026-07-14) corrupted a test drive's GPT partition table and FAT32 boot sector; **root-caused the same day and fixed in gateware, sim-verified** (the CSR TX FIFO's flush-on-start_write erased the just-loaded payload, so every WRITE(10) went out payload-less and desynced the drive's bulk-only transport — fix: strobe-then-fill contract + engine start deferred until all 128 words are banked, `usb_msc_csr.py` + `fw/src/usb_msc.rs`, regression tests in `tests/test_usb_msc_csr.py`). The `Export` path is re-enabled in firmware for hardware validation — `M6_USB_STORAGE.md` §7b's checklist must pass on **disposable media only** before trusting it near real data. See `M6_USB_STORAGE.md`'s incident writeup + root cause and §8 risk table.**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `docs/` holds the narrative documentation set (user guide, architecture, developer
 guide, limitations, extending) — update the relevant page when a feature lands.
@@ -14,7 +14,7 @@ Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksu
 host `cargo test --lib` (118/118, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
 `usb_patch`/FAT-fixture/menu Usb-card coverage, `export_patch`/encode_syx round-trip), full bitstream
 build with **both** the M6a read path and the M6b write path (TX FIFO + WRITE(10) engine) included,
-`sync` Fmax 64.29 MHz PASS (60 MHz target), 22872/24288 (94%) `TRELLIS_COMB`
+`sync` Fmax 64.46 MHz PASS (60 MHz target; round-five build, all five clocks PASS), 22845/24288 (94%) `TRELLIS_COMB`
 (`build/mbsid-r5/top.tim`) — post-route Fmax swings several MHz build-to-build on
 placement-seed noise alone (root `CLAUDE.md`), so treat this exact number as a snapshot, not
 a promise; LUT climbed from M6a's 91% as expected with the write leg added, still comfortably
@@ -244,12 +244,94 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     `sid_player_sw` shares the stock engine and likely idles into the same 10 s
     reset cycle on hardware; it just never surfaced (its UI doesn't live-render drive
     state the way the mbsid `Usb` card does).
-- **M6b: USB patch export (write) — `M6_USB_STORAGE.md §4b/§6`.** Adds a SCSI
+  - **Peak stack usage is far tighter than the §6f estimate predicted — 22736/25856 B
+    (~3.1 KB / 12% headroom), measured on hardware 2026-07-14 via a temporary UART0
+    probe** (mbsid has no logger/UI wiring at all, unlike `sid_player_sw`'s
+    `handlers::logger_init` — the probe talked to `Serial0`/UART0 directly: paint the
+    stack region with `0xAA` at boot, scan for the high-water mark every 64 main-loop
+    iterations, log new peaks at 115200 baud; still present in `fw/src/main.rs`, marked
+    `TEMPORARY`, pending the M6b re-measurement below — see `M6_USB_STORAGE.md §7a`).
+    Triggered by a `Usb` card `Load→Slot` — nearly 6x the
+    +2–3 KB (over M4's 4016 B baseline) the plan estimated. **M6b's export path (the
+    `tx_data` fill loop + FAT write-back cache) has not yet been measured and stacks on
+    top of this** — treat it as a real overflow risk, not a formality, before trusting
+    M6b on hardware (`M6_USB_STORAGE.md §7b`, §8 risk table).
+- **M6b: USB patch export (write) — `M6_USB_STORAGE.md §4b/§6`. Corrupted a real drive on
+  first hardware exercise (2026-07-14); root-caused the same day and fixed in gateware
+  simulation — see `M6_USB_STORAGE.md`'s incident writeup + root cause.** The bug: the
+  final-review commit `a232efb` wrapped the CSR TX word FIFO in
+  `ResetInserter(start_write)` while the contract was fill-then-strobe, so the strobe that
+  started every write flushed the just-loaded payload — each WRITE(10) CBW went out with no
+  data phase, hanging the drive mid-command until the 10 s watchdog reset, and the resulting
+  bulk-only-transport desync committed mostly-zero sectors at arbitrary LBAs (the LBA math
+  itself was never wrong). `PressResult::UsbExport` (`fw/src/main.rs`) stays hard-disabled —
+  zero USB I/O, always "Export FAILED" — until §7b's checklist passes on disposable media.
+  **Second bring-up round (2026-07-15) found three more engine bugs** (see
+  `M6_USB_STORAGE.md`'s round-two writeup): CBW NAK treated as rejection (upstream `guh`
+  bug, latent on reads — now retried with same PID), CSW-RX/DATA-RX missing Default arms
+  (a STALLed CSW wedged the engine until the watchdog, whose reset also zeroed the diag
+  CSRs — beware last-failure-only diagnostics destroying their own evidence), and no
+  REQUEST SENSE after CHECK CONDITION (now auto-issued after failed writes; key/ASC/ASCQ
+  in the `sense_info` CSR at `0x34`; key=7/asc=0x27 = drive is write-protected).
+  **Rounds three/four (2026-07-15) found the final root cause: undecoded NYET**
+  (`M6_USB_STORAGE.md` round four). The drive runs at High Speed — `status.speed` CSR
+  encoding is LUNA xcvr_select: **0=HIGH**, 1=FULL, 2=LOW, 3=no-device (it was
+  mis-documented inverted, which misdirected round three toward "link is FS") — and HS
+  drives answer bulk-OUT data with NYET ("accepted, busy") as routine write flow
+  control. Stock `guh`'s SIE decodes only ACK/NAK/STALL, so NYET fell into the TIMEOUT
+  arm → engine rejected every write as `rej=4/2/0` regardless of chunk size (64/32/31)
+  or toggle. Fix: `guh/usbh/sie.py` vendored to `src/vendor/guh_msc/sie.py`
+  (`TransferResponse.NYET=7` + `detected.nyet` decode; swapped into the stock
+  enumerator in `SCSIBulkHost.__init__`), engine treats NYET as ACK in `CBW-WAIT`/
+  `DATA-TX-WAIT` (PING protocol deliberately skipped — the NAK-replay path covers the
+  busy case). Tests: UTMI-level handshake injection in `tests/test_guh_sie_tx_packets.py`
+  + a NYETing-drive write in `tests/test_usb_msc_integration.py`. All sim tests now
+  import `TransferType`/`TransferResponse` from `vendor.guh_msc.sie`, NOT `guh.usbh.sie`
+  — the classes are numerically identical but `ctx.set()`/asserts reject members of the
+  other class. **A related trap bites the engine RTL itself**: the *production* SIE's
+  `status.response` is an EnumView of **guh's** enum class, so `response ==
+  TransferResponse.NYET` (vendored class) raises TypeError at elaboration — but only in
+  the full build, because the sim stub's signature uses the vendored class. Compare via
+  `.as_value() == Member.value` in any new `m.If`; `m.Case` arms are immune (compare by
+  value). Sim green + build crash = check for this.
+  **Round five (2026-07-15, post-NYET-fix hardware test): no BOT error recovery, and the
+  watchdog destroys wedge evidence** (full writeup: `M6_USB_STORAGE.md` round five). An
+  8GB stick STALLed the bulk-OUT endpoint mid-data-phase (`rej=3/2/4` = STALL/DATA-TX/
+  128B ACKed) and, with no CLEAR_FEATURE(ENDPOINT_HALT), every later CBW bounced off the
+  halted endpoint (`rej=3/1/4`), sense unreadable, watchdog loop; a 64GB stick wedged
+  outright and logged `rej=0/0/0` — the watchdog reset zeroed the diag CSRs before
+  firmware read them. Fixes: (1) clear-halt recovery in the engine (DATA-TX STALL →
+  clear OUT halt via ep0 control transfer → toggle reset → read CSW → auto-sense; CSW
+  STALL → clear IN halt → exactly one CSW retry; reject phase **5** = the recovery
+  itself failed), (2) ALL reject/sense/NYET diags latched in `usb_msc_csr.py` on
+  **change-to-nonzero**, outside the watchdog reset domain — the engine now zeroes its
+  reject regs on each `cmd.start`, which the change-detect contract requires (don't
+  remove either half) — plus two new `reject_info` fields: `nyets` (NYET count; `ny=0`
+  on a STALL rules out the skipped-PING hypothesis) and `last_phase` (live-phase
+  breadcrumb: where a wedged engine was stuck when the watchdog wiped it). UART diag
+  prints `rej=r/p/t ny=N lph=P`. RejectInfo gained fields = CSR change = `--pac-only`
+  regen. Hotplug re-detection is separately broken (bitstream restart needed) —
+  `.scratch/mbsid-usb-hotplug-redetect-broken/`. **Timing lesson:** the live-phase
+  decode as a comb path (whole FSM state reg → Mux chain → cross-module →
+  peripheral change-detect) cost ~5–7 MHz of `sync` Fmax at 94% LUT — three seeds all
+  FAILED 55–57 MHz with critical paths in *unrelated stock logic* (CPU fabric, audio
+  calibrator DSP), the signature of diffuse congestion rather than a hot path;
+  registering the decode in the engine (`m.d.usb`, one cycle of lag, irrelevant for a
+  breadcrumb) restored 64.46 MHz PASS at the default seed. Cross-module diagnostic
+  fanout wants a register at the source, same spirit as the root CLAUDE.md's
+  register-the-MULT rule.
+  **Per-layer sim tests all passed while the assembled stack failed on hardware** — the
+  CSR peripheral + engine + `top.py` glue combination is now covered by
+  `tests/test_usb_msc_integration.py` (firmware-exact CSR sequences vs a scripted
+  disagreeable drive); keep its copy of the glue in sync with `../sid/top.py`.
+  Adds a SCSI
   WRITE(10) + bulk-OUT data path to the `guh` MSC host, a TX CSR block on
   `USBMSCPeripheral`, and the fat write-back cache + `export_syx` firmware flow. Landed
   in five commits (vendor engine, CSR write path, FAT write-back, patch-store partial-write
   fix, `export_syx`+menu row); host tests green throughout, full bitstream PASS with the
-  write leg included (see status line above).
+  write leg included (see status line above) — none of that caught the real-hardware bug,
+  since host tests and sim both drive a mock/in-memory storage backend, not a real MSC
+  device.
   - **Vendored engine lives at `src/vendor/guh_msc/msc.py`** (BSD-3 header kept), NOT the
     pip-installed `guh` under `.venv/` — the pinned upstream `guh/engines/msc.py` is
     read-only by design (its CBW builder can't express a host→device data phase; see
@@ -259,15 +341,19 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     is self-contained (`SCSIBulkHost.Command.data_dir`, a `DATA-TX` state, `WRITE_10 =
     0x2A`) and could be offered back rather than carried as a permanent fork.
   - **Write CSR contract** (`src/tiliqua/usb_msc_csr.py`, `USBMSCPeripheral(with_write=True)`,
-    instantiated at `../sid/top.py:539` alongside `with_mode=True`): push exactly 128
-    little-endian 32-bit words to `tx_data` (offset `0x20`) — one full 512-byte block, no
-    partial fills accepted — then strobe `start_write` (offset `0x24`, `0x18` is the shared
-    `resp` register reused from the read path). Firmware then polls the **sticky**
+    instantiated at `../sid/top.py:539` alongside `with_mode=True`): strobe `start_write`
+    FIRST (offset `0x24` — arms the write: flushes leftover TX words, clears the sticky
+    resp bits), then push exactly 128 little-endian 32-bit words to `tx_data` (offset
+    `0x20`); the peripheral defers the engine start until the 128th word is banked, so a
+    WRITE(10) CBW can never be issued without its full 512-byte data phase (`0x18` is the
+    shared `resp` register reused from the read path). **Do NOT revert to fill-then-strobe:
+    that order + the flush-on-strobe was the 2026-07-14 drive-corruption root cause.**
+    Firmware then polls the **sticky**
     `resp.done` bit (cleared by either a new `start`/read strobe or a new `start_write`
     strobe, not by the poll itself) and only then checks `resp.error`. `fw/src/usb_msc.rs`'s
-    `write_block` is the reference implementation: fill loop, one `start_write` strobe, then
-    a capped poll loop (`MAX_SPIN = 10_000_000`, looser than `read_block`'s 1,000,000 — a
-    block write is expected to take longer than a read). The CSR-side review round (task 12)
+    `write_block` is the reference implementation: `lba`, one `start_write` strobe, fill
+    loop, then a capped poll loop (`MAX_SPIN = 10_000_000`, looser than `read_block`'s
+    1,000,000 — a block write is expected to take longer than a read). The CSR-side review round (task 12)
     caught a different read/write interaction bug: `write_pending`'s `m.d.sync` clear on
     `start_o` lands one cycle late, so a plain read issued right after a write saw a stale
     `write_pending=1` and got misrouted into `msc`'s WRITE state instead of READ, silently
