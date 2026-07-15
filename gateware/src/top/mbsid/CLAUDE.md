@@ -11,8 +11,9 @@ guide, limitations, extending) — update the relevant page when a feature lands
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
 Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
-host `cargo test --lib` (118/118, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
-`usb_patch`/FAT-fixture/menu Usb-card coverage, `export_patch`/encode_syx round-trip), full bitstream
+host `cargo test --lib` (121/121, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
+`usb_patch`/FAT-fixture/menu Usb-card coverage, `export_patch`/encode_syx round-trip, `uptime` wall-clock),
+full bitstream
 build with **both** the M6a read path and the M6b write path (TX FIFO + WRITE(10) engine) included,
 `sync` Fmax 64.46 MHz PASS (60 MHz target; round-five build, all five clocks PASS), 22845/24288 (94%) `TRELLIS_COMB`
 (`build/mbsid-r5/top.tim`) — post-route Fmax swings several MHz build-to-build on
@@ -230,19 +231,16 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     `lead_loaded` bug: deriving `Card::Usb`'s validity only from menu navigation events
     (instead of every iteration) would let a stale file list survive an unplug until the
     user happened to turn the encoder again.
-  - **An idle-but-ready drive needs a firmware keepalive — don't remove it.** The MSC
-    engine's 10 s watchdog (`src/vendor/guh_msc/msc.py`, `_WATCHDOG_CYCLES`, inherited
-    from stock `guh`) is only fed by a *completed* SCSI command and keeps counting in the
-    `READY` state, so with no keepalive an idle drive is hard-reset + re-enumerated every
-    10 s (`Ready` → `No drive` → `Ready` menu loop — first bug found in M6 hardware
-    bring-up, 2026-07-14). `main.rs` reads LBA 0 every 2 s while `drive_ready`. Don't
-    "fix" this by clearing the watchdog in the gateware `READY` state instead: the
-    watchdog reset is the only unplug detection there is (the `guh` enumerator's
-    `enumerated` flag is set once and never cleared), and the keepalive preserves it — a
-    yanked drive fails the poll, the watchdog fires as designed, `ready` drops. Note
-    `sid_player_sw` shares the stock engine and likely idles into the same 10 s
-    reset cycle on hardware; it just never surfaced (its UI doesn't live-render drive
-    state the way the mbsid `Usb` card does).
+  - **An idle-but-ready drive needs a firmware keepalive — don't remove it.** Since
+    round seven the MSC engine's 10 s watchdog (`src/vendor/guh_msc/msc.py`) is
+    handshake-fed — any ACK/NAK/NYET holds it cleared, so a busy-NAKing drive is
+    never reset mid-command — but an IDLE bus produces no handshakes (SOFs don't
+    touch the SIE response), so a quiet READY drive still needs the 2 s LBA-0
+    probe in `main.rs`. The keepalive is also the unplug detector's trigger: a
+    yanked drive meets the probe with silence (TIMEOUT — deliberately NOT in the
+    watchdog's alive-set, along with STALL and CRC noise), the watchdog runs out,
+    `ready` drops. Note `sid_player_sw` shares the stock engine and the old
+    idle-reset behavior; only mbsid carries the vendored fix.
   - **Peak stack usage is far tighter than the §6f estimate predicted — 22736/25856 B
     (~3.1 KB / 12% headroom), measured on hardware 2026-07-14 via a temporary UART0
     probe** (mbsid has no logger/UI wiring at all, unlike `sid_player_sw`'s
@@ -322,7 +320,26 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   - **Round-six read-path `pth` diagnostic:** `pth` is the raw `read_path_info`
     CSR: engine bytes `[9:0]`, peripheral bytes `[19:10]`, packed words
     `[27:20]`, sampled stream mode `[28]`, sampled-length-is-512 `[29]`.
-    It is diagnostic-only and sampled before the engine's 10 s watchdog.
+    Diagnostic-only. **The "sampled before the watchdog" assumption is disproven on
+    hardware (2026-07-15 run):** `read_block`'s 10M-spin timeout outlasts the engine's
+    10 s watchdog (2 byte-serialized CSR reads per spin), so the engine-side fields
+    (`[9:0]`, `[28]`, `[29]`) read back zeroed and `lph` shows the post-reset recovery
+    TEST-UNIT-READY, not the failing read. Only `periph_bytes`/`periph_words`
+    (`[19:10]`/`[27:20]`, sync-domain, reset only on start strobes) survive — and they
+    proved zero bytes ever crossed for the post-write READ(10), exonerating the whole
+    Tiliqua datapath (see `M6_USB_STORAGE.md`'s round-six results).
+  - **Round seven (2026-07-15): handshake-fed watchdog + wall-clock firmware
+    timeouts** (`M6_USB_STORAGE.md` round seven). The engine watchdog is held
+    cleared by any live handshake (ACK/NAK/NYET) so a drive busy-NAKing for
+    >10 s (the round-six read-after-write killer) is waited out instead of
+    reset; TIMEOUT/STALL/CRC still count so unplug detection and re-enumeration
+    survive (guarded by `test_watchdog_still_fires_on_silent_drive`). Firmware
+    read/write polls budget 30 s of Timer0 wall-clock (`fw/src/uptime.rs`;
+    spin caps proved uncalibrated), abort early with read reason 4 if
+    `connected` drops, and print `ms=`/`wms=` beside `sp=`. No CSR changes —
+    no `--pac-only` needed. Consequence for diagnostics: the `pth` engine
+    fields are live-and-trustworthy at a rsn=3 snapshot now, since no watchdog
+    reset precedes it.
   **Per-layer sim tests all passed while the assembled stack failed on hardware** — the
   CSR peripheral + engine + `top.py` glue combination is now covered by
   `tests/test_usb_msc_integration.py` (firmware-exact CSR sequences vs a scripted
