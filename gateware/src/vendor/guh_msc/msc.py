@@ -175,6 +175,11 @@ class SCSIBulkHost(wiring.Component):
     # (the 2026-07-15 64GB-stick hang came back rej=0/0/0 — all evidence
     # zeroed by the very reset that ended the hang).
     phase_o: Out(3)
+    # Live read-path diagnostics. Firmware samples these before the outer
+    # 10-second watchdog can reset the engine.
+    rx_bytes_o:       Out(10)  # bytes accepted from the SIE this data-IN phase
+    stream_mode_o:    Out(1)   # command's sampled stream_data value
+    data_len_512_o:   Out(1)   # sampled data_len equals one 512-byte block
     # REQUEST SENSE support: key/ASC/ASCQ view of the capture buffer
     # ([19:16]=sense key, [15:8]=ASC, [7:0]=ASCQ), valid after a REQUEST
     # SENSE command completes.
@@ -247,6 +252,11 @@ class SCSIBulkHost(wiring.Component):
         rx_packet = packet_layout(rx_fifo.w_stream.payload)
         stream_mode = Signal()
         data_dir_r = Signal()   # latched cmd.data_dir (0=IN, 1=OUT)
+        m.d.comb += [
+            self.rx_bytes_o.eq(rx_data_count[:10]),
+            self.stream_mode_o.eq(stream_mode),
+            self.data_len_512_o.eq(data_len == 512),
+        ]
 
         # --- STALL recovery (BOT §6.7: clear the endpoint halt, then read the
         # CSW to learn WHY the device bailed). ch_ep is the CLEAR_FEATURE
@@ -844,6 +854,9 @@ class USBMSCHost(wiring.Component):
     reject_txdone:   Out(4)
     nyets:           Out(8)   # pass-through: NYETs this command
     phase_o:         Out(3)   # pass-through: live exchange phase
+    rx_bytes_o:       Out(10)
+    stream_mode_o:    Out(1)
+    data_len_512_o:   Out(1)
     speed_o:         Out(2)   # negotiated link speed (USBHostSpeed)
     # Auto-REQUEST-SENSE result after a failed WRITE ([19:16]=key, [15:8]=ASC,
     # [7:0]=ASCQ). `sense_valid` set once captured, cleared on the next
@@ -883,6 +896,9 @@ class USBMSCHost(wiring.Component):
             self.reject_txdone.eq(scsi.reject_txdone),
             self.nyets.eq(scsi.nyets),
             self.phase_o.eq(scsi.phase_o),
+            self.rx_bytes_o.eq(scsi.rx_bytes_o),
+            self.stream_mode_o.eq(scsi.stream_mode_o),
+            self.data_len_512_o.eq(scsi.data_len_512_o),
         ]
         # Sim stubs (StubEnumerator) have no SIE; leave speed_o at 0 there.
         if hasattr(scsi.enumerator, "sie"):

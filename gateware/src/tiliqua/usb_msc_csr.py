@@ -125,6 +125,17 @@ class USBMSCPeripheral(wiring.Component):
         code:  csr.Field(csr.action.R, unsigned(20))
         valid: csr.Field(csr.action.R, unsigned(1))
 
+    class ReadPathInfo(csr.Register, access="r"):
+        """Live read-path discriminator for post-write READ(10) failures.
+        engine_bytes counts bytes accepted from the SIE; periph_bytes and
+        periph_words count what crossed and packed at this peripheral.
+        stream_mode/data_len_512 are the values sampled by SCSIBulkHost."""
+        engine_bytes: csr.Field(csr.action.R, unsigned(10))
+        periph_bytes: csr.Field(csr.action.R, unsigned(10))
+        periph_words: csr.Field(csr.action.R, unsigned(8))
+        stream_mode:  csr.Field(csr.action.R, unsigned(1))
+        data_len_512: csr.Field(csr.action.R, unsigned(1))
+
     # Ports — bus addr_width varies (5 bits normally, 6 once with_write adds
     # tx_data/start_write past 0x1F), so the whole signature is built
     # per-instance in __init__ rather than as class-level annotations
@@ -157,6 +168,8 @@ class USBMSCPeripheral(wiring.Component):
             self._csw_status  = regs.add("csw_status",  self.CswStatus(),  offset=0x2C)
             self._reject_info = regs.add("reject_info", self.RejectInfo(), offset=0x30)
             self._sense_info  = regs.add("sense_info",  self.SenseInfo(),  offset=0x34)
+            self._read_path_info = regs.add(
+                "read_path_info", self.ReadPathInfo(), offset=0x38)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus":           In(csr.Signature(addr_width=addr_width, data_width=8)),
@@ -178,6 +191,9 @@ class USBMSCPeripheral(wiring.Component):
             "sense_i":           In(20), # with_write only: key/ASC/ASCQ
             "sense_valid_i":     In(1),
             "speed_i":           In(2),  # with_write only: link speed
+            "engine_rx_bytes_i":     In(10),
+            "engine_stream_mode_i":  In(1),
+            "engine_data_len_512_i": In(1),
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -196,9 +212,13 @@ class USBMSCPeripheral(wiring.Component):
         # Pack incoming bytes (little-endian) into 32-bit words.
         byte_ix = Signal(2)
         acc = Signal(32)
+        rx_byte_count_r = Signal(10)
+        rx_word_count_r = Signal(8)
         m.d.comb += [self.rx_data.ready.eq(1), wf.w_en.eq(0)]
         with m.If(self.rx_data.valid & self.rx_data.ready):
             b = self.rx_data.payload.data
+            with m.If(rx_byte_count_r != 0x3FF):
+                m.d.sync += rx_byte_count_r.eq(rx_byte_count_r + 1)
             with m.Switch(byte_ix):
                 for i in range(4):
                     with m.Case(i):
@@ -206,6 +226,8 @@ class USBMSCPeripheral(wiring.Component):
             m.d.sync += byte_ix.eq(byte_ix + 1)
             with m.If(byte_ix == 3):
                 m.d.comb += [wf.w_data.eq(Cat(acc[0:24], b)), wf.w_en.eq(1)]
+                with m.If(wf.w_rdy & (rx_word_count_r != 0xFF)):
+                    m.d.sync += rx_word_count_r.eq(rx_word_count_r + 1)
 
         # Status / capacity readback.
         m.d.comb += [
@@ -237,7 +259,13 @@ class USBMSCPeripheral(wiring.Component):
         # start_strobe wins: placed AFTER the done block so a simultaneous
         # start+done clears rather than latches (new command takes priority).
         with m.If(start_strobe):
-            m.d.sync += [byte_ix.eq(0), acc.eq(0), resp_error_r.eq(0)]
+            m.d.sync += [
+                byte_ix.eq(0),
+                acc.eq(0),
+                resp_error_r.eq(0),
+                rx_byte_count_r.eq(0),
+                rx_word_count_r.eq(0),
+            ]
         m.d.comb += self._resp.f.error.r_data.eq(resp_error_r)
 
         if self._with_mode:
@@ -286,7 +314,11 @@ class USBMSCPeripheral(wiring.Component):
                 with m.If(tx_ix == 3):
                     m.d.comb += txf.r_en.eq(1)
             with m.If(start_write):
-                m.d.sync += tx_ix.eq(0)
+                m.d.sync += [
+                    tx_ix.eq(0),
+                    rx_byte_count_r.eq(0),
+                    rx_word_count_r.eq(0),
+                ]
             # sticky done (with_write resp variant); extends the existing
             # resp_error_r clear term rather than duplicating the register.
             # Cleared by EITHER start (read) or start_write, per spec.
@@ -362,6 +394,14 @@ class USBMSCPeripheral(wiring.Component):
                 self._reject_info.f.last_phase.r_data.eq(last_phase_r),
                 self._sense_info.f.code.r_data.eq(sense_code_r),
                 self._sense_info.f.valid.r_data.eq(sense_valid_r),
+                self._read_path_info.f.engine_bytes.r_data.eq(
+                    self.engine_rx_bytes_i),
+                self._read_path_info.f.periph_bytes.r_data.eq(rx_byte_count_r),
+                self._read_path_info.f.periph_words.r_data.eq(rx_word_count_r),
+                self._read_path_info.f.stream_mode.r_data.eq(
+                    self.engine_stream_mode_i),
+                self._read_path_info.f.data_len_512.r_data.eq(
+                    self.engine_data_len_512_i),
                 self._status.f.speed.r_data.eq(self.speed_i),
             ]
 
