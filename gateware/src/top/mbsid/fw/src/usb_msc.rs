@@ -38,7 +38,8 @@ pub struct MscDiag {
     pub wr_reject_first: core::cell::Cell<(u8, u8, u8, u8, u8)>,
     pub wr_first_set: core::cell::Cell<bool>,
     /// TEMPORARY round-six: first/last failed READ since begin():
-    /// (reason: 1=not-ready at entry, 2=resp.error, 3=spin timeout;
+    /// (reason: 1=not-ready at entry, 2=resp.error, 3=deadline timeout,
+    ///  4=connected lost mid-read (engine watchdog fired / unplug);
     ///  word index 0..127 the failure hit at; lba; spins in the failing
     ///  word's poll loop; then a reject_info CSR snapshot at the moment of
     ///  failure: response, phase, nyets, last_phase). Round six evidence:
@@ -55,6 +56,14 @@ pub struct MscDiag {
     pub rd_path_first: core::cell::Cell<u32>,
     pub rd_path: core::cell::Cell<u32>,
     pub rd_first_set: core::cell::Cell<bool>,
+    /// Elapsed wall-clock ms (Timer0 uptime) at the failure, captured with
+    /// rd_fail_first/rd_fail. Printed beside sp= — together they double as
+    /// a spins->ms calibration sample (round six had no time base at all
+    /// and its "10M spins ~ 3 s" estimate was off by >3x).
+    pub rd_ms_first: core::cell::Cell<u32>,
+    pub rd_ms: core::cell::Cell<u32>,
+    /// Wall-clock ms the last write_block spent polling (success or not).
+    pub wr_ms_last: core::cell::Cell<u32>,
 }
 
 impl MscDiag {
@@ -69,19 +78,25 @@ impl MscDiag {
         self.rd_fail.set((0, 0, 0, 0, 0, 0, 0, 0));
         self.rd_path_first.set(0);
         self.rd_path.set(0);
+        self.rd_ms_first.set(0);
+        self.rd_ms.set(0);
+        self.wr_ms_last.set(0);
     }
 
     fn record_rd_failure(
         &self,
         v: (u8, u8, u32, u32, u8, u8, u8, u8),
         path: u32,
+        ms: u32,
     ) {
         self.rd_fail.set(v);
         self.rd_path.set(path);
+        self.rd_ms.set(ms);
         if !self.rd_first_set.get() {
             self.rd_first_set.set(true);
             self.rd_fail_first.set(v);
             self.rd_path_first.set(path);
+            self.rd_ms_first.set(ms);
         }
     }
 
@@ -157,47 +172,60 @@ impl UsbMsc {
             let (rr, rp, ny, lp) = self.reject_snapshot();
             let path = self.read_path_snapshot();
             self.diag.record_rd_failure(
-                (1, 0, lba, 0, rr, rp, ny, lp), path);
+                (1, 0, lba, 0, rr, rp, ny, lp), path, 0);
             return Err(MscError::NotReady);
         }
         self.regs.lba().write(|w| unsafe { w.value().bits(lba) });
         self.regs.start().write(|w| w.strobe().set_bit());
-        // Drain 128 words (512 bytes). Spin on rx_avail per word.
+        // Wall-clock budget for the WHOLE block (Timer0 1 ms uptime).
+        // Round six proved spin caps are uncalibrated: the old 10M-spin cap
+        // (comment said ~3 s) silently outlasted the engine's 10 s watchdog,
+        // so every failure snapshot read a watchdog-wiped engine. 30 s
+        // matches desktop-host patience with a busy drive; the handshake-fed
+        // watchdog (vendor msc.py, round seven) no longer resets the engine
+        // while the drive NAKs, so waiting this long is now meaningful.
+        const READ_TIMEOUT_MS: u32 = 30_000;
+        let t0 = crate::uptime::now_ms();
         for i in 0..128usize {
-            // Cap spin iterations to prevent an infinite hang if the device
-            // stalls (no word, no error). Raised 1M -> 10M (~0.3 s -> ~3 s)
-            // after round six (2026-07-15): a drive that just accepted a
-            // write busy-NAKs subsequent reads for seconds while its FTL
-            // commits — the 8GB stick's export failed on exactly this
-            // (d_wrok=1 then d_rderr=2 on the verify readback).
-            #[cfg(not(test))]
-            const MAX_SPIN: u32 = 10_000_000;
-            #[cfg(not(test))]
             let mut spins: u32 = 0;
             loop {
                 let st = self.regs.status().read();
                 if st.rx_avail().bit_is_set() { break; }
                 if self.regs.resp().read().error().bit_is_set() {
                     self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
-                    #[cfg(not(test))]
-                    let sp = spins;
-                    #[cfg(test)]
-                    let sp = 0u32;
                     let (rr, rp, ny, lp) = self.reject_snapshot();
                     let path = self.read_path_snapshot();
+                    let ms = crate::uptime::now_ms().wrapping_sub(t0);
                     self.diag.record_rd_failure(
-                        (2, i as u8, lba, sp, rr, rp, ny, lp), path);
+                        (2, i as u8, lba, spins, rr, rp, ny, lp), path, ms);
                     return Err(MscError::ReadError);
                 }
-                #[cfg(not(test))]
-                {
-                    spins += 1;
-                    if spins >= MAX_SPIN {
-                        self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
+                spins = spins.wrapping_add(1);
+                // Deadline/liveness checks every 1024 spins: each check is a
+                // critical_section + CSR read, too heavy for every iteration.
+                if spins % 1024 == 0 {
+                    if !self.connected() {
+                        // rsn=4: the engine lost the drive mid-command
+                        // (watchdog fired or the drive was yanked) —
+                        // resp.done can never come; fail fast.
+                        self.diag.rd_err.set(
+                            self.diag.rd_err.get().wrapping_add(1));
+                        let (rr, rp, ny, lp) = self.reject_snapshot();
+                        let path = self.read_path_snapshot();
+                        let ms = crate::uptime::now_ms().wrapping_sub(t0);
+                        self.diag.record_rd_failure(
+                            (4, i as u8, lba, spins, rr, rp, ny, lp), path, ms);
+                        return Err(MscError::ReadError);
+                    }
+                    let now = crate::uptime::now_ms();
+                    if crate::uptime::deadline_expired(t0, now, READ_TIMEOUT_MS) {
+                        self.diag.rd_err.set(
+                            self.diag.rd_err.get().wrapping_add(1));
                         let (rr, rp, ny, lp) = self.reject_snapshot();
                         let path = self.read_path_snapshot();
                         self.diag.record_rd_failure(
-                            (3, i as u8, lba, spins, rr, rp, ny, lp), path);
+                            (3, i as u8, lba, spins, rr, rp, ny, lp), path,
+                            now.wrapping_sub(t0));
                         return Err(MscError::ReadError);
                     }
                 }
@@ -241,11 +269,11 @@ impl UsbMsc {
         // Bounded ready-wait instead of an instant NotReady: after a failed
         // write the engine stays busy for a few ms running its automatic
         // REQUEST SENSE; an immediate retry must wait that out, not fail.
-        const READY_SPIN: u32 = 2_000_000; // ~1 s worst case
-        let mut waited: u32 = 0;
+        const READY_WAIT_MS: u32 = 1_000;
+        let t0r = crate::uptime::now_ms();
         while !self.ready() {
-            waited += 1;
-            if waited >= READY_SPIN {
+            if crate::uptime::deadline_expired(
+                t0r, crate::uptime::now_ms(), READY_WAIT_MS) {
                 self.diag.wr_notready.set(
                     self.diag.wr_notready.get().wrapping_add(1));
                 return Err(MscError::NotReady);
@@ -260,18 +288,18 @@ impl UsbMsc {
             let w32 = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
             self.regs.tx_data().write(|w| unsafe { w.word().bits(w32) });
         }
-        // Raised 10M -> 40M (~3 s -> ~12 s) after round six: the 64GB stick
-        // accepts the whole data phase (ny=3 = routine HS flow control) then
-        // NAKs the CSW for longer than 3 s while committing (lph=3 = engine
-        // parked in the CSW phase, no reject). The engine's own 10 s
-        // watchdog still bounds a truly-dead exchange; this cap just needs
-        // to outlast it so the watchdog (not the poll) decides.
-        const MAX_SPIN: u32 = 40_000_000;
+        // Wall-clock completion budget (see read_block's comment: spin caps
+        // are uncalibrated, and with the round-seven handshake-fed watchdog
+        // a busy-NAKing drive is safe to wait on).
+        const WRITE_TIMEOUT_MS: u32 = 30_000;
+        let t0 = crate::uptime::now_ms();
         let mut spins: u32 = 0;
         loop {
             let r = self.regs.resp().read();
             if r.done().bit_is_set() {
                 self.diag.wr_spins_last.set(spins); // TEMPORARY diag
+                self.diag.wr_ms_last.set(
+                    crate::uptime::now_ms().wrapping_sub(t0));
                 return if r.error().bit_is_set() {
                     self.diag.wr_resp_err.set(
                         self.diag.wr_resp_err.get().wrapping_add(1));
@@ -288,19 +316,25 @@ impl UsbMsc {
                     Ok(())
                 };
             }
-            spins += 1;
-            if spins >= MAX_SPIN {
-                self.diag.wr_spins_last.set(spins); // TEMPORARY diag
-                self.diag.wr_timeout.set(
-                    self.diag.wr_timeout.get().wrapping_add(1));
-                let ri = self.regs.reject_info().read();
-                self.diag.record_failure(
-                    (self.regs.csw_status().read().value().bits(),
-                     self.regs.csw_residue().read().value().bits()),
-                    (ri.response().bits(), ri.phase().bits(),
-                     ri.txdone().bits(), ri.nyets().bits(),
-                     ri.last_phase().bits()));
-                return Err(MscError::WriteError);
+            spins = spins.wrapping_add(1);
+            if spins % 1024 == 0 {
+                let now = crate::uptime::now_ms();
+                if !self.connected()
+                    || crate::uptime::deadline_expired(t0, now, WRITE_TIMEOUT_MS)
+                {
+                    self.diag.wr_spins_last.set(spins); // TEMPORARY diag
+                    self.diag.wr_ms_last.set(now.wrapping_sub(t0));
+                    self.diag.wr_timeout.set(
+                        self.diag.wr_timeout.get().wrapping_add(1));
+                    let ri = self.regs.reject_info().read();
+                    self.diag.record_failure(
+                        (self.regs.csw_status().read().value().bits(),
+                         self.regs.csw_residue().read().value().bits()),
+                        (ri.response().bits(), ri.phase().bits(),
+                         ri.txdone().bits(), ri.nyets().bits(),
+                         ri.last_phase().bits()));
+                    return Err(MscError::WriteError);
+                }
             }
         }
     }
