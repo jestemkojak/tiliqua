@@ -36,6 +36,13 @@ class USBMSCPeripheral(wiring.Component):
         ready:       csr.Field(csr.action.R, unsigned(1))
         busy:        csr.Field(csr.action.R, unsigned(1))
         rx_avail:    csr.Field(csr.action.R, unsigned(1))
+        # Negotiated link speed (guh USBHostSpeed = LUNA xcvr_select
+        # encoding: 0=HIGH, 1=FULL, 2=LOW, 3=UNKNOWN/no device — NOT
+        # 0=FULL/1=HIGH as previously mis-documented here, an inversion
+        # that sent the 2026-07-15 M6b debug down a "link is FS" path
+        # while the NYETing drive was actually at High Speed);
+        # wired only when with_write (diagnostics), else reads 0.
+        speed:       csr.Field(csr.action.R, unsigned(2))
 
     class BlockSize(csr.Register, access="r"):
         value: csr.Field(csr.action.R, unsigned(16))
@@ -61,16 +68,62 @@ class USBMSCPeripheral(wiring.Component):
         storage: csr.Field(csr.action.RW, unsigned(1))
 
     class TxData(csr.Register, access="w"):
-        """One little-endian 32-bit word of write-payload. Push exactly 128
-        words (512 B), then strobe start_write."""
+        """One little-endian 32-bit word of write-payload. Strobe start_write
+        FIRST, then push exactly 128 words (512 B); the engine is started
+        automatically once the 128th word is banked."""
         word: csr.Field(csr.action.W, unsigned(32))
 
     class StartWrite(csr.Register, access="w"):
+        """Arms a block write: flushes any leftover TX words, clears the
+        sticky resp bits, and defers the actual engine start until the TX
+        FIFO holds a full 128-word payload. The engine therefore never
+        issues a WRITE(10) CBW without its complete data phase banked —
+        a payload-less CBW leaves the device hanging mid-command and can
+        desync the bulk-only transport (2026-07-14 drive-corruption
+        incident, M6_USB_STORAGE.md)."""
         strobe: csr.Field(csr.action.W, unsigned(1))
 
     class RespW(csr.Register, access="r"):
         error: csr.Field(csr.action.R, unsigned(1))
         done:  csr.Field(csr.action.R, unsigned(1))
+
+    class CswResidue(csr.Register, access="r"):
+        """dCSWDataResidue of the last CSW (diagnostics: >0 on a failed write
+        means the device did not accept the whole data phase)."""
+        value: csr.Field(csr.action.R, unsigned(32))
+
+    class CswStatus(csr.Register, access="r"):
+        """bCSWStatus of the last CSW (0=passed, 1=failed, 2=phase error)."""
+        value: csr.Field(csr.action.R, unsigned(8))
+
+    class RejectInfo(csr.Register, access="r"):
+        """Last rejected/STALLed transfer: SIE response (3=STALL, 4=TIMEOUT,
+        5=CRC_ERROR) and exchange phase (1=CBW, 2=DATA-TX, 3=CSW, 4=DATA-RX,
+        5=CTRL i.e. the clear-halt recovery itself). All fields in this
+        register are LATCHED HERE in the peripheral (sync domain), outside
+        the engine's 10 s watchdog reset — the 2026-07-15 64GB-stick hang
+        came back rej=0/0/0 because the watchdog reset that ended the wedge
+        also zeroed the engine-side diagnostics. Cleared by a start or
+        start_write strobe."""
+        response: csr.Field(csr.action.R, unsigned(3))
+        phase:    csr.Field(csr.action.R, unsigned(3))
+        # DATA-TX rejects only: 32-byte units already ACKed when it failed
+        # (0 = the very first data packet never got a handshake).
+        txdone:   csr.Field(csr.action.R, unsigned(4))
+        # NYET handshakes seen during the command (saturating) — >0 means the
+        # drive used HS flow control; relevant to the skipped PING protocol.
+        nyets:    csr.Field(csr.action.R, unsigned(8))
+        # Last nonzero live exchange phase seen (same encoding as `phase`).
+        # On a wedged-then-watchdogged command this is the phase the engine
+        # was STUCK in, even though `phase` (a reject latch) stayed 0.
+        last_phase: csr.Field(csr.action.R, unsigned(3))
+
+    class SenseInfo(csr.Register, access="r"):
+        """Auto-REQUEST-SENSE result after a failed write. code[19:16]=sense
+        key, code[15:8]=ASC, code[7:0]=ASCQ (e.g. key=7/ASC=0x27 = WRITE
+        PROTECTED). valid=1 once captured; cleared on the next command."""
+        code:  csr.Field(csr.action.R, unsigned(20))
+        valid: csr.Field(csr.action.R, unsigned(1))
 
     # Ports — bus addr_width varies (5 bits normally, 6 once with_write adds
     # tx_data/start_write past 0x1F), so the whole signature is built
@@ -100,6 +153,10 @@ class USBMSCPeripheral(wiring.Component):
         if with_write:
             self._tx_data     = regs.add("tx_data",     self.TxData(),     offset=0x20)
             self._start_write = regs.add("start_write", self.StartWrite(), offset=0x24)
+            self._csw_residue = regs.add("csw_residue", self.CswResidue(), offset=0x28)
+            self._csw_status  = regs.add("csw_status",  self.CswStatus(),  offset=0x2C)
+            self._reject_info = regs.add("reject_info", self.RejectInfo(), offset=0x30)
+            self._sense_info  = regs.add("sense_info",  self.SenseInfo(),  offset=0x34)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus":           In(csr.Signature(addr_width=addr_width, data_width=8)),
@@ -111,6 +168,16 @@ class USBMSCPeripheral(wiring.Component):
             "mode_o":        Out(1),   # with_mode only: 0=MIDI owns PHY, 1=MSC
             "tx_data_o":     Out(stream.Signature(unsigned(8))),  # with_write only
             "start_write_o": Out(1),                              # with_write only
+            "csw_status_i":  In(8),    # with_write only: last CSW status byte
+            "csw_residue_i": In(32),   # with_write only: last CSW data residue
+            "reject_response_i": In(3),  # with_write only: last rejected xfer
+            "reject_phase_i":    In(3),  # with_write only: where it rejected
+            "reject_txdone_i":   In(4),  # with_write only: ACKed 32B units
+            "nyet_count_i":      In(8),  # with_write only: NYETs this command
+            "phase_i":           In(3),  # with_write only: live engine phase
+            "sense_i":           In(20), # with_write only: key/ASC/ASCQ
+            "sense_valid_i":     In(1),
+            "speed_i":           In(2),  # with_write only: link speed
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -182,12 +249,29 @@ class USBMSCPeripheral(wiring.Component):
             # Wrap the TX word FIFO with ResetInserter so start_write flushes
             # any leftover words from a prior (partial/failed) write before
             # the new one begins — symmetric to the RX word FIFO's
-            # ResetInserter(start_strobe) above.
+            # ResetInserter(start_strobe) above. Because this flush fires on
+            # the strobe itself, the payload MUST be pushed AFTER the strobe
+            # (strobe-then-fill): the original fill-then-strobe contract had
+            # this same flush erase the just-loaded payload on the start
+            # edge, so every write issued a payload-less WRITE(10) CBW —
+            # root cause of the 2026-07-14 drive-corruption incident.
             m.submodules.tx_fifo = txf = ResetInserter(start_write)(self._tx_fifo)
+            # start_write only ARMS the write; the engine start is deferred
+            # until the full 512-byte payload is banked, so a WRITE(10) can
+            # never be issued with missing data (even if firmware dies
+            # mid-fill, no bus traffic happens at all). A read start strobe
+            # disarms, so stray tx words can't launch a stale write later.
+            write_armed = Signal()
+            fire_write = Signal()
+            m.d.comb += fire_write.eq(write_armed & (txf.r_level == 128))
+            with m.If(start_write):
+                m.d.sync += write_armed.eq(1)
+            with m.Elif(fire_write | start_strobe):
+                m.d.sync += write_armed.eq(0)
             m.d.comb += [
                 txf.w_en.eq(self._tx_data.f.word.w_stb),
                 txf.w_data.eq(self._tx_data.f.word.w_data),
-                self.start_write_o.eq(start_write),
+                self.start_write_o.eq(fire_write),
             ]
             # word -> byte unpacker (mirror of the RX byte->word packer)
             tx_ix = Signal(2)
@@ -212,5 +296,73 @@ class USBMSCPeripheral(wiring.Component):
             with m.If(start_strobe | start_write):
                 m.d.sync += [resp_done_r.eq(0), resp_error_r.eq(0)]
             m.d.comb += self._resp.f.done.r_data.eq(resp_done_r)
+            # Diagnostic latches. The engine-side reject/sense/nyet registers
+            # live inside the MSC engine's 10 s watchdog reset domain, so a
+            # wedged command's evidence is zeroed by the very reset that ends
+            # the wedge (observed on hardware 2026-07-15: a hung write came
+            # back rej=0/0/0). Latch every diagnostic HERE, outside that
+            # reset, updating only from nonzero/valid engine values and
+            # clearing on the next command strobe.
+            rej_resp_r   = Signal(3)
+            rej_phase_r  = Signal(3)
+            rej_txdone_r = Signal(4)
+            nyets_r      = Signal(8)
+            last_phase_r = Signal(3)
+            sense_code_r  = Signal(20)
+            sense_valid_r = Signal()
+            # Change-to-nonzero detection, NOT level: the engine's own diag
+            # registers persist until its next cmd.start, which for a write
+            # fires only after firmware banks all 128 payload words — a
+            # level-based latch would re-capture the PREVIOUS command's
+            # values in that window, right after our clear-on-strobe. The
+            # engine zeroes each of these per command, so every real event
+            # arrives as a 0 -> nonzero (or value-stepping) change; the
+            # watchdog reset arrives as a change TO zero, which is ignored —
+            # that's the evidence-preservation this latch exists for.
+            rej_in = Cat(self.reject_response_i, self.reject_phase_i,
+                         self.reject_txdone_i)
+            rej_prev = Signal.like(rej_in)
+            m.d.sync += rej_prev.eq(rej_in)
+            with m.If((rej_in != rej_prev) & (self.reject_phase_i != 0)):
+                m.d.sync += [
+                    rej_resp_r.eq(self.reject_response_i),
+                    rej_phase_r.eq(self.reject_phase_i),
+                    rej_txdone_r.eq(self.reject_txdone_i),
+                ]
+            nyet_prev = Signal(8)
+            m.d.sync += nyet_prev.eq(self.nyet_count_i)
+            with m.If((self.nyet_count_i != nyet_prev)
+                      & (self.nyet_count_i != 0)):
+                m.d.sync += nyets_r.eq(self.nyet_count_i)
+            phase_prev = Signal(3)
+            m.d.sync += phase_prev.eq(self.phase_i)
+            with m.If((self.phase_i != phase_prev) & (self.phase_i != 0)):
+                m.d.sync += last_phase_r.eq(self.phase_i)
+            sense_in = Cat(self.sense_i, self.sense_valid_i)
+            sense_prev = Signal.like(sense_in)
+            m.d.sync += sense_prev.eq(sense_in)
+            with m.If((sense_in != sense_prev) & self.sense_valid_i):
+                m.d.sync += [
+                    sense_code_r.eq(self.sense_i),
+                    sense_valid_r.eq(1),
+                ]
+            with m.If(start_strobe | start_write):
+                m.d.sync += [
+                    rej_resp_r.eq(0), rej_phase_r.eq(0), rej_txdone_r.eq(0),
+                    nyets_r.eq(0), last_phase_r.eq(0),
+                    sense_code_r.eq(0), sense_valid_r.eq(0),
+                ]
+            m.d.comb += [
+                self._csw_residue.f.value.r_data.eq(self.csw_residue_i),
+                self._csw_status.f.value.r_data.eq(self.csw_status_i),
+                self._reject_info.f.response.r_data.eq(rej_resp_r),
+                self._reject_info.f.phase.r_data.eq(rej_phase_r),
+                self._reject_info.f.txdone.r_data.eq(rej_txdone_r),
+                self._reject_info.f.nyets.r_data.eq(nyets_r),
+                self._reject_info.f.last_phase.r_data.eq(last_phase_r),
+                self._sense_info.f.code.r_data.eq(sense_code_r),
+                self._sense_info.f.valid.r_data.eq(sense_valid_r),
+                self._status.f.speed.r_data.eq(self.speed_i),
+            ]
 
         return m

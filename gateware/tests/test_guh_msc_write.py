@@ -19,7 +19,13 @@ from amaranth.lib import wiring
 from amaranth.lib.wiring import In, Out
 from amaranth.sim import Simulator
 
-from guh.usbh.sie import USBSIEInterface, TransferType, TransferResponse, DataPID
+# Vendored SIE types (not guh's): the stub's ctrl signature and the response
+# codes the drive scripts set must be the SAME enum class the vendored engine
+# compares against — guh's TransferResponse lacks NYET=7 and mixing the two
+# classes makes ctx.set() reject members of the other.
+from vendor.guh_msc.sie import (
+    USBSIEInterface, TransferType, TransferResponse, DataPID,
+)
 
 from vendor.guh_msc.msc import (
     SCSIBulkHost, SCSIOpCode, CBWFlags, CBW_SIZE_BYTES, CSW_SIZE_BYTES,
@@ -220,6 +226,51 @@ class GuhMscWriteTests(unittest.TestCase):
         for a, b in zip(pids, pids[1:]):
             self.assertNotEqual(a, b)
 
+    def test_write_data_phase_chunks_31_bytes(self):
+        """(2b) With tx_chunk_bytes=31 (2026-07-15 diagnostic build: data
+        packets byte-identical in length to a hardware-proven CBW), a 512-byte
+        payload streams as 16 x 31-byte chunks + one 16-byte tail, PID toggling
+        throughout, payload intact."""
+        stub = StubEnumerator()
+        dut = SCSIBulkHost(enumerator=stub, tx_chunk_bytes=31)
+        m = Module()
+        m.submodules.dut = dut
+        cbw = []
+        chunks = []
+        meta = []
+
+        async def tb(ctx):
+            sie = _Sie(dut, stub)
+            await sie.to_idle_and_start(
+                ctx, data_dir=1, opcode=SCSIOpCode.WRITE_10, data_len=BLOCK_SIZE)
+            await sie.expect_out(ctx, TransferResponse.ACK, cbw)
+            for _ in range(17):
+                buf = []
+                pid, xtype, ep = await sie.expect_out(
+                    ctx, TransferResponse.ACK, buf)
+                chunks.append(buf)
+                meta.append((pid, xtype, ep))
+            # Command completes with a passing CSW.
+            done, error = await sie.do_in(
+                ctx, _passing_csw(), TransferResponse.ACK)
+            self.assertTrue(done)
+            self.assertFalse(error)
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6, domain="usb")
+        sim.add_testbench(tb)
+        sim.run()
+
+        payload = [b for c in chunks for b in c]
+        self.assertEqual(len(payload), BLOCK_SIZE)
+        self.assertEqual(payload, [i & 0xFF for i in range(BLOCK_SIZE)])
+        self.assertEqual([len(c) for c in chunks], [31] * 16 + [16])
+        self.assertTrue(all(ep == 2 for _, _, ep in meta))
+        pids = [p for p, _, _ in meta]
+        self.assertEqual(pids[0], DataPID.DATA1)
+        for a, b in zip(pids, pids[1:]):
+            self.assertNotEqual(a, b)
+
     def test_write_nak_replays_same_chunk(self):
         """(3) A NAK on a data OUT transaction re-issues the same chunk with the
         same PID (bytes come from the local replay buffer, not tx_data)."""
@@ -280,6 +331,59 @@ class GuhMscWriteTests(unittest.TestCase):
 
                 self.assertEqual(result["done"], 1)
                 self.assertEqual(result["error"], exp_err)
+
+    def test_cbw_nak_retries_same_cbw(self):
+        """(6) Regression (2026-07-15 hardware bring-up): a NAK on the CBW OUT
+        transaction is flow control, not rejection — the engine must re-send
+        the identical 31-byte CBW with the same PID and then proceed normally.
+        A real drive NAKs CBWs while doing flash housekeeping; the old code's
+        Default arm failed the whole command (reject resp=2 phase=1)."""
+        m, dut, stub = _build()
+        first = []
+        retry = []
+        pids = []
+        rejected = {}
+
+        async def tb(ctx):
+            sie = _Sie(dut, stub)
+            await sie.to_idle_and_start(
+                ctx, data_dir=1, opcode=SCSIOpCode.WRITE_10, data_len=BLOCK_SIZE)
+            # NAK the CBW.
+            p0, _, _ = await sie.expect_out(ctx, TransferResponse.NAK, first)
+            pids.append(p0)
+            rejected["after_nak"] = ctx.get(dut.status.rejected)
+            # Engine must re-send the same CBW. Bounded wait: the broken
+            # engine goes IDLE after the NAK and never retries — fail the
+            # test instead of hanging the simulation.
+            c = stub.ctrl
+            ctx.set(c.status.idle, 1)
+            for _ in range(200):
+                if ctx.get(c.xfer.start):
+                    break
+                await sie.tick(ctx, retry)
+            else:
+                self.fail("engine never re-sent the CBW after a NAK "
+                          "(treated flow control as rejection)")
+            p1 = ctx.get(c.xfer.data_pid)
+            await sie.tick(ctx)                    # commit XFER -> CBW-WAIT
+            ctx.set(c.status.response, TransferResponse.ACK)
+            await sie.tick(ctx)                    # DUT reads response
+            pids.append(p1)
+            # Command proceeds into the data phase as usual.
+            data = []
+            await sie.expect_out(ctx, TransferResponse.ACK, data)
+            rejected["data_len"] = len(data)
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6, domain="usb")
+        sim.add_testbench(tb)
+        sim.run()
+
+        self.assertEqual(rejected["after_nak"], 0)   # not treated as fatal
+        self.assertEqual(len(first), CBW_SIZE_BYTES)
+        self.assertEqual(retry, first)               # identical CBW re-sent
+        self.assertEqual(pids[0], pids[1])           # same PID (no toggle on NAK)
+        self.assertEqual(rejected["data_len"], 64)   # first data chunk followed
 
     def test_read_cbw_flags_unchanged(self):
         """(5) Regression: a READ command (data_dir=0) still emits flags 0x80."""

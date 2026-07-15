@@ -27,7 +27,9 @@ from amaranth.lib.wiring import In, Out
 from luna.gateware.stream.future import Packet
 
 from guh.usbh.enumerator import USBHostEnumerator
-from guh.usbh.sie import TransferType, TransferResponse, DataPID
+# TransferType/DataPID are numerically identical to guh's; TransferResponse
+# adds NYET=7 (see sie.py's docstring — the 2026-07-15 write-failure fix).
+from .sie import USBSIE, TransferType, TransferResponse, DataPID
 from guh.usbh.descriptor import USBDescriptorParser, EndpointFilter
 from guh.protocol.descriptors import *
 
@@ -103,11 +105,19 @@ CBW_SIZE_BYTES = CBW.as_shape().size // 8
 CSW_SIZE_BYTES = CSW.as_shape().size // 8
 READ_CAPACITY_SIZE_BYTES = ReadCapacity10Response.as_shape().size // 8
 
-# Max bytes per bulk-OUT transaction. The guh SIE tx FIFO is 64 deep and
-# captures its transmit length once (tx_len = tx_fifo.w_level) at xfer.start
-# (guh/usbh/sie.py IDLE state), so a single OUT transaction is hard-capped at
-# 64 bytes — there is no streaming feed-while-transmitting. A 512-byte block is
-# therefore sent as 8 x 64-byte OUT transactions with PID toggling per ACK.
+# Default max bytes per bulk-OUT transaction. The guh SIE tx FIFO is 64 deep
+# and captures its transmit length once (tx_len = tx_fifo.w_level) at
+# xfer.start (guh/usbh/sie.py IDLE state), so a single OUT transaction is
+# hard-capped at 64 bytes — there is no streaming feed-while-transmitting. A
+# 512-byte block is therefore sent as 8 x 64-byte OUT transactions with PID
+# toggling per ACK. Overridable per instance (`tx_chunk_bytes`): the 2026-07-15
+# hardware bring-up saw 64-byte data packets get NO handshake from a real
+# drive while 31-byte CBWs work, with the emitted packet proven bit-perfect at
+# the UTMI level in sim (tests/test_guh_sie_tx_packets.py) — a smaller chunk
+# A/Bs whether the failure below UTMI (ULPI translator / PHY) is
+# length-dependent. NOTE: intermediate short packets are technically out of
+# spec for bulk (all but the last should be wMaxPacketSize); most drives
+# tolerate it, and a CSW/sense complaint is itself a diagnostic answer.
 _TX_CHUNK_BYTES = 64
 
 # ============================================================
@@ -147,10 +157,35 @@ class SCSIBulkHost(wiring.Component):
     rx_data:  Out(stream.Signature(Packet(unsigned(8))))
     tx_data:  In(stream.Signature(unsigned(8)))   # OUT payload (data_dir=1 cmds)
     captured: Out(ReadCapacity10Response)
+    csw:      Out(CSW)   # last received CSW (status/residue diagnostics)
+    # Diagnostics: on a rejected command (Default arm — response neither ACK
+    # nor NAK), latch WHAT the SIE reported and WHERE in the exchange.
+    reject_response: Out(3)   # TransferResponse value (3=STALL, 4=TIMEOUT, ...)
+    reject_phase:    Out(3)   # 0=none yet, 1=CBW, 2=DATA-TX, 3=CSW, 4=DATA-RX,
+                              # 5=CTRL (CLEAR_FEATURE recovery itself failed)
+    reject_txdone:   Out(4)   # DATA-TX rejects: 32-byte units already ACKed
+    # NYET handshakes seen this command (CBW + DATA-TX phases, saturating).
+    # Diagnostic for the skipped PING protocol: a STALL with nyets>0 could be
+    # a strict HS device objecting to OUT-without-PING after NYET; nyets=0
+    # rules that out.
+    nyets: Out(8)
+    # Live exchange phase (same encoding as reject_phase, 0=idle). Latched
+    # OUTSIDE the watchdog reset domain by the CSR peripheral so a wedged
+    # engine still reports WHERE it was stuck after the watchdog wipes it
+    # (the 2026-07-15 64GB-stick hang came back rej=0/0/0 — all evidence
+    # zeroed by the very reset that ended the hang).
+    phase_o: Out(3)
+    # REQUEST SENSE support: key/ASC/ASCQ view of the capture buffer
+    # ([19:16]=sense key, [15:8]=ASC, [7:0]=ASCQ), valid after a REQUEST
+    # SENSE command completes.
+    sense: Out(20)
 
-    def __init__(self, *, enumerator=None, **kwargs):
+    def __init__(self, *, enumerator=None, tx_chunk_bytes=_TX_CHUNK_BYTES,
+                 **kwargs):
         # `enumerator` is an injection seam for sim (a stub SIE); production code
         # leaves it None and gets the real USBHostEnumerator built from **kwargs.
+        assert 1 <= tx_chunk_bytes <= 64   # SIE tx FIFO depth
+        self.tx_chunk_bytes = tx_chunk_bytes
         if enumerator is not None:
             self.enumerator = enumerator
         else:
@@ -165,6 +200,12 @@ class SCSIBulkHost(wiring.Component):
                     interface_protocol=MSCProtocol.BULK_ONLY,
                 ),
             )
+            # Swap the stock SIE for the vendored one (NYET decode — see
+            # sie.py's docstring). Same ctor args the enumerator itself used;
+            # the enumerator elaborates whatever instance `self.sie` holds.
+            self.enumerator.sie = USBSIE(
+                bus=kwargs.get("bus"),
+                handle_clocking=kwargs.get("handle_clocking", True))
         super().__init__()
 
     def elaborate(self, platform):
@@ -186,9 +227,17 @@ class SCSIBulkHost(wiring.Component):
 
         csw_sig = Signal(CSW)
         csw_flat = csw_sig.as_value()
-        captured_sig = Signal(ReadCapacity10Response)
-        captured_flat = captured_sig.as_value()
-        m.d.comb += self.captured.eq(captured_sig)
+        # Non-streamed capture buffer, sized for the widest capture command:
+        # REQUEST SENSE (18 bytes) > READ CAPACITY (8 bytes). `captured` views
+        # the low 8 bytes; `sense` picks key/ASC/ASCQ out of the sense layout.
+        captured_flat = Signal(unsigned(8 * 18))
+        m.d.comb += self.captured.eq(ReadCapacity10Response(captured_flat[0:64]))
+        m.d.comb += self.sense.eq(Cat(
+            captured_flat[13*8:14*8],    # ASCQ (byte 13)
+            captured_flat[12*8:13*8],    # ASC  (byte 12)
+            captured_flat[2*8:2*8+4],    # sense key (byte 2, low nibble)
+        ))
+        m.d.comb += self.csw.eq(csw_sig)
 
         endp_in = enum.parser.o.i_endp.number
         endp_out = enum.parser.o.o_endp.number
@@ -199,25 +248,43 @@ class SCSIBulkHost(wiring.Component):
         stream_mode = Signal()
         data_dir_r = Signal()   # latched cmd.data_dir (0=IN, 1=OUT)
 
+        # --- STALL recovery (BOT §6.7: clear the endpoint halt, then read the
+        # CSW to learn WHY the device bailed). ch_ep is the CLEAR_FEATURE
+        # wIndex low byte: endpoint number, bit 7 = IN direction.
+        ch_ep = Signal(8)
+        ch_retry = Signal(2)          # SETUP NAK/TIMEOUT retries (bounded)
+        csw_halt_retried = Signal()   # only one CSW clear-halt per command
+        setup_ix = Signal(range(8))
+        # CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType=0x02 (endpoint),
+        # bRequest=1, wValue=0 (ENDPOINT_HALT), wIndex=ch_ep, wLength=0.
+        ch_setup_byte = Signal(8)
+        with m.Switch(setup_ix):
+            for i, const_b in enumerate([0x02, 0x01, 0x00, 0x00,
+                                         None, 0x00, 0x00, 0x00]):
+                with m.Case(i):
+                    m.d.comb += ch_setup_byte.eq(
+                        ch_ep if const_b is None else const_b)
+
         # --- bulk-OUT (write) data phase state ---------------------------------
-        # 64-byte chunks (see _TX_CHUNK_BYTES). The SIE drains its own tx FIFO on
+        # tx_chunk_bytes-sized chunks (default 64, see _TX_CHUNK_BYTES). The
+        # SIE drains its own tx FIFO on
         # every transfer completion (guh/usbh/sie.py IPD_DRAIN_TX), including on a
         # NAK, so a NAK'd chunk's payload is gone from the SIE. We therefore keep
         # a local replay buffer here, filled from tx_data during DATA-TX-LOAD and
         # re-fed (same PID) from DATA-TX-RELOAD if the device NAKs.
         m.submodules.tx_replay = tx_replay = LibMemory(
-            shape=unsigned(8), depth=_TX_CHUNK_BYTES, init=[])
+            shape=unsigned(8), depth=self.tx_chunk_bytes, init=[])
         replay_wport = tx_replay.write_port(domain="usb")
         replay_rport = tx_replay.read_port(domain="comb")
 
-        tx_sent  = Signal(range(_TX_CHUNK_BYTES + 1))  # bytes fed to SIE this txn
+        tx_sent  = Signal(range(self.tx_chunk_bytes + 1))  # bytes fed to SIE this txn
         tx_total = Signal(32)                          # bytes ACKed this phase
         tx_remaining = Signal(32)
-        chunk_len = Signal(range(_TX_CHUNK_BYTES + 1))
+        chunk_len = Signal(range(self.tx_chunk_bytes + 1))
         m.d.comb += [
             tx_remaining.eq(data_len - tx_total),
-            chunk_len.eq(Mux(tx_remaining >= _TX_CHUNK_BYTES,
-                             _TX_CHUNK_BYTES, tx_remaining)),
+            chunk_len.eq(Mux(tx_remaining >= self.tx_chunk_bytes,
+                             self.tx_chunk_bytes, tx_remaining)),
         ]
 
         # Build CBW from command
@@ -267,7 +334,7 @@ class SCSIBulkHost(wiring.Component):
 
         m.d.comb += self.status.idle.eq(0)
 
-        with m.FSM(domain="usb"):
+        with m.FSM(domain="usb") as fsm:
 
             with m.State("WAIT-ENUMERATION"):
                 with m.If(enum.status.enumerated & enum.parser.o.valid):
@@ -282,6 +349,16 @@ class SCSIBulkHost(wiring.Component):
                         stream_mode.eq(self.cmd.stream_data),
                         data_dir_r.eq(self.cmd.data_dir),
                         tx_total.eq(0),
+                        self.nyets.eq(0),
+                        csw_halt_retried.eq(0),
+                        ch_retry.eq(0),
+                        # Per-command reject scope: the CSR peripheral latches
+                        # these on change-to-nonzero, so they must return to 0
+                        # between commands or a stale reject would re-latch
+                        # after the peripheral's own clear-on-strobe.
+                        self.reject_response.eq(0),
+                        self.reject_phase.eq(0),
+                        self.reject_txdone.eq(0),
                     ]
                     m.next = "CBW-LOAD"
 
@@ -304,12 +381,26 @@ class SCSIBulkHost(wiring.Component):
             with m.State("CBW-WAIT"):
                 with m.If(enum.ctrl.status.idle):
                     with m.Switch(enum.ctrl.status.response):
-                        with m.Case(TransferResponse.ACK):
+                        # NYET (HS only) = packet ACCEPTED, endpoint busy for
+                        # the NEXT one — advance exactly like ACK. The "busy"
+                        # half is handled by the existing NAK-replay path on
+                        # the following transaction (we skip the optional
+                        # PING protocol; devices tolerate OUT->NAK).
+                        with m.Case(TransferResponse.ACK,
+                                    TransferResponse.NYET):
                             m.d.usb += [
                                 pid_out.eq(Mux(pid_out, DataPID.DATA0, DataPID.DATA1)),
                                 rx_byte_idx.eq(0),
                                 rx_data_count.eq(0),
                             ]
+                            # .as_value() comparison: the production SIE's
+                            # `response` is an EnumView of guh's enum class;
+                            # `==` across enum classes raises TypeError (the
+                            # m.Case arms compare by value and don't care).
+                            with m.If((enum.ctrl.status.response.as_value()
+                                       == TransferResponse.NYET.value)
+                                      & (self.nyets != 0xFF)):
+                                m.d.usb += self.nyets.eq(self.nyets + 1)
                             with m.If(data_len > 0):
                                 with m.If(data_dir_r):
                                     m.next = "DATA-TX-START"
@@ -317,7 +408,28 @@ class SCSIBulkHost(wiring.Component):
                                     m.next = "DATA"
                             with m.Else():
                                 m.next = "CSW"
+                        with m.Case(TransferResponse.NAK):
+                            # NAK on the CBW OUT is flow control (drive busy,
+                            # e.g. flash housekeeping right after a write),
+                            # NOT rejection — re-send the identical CBW with
+                            # the same PID (toggle advances only on ACK).
+                            # Found on hardware 2026-07-15: the Default arm
+                            # below failed every export whose CBW was NAKed;
+                            # reads never provoked it (idle drives accept
+                            # CBWs immediately). The CBW bytes regenerate
+                            # combinationally from self.cmd (held by the
+                            # caller's *-WAIT state), so CBW-LOAD refills the
+                            # drained SIE FIFO correctly. Endless NAK is
+                            # backstopped by the caller's watchdog, same as
+                            # the CSW retry loop. Upstream guh has this same
+                            # bug on the read path — PR candidate.
+                            m.d.usb += tx_byte_idx.eq(0)
+                            m.next = "CBW-LOAD"
                         with m.Default():
+                            m.d.usb += [
+                                self.reject_response.eq(enum.ctrl.status.response),
+                                self.reject_phase.eq(1),   # CBW
+                            ]
                             m.d.comb += [
                                 self.status.done.eq(1),
                                 self.status.rejected.eq(1),
@@ -360,6 +472,21 @@ class SCSIBulkHost(wiring.Component):
                                 m.next = "DATA"
                         with m.Case(TransferResponse.NAK):
                             m.next = "DATA"
+                        with m.Default():
+                            # STALL/TIMEOUT/CRC on the data-IN phase: fail the
+                            # command instead of looping forever. (Gap found
+                            # 2026-07-15 alongside the CSW-RX one below —
+                            # previously no Default arm existed and the switch
+                            # simply retried nothing, wedging until watchdog.)
+                            m.d.usb += [
+                                self.reject_response.eq(enum.ctrl.status.response),
+                                self.reject_phase.eq(4),   # DATA-RX
+                            ]
+                            m.d.comb += [
+                                self.status.done.eq(1),
+                                self.status.rejected.eq(1),
+                            ]
+                            m.next = "IDLE"
 
             # --- bulk-OUT (write) data phase -----------------------------------
             # One OUT transaction per chunk_len (<= _TX_CHUNK_BYTES) bytes.
@@ -407,11 +534,24 @@ class SCSIBulkHost(wiring.Component):
             with m.State("DATA-TX-WAIT"):
                 with m.If(enum.ctrl.status.idle):
                     with m.Switch(enum.ctrl.status.response):
-                        with m.Case(TransferResponse.ACK):
+                        # NYET = accepted, same as ACK (see CBW-WAIT note) —
+                        # this was the 2026-07-15 hardware failure: HS drives
+                        # NYET write-data packets as flow control, and the
+                        # stock SIE reported that as TIMEOUT (rej=4/2/0).
+                        with m.Case(TransferResponse.ACK,
+                                    TransferResponse.NYET):
                             m.d.usb += [
                                 pid_out.eq(Mux(pid_out, DataPID.DATA0, DataPID.DATA1)),
                                 tx_total.eq(tx_total + chunk_len),
                             ]
+                            # .as_value() comparison: the production SIE's
+                            # `response` is an EnumView of guh's enum class;
+                            # `==` across enum classes raises TypeError (the
+                            # m.Case arms compare by value and don't care).
+                            with m.If((enum.ctrl.status.response.as_value()
+                                       == TransferResponse.NYET.value)
+                                      & (self.nyets != 0xFF)):
+                                m.d.usb += self.nyets.eq(self.nyets + 1)
                             with m.If(tx_total + chunk_len >= data_len):
                                 m.d.usb += rx_byte_idx.eq(0)
                                 m.next = "CSW"
@@ -421,7 +561,33 @@ class SCSIBulkHost(wiring.Component):
                             # Same data, same PID: replay from the local buffer.
                             m.d.usb += tx_sent.eq(0)
                             m.next = "DATA-TX-RELOAD"
+                        with m.Case(TransferResponse.STALL):
+                            # The device halted the bulk-OUT endpoint to
+                            # truncate the data phase (legal per BOT §6.7.3 —
+                            # e.g. it already knows the write fails). Recover
+                            # per spec: CLEAR_FEATURE(ENDPOINT_HALT) on the
+                            # OUT endpoint, then read the CSW, which reports
+                            # WHY (and unlocks the auto-REQUEST-SENSE path).
+                            # Found on hardware 2026-07-15 round five: the
+                            # 8GB stick STALLed after 2 data packets and,
+                            # with no recovery, every later CBW bounced off
+                            # the halted endpoint until the watchdog.
+                            # reject_* is latched as a diagnostic breadcrumb
+                            # even though the command itself continues.
+                            m.d.usb += [
+                                self.reject_response.eq(enum.ctrl.status.response),
+                                self.reject_phase.eq(2),   # DATA-TX
+                                self.reject_txdone.eq(tx_total[5:9]),
+                                ch_ep.eq(endp_out),
+                                ch_retry.eq(0),
+                            ]
+                            m.next = "CLEAR-HALT-LOAD"
                         with m.Default():
+                            m.d.usb += [
+                                self.reject_response.eq(enum.ctrl.status.response),
+                                self.reject_phase.eq(2),   # DATA-TX
+                                self.reject_txdone.eq(tx_total[5:9]),
+                            ]
                             m.d.comb += [
                                 self.status.done.eq(1),
                                 self.status.rejected.eq(1),
@@ -456,6 +622,167 @@ class SCSIBulkHost(wiring.Component):
                             m.next = "IDLE"
                         with m.Case(TransferResponse.NAK):
                             m.next = "CSW"
+                        with m.Case(TransferResponse.STALL):
+                            # A STALLed CSW: BOT §5.3.3/6.7.2 says clear the
+                            # IN endpoint's halt and retry the CSW read —
+                            # once. A second STALL means reset recovery is
+                            # needed; fail the command promptly (found on
+                            # hardware 2026-07-15: with no Default arm the
+                            # FSM sat in CSW-RX until the 10 s watchdog,
+                            # whose reset also zeroed these diagnostics).
+                            m.d.usb += [
+                                self.reject_response.eq(enum.ctrl.status.response),
+                                self.reject_phase.eq(3),   # CSW
+                            ]
+                            with m.If(~csw_halt_retried):
+                                m.d.usb += [
+                                    csw_halt_retried.eq(1),
+                                    ch_ep.eq(0x80 | endp_in),
+                                    ch_retry.eq(0),
+                                ]
+                                m.next = "CLEAR-HALT-LOAD"
+                            with m.Else():
+                                m.d.comb += [
+                                    self.status.done.eq(1),
+                                    self.status.rejected.eq(1),
+                                ]
+                                m.next = "IDLE"
+                        with m.Default():
+                            # TIMEOUT/CRC on the CSW — fail promptly.
+                            m.d.usb += [
+                                self.reject_response.eq(enum.ctrl.status.response),
+                                self.reject_phase.eq(3),   # CSW
+                            ]
+                            m.d.comb += [
+                                self.status.done.eq(1),
+                                self.status.rejected.eq(1),
+                            ]
+                            m.next = "IDLE"
+
+            # --- CLEAR_FEATURE(ENDPOINT_HALT) recovery ---------------------
+            # A control transfer on ep0 driven through the same pass-through
+            # SIE interface the bulk states use (mirrors the enumerator's
+            # SETUP helpers): SETUP(DATA0, 8 bytes) -> IN status stage
+            # (DATA1, ZLP). On success the halted endpoint's data toggle
+            # resets to DATA0 on both sides (USB 2.0 §9.4.5) and we proceed
+            # to the CSW, which reports why the device halted mid-command.
+
+            with m.State("CLEAR-HALT-LOAD"):
+                m.d.comb += [
+                    enum.ctrl.txs.valid.eq(1),
+                    enum.ctrl.txs.payload.eq(ch_setup_byte),
+                ]
+                with m.If(enum.ctrl.txs.ready):
+                    m.d.usb += setup_ix.eq(setup_ix + 1)
+                    with m.If(setup_ix == 7):
+                        m.d.usb += setup_ix.eq(0)
+                        m.next = "CLEAR-HALT-XFER"
+
+            with m.State("CLEAR-HALT-XFER"):
+                with m.If(enum.ctrl.status.idle):
+                    m.d.comb += [
+                        enum.ctrl.xfer.start.eq(1),
+                        enum.ctrl.xfer.type.eq(TransferType.SETUP),
+                        enum.ctrl.xfer.data_pid.eq(DataPID.DATA0),
+                        enum.ctrl.xfer.dev_addr.eq(enum.status.dev_addr),
+                        enum.ctrl.xfer.ep_addr.eq(0),
+                    ]
+                    m.next = "CLEAR-HALT-SETUP-WAIT"
+
+            with m.State("CLEAR-HALT-SETUP-WAIT"):
+                with m.If(enum.ctrl.status.idle):
+                    with m.Switch(enum.ctrl.status.response):
+                        with m.Case(TransferResponse.ACK):
+                            m.next = "CLEAR-HALT-STATUS"
+                        with m.Case(TransferResponse.NAK,
+                                    TransferResponse.TIMEOUT):
+                            # SETUP may not be NAKed per spec, but tolerate a
+                            # flaky link with a bounded retry (the SIE drains
+                            # its tx FIFO on completion, so reload the bytes).
+                            with m.If(ch_retry == 3):
+                                m.d.usb += [
+                                    self.reject_response.eq(
+                                        enum.ctrl.status.response),
+                                    self.reject_phase.eq(5),   # CTRL
+                                ]
+                                m.d.comb += [
+                                    self.status.done.eq(1),
+                                    self.status.rejected.eq(1),
+                                ]
+                                m.next = "IDLE"
+                            with m.Else():
+                                m.d.usb += ch_retry.eq(ch_retry + 1)
+                                m.next = "CLEAR-HALT-LOAD"
+                        with m.Default():
+                            m.d.usb += [
+                                self.reject_response.eq(
+                                    enum.ctrl.status.response),
+                                self.reject_phase.eq(5),   # CTRL
+                            ]
+                            m.d.comb += [
+                                self.status.done.eq(1),
+                                self.status.rejected.eq(1),
+                            ]
+                            m.next = "IDLE"
+
+            with m.State("CLEAR-HALT-STATUS"):
+                with m.If(enum.ctrl.status.idle):
+                    m.d.comb += [
+                        enum.ctrl.xfer.start.eq(1),
+                        enum.ctrl.xfer.type.eq(TransferType.IN),
+                        enum.ctrl.xfer.data_pid.eq(DataPID.DATA1),
+                        enum.ctrl.xfer.dev_addr.eq(enum.status.dev_addr),
+                        enum.ctrl.xfer.ep_addr.eq(0),
+                    ]
+                    m.next = "CLEAR-HALT-STATUS-WAIT"
+
+            with m.State("CLEAR-HALT-STATUS-WAIT"):
+                m.d.comb += enum.ctrl.rxs.ready.eq(1)   # drain the status ZLP
+                with m.If(enum.ctrl.status.idle):
+                    with m.Switch(enum.ctrl.status.response):
+                        with m.Case(TransferResponse.ACK):
+                            # Halt cleared — reset our copy of the endpoint's
+                            # toggle and go read the CSW.
+                            with m.If(ch_ep[7]):
+                                m.d.usb += pid_in.eq(DataPID.DATA0)
+                            with m.Else():
+                                m.d.usb += pid_out.eq(DataPID.DATA0)
+                            m.d.usb += rx_byte_idx.eq(0)
+                            m.next = "CSW"
+                        with m.Case(TransferResponse.NAK):
+                            m.next = "CLEAR-HALT-STATUS"
+                        with m.Default():
+                            m.d.usb += [
+                                self.reject_response.eq(
+                                    enum.ctrl.status.response),
+                                self.reject_phase.eq(5),   # CTRL
+                            ]
+                            m.d.comb += [
+                                self.status.done.eq(1),
+                                self.status.rejected.eq(1),
+                            ]
+                            m.next = "IDLE"
+
+        # Live phase decode for phase_o (see port comment). Same encoding as
+        # reject_phase; 0 = idle/enumeration. REGISTERED: this decode reads
+        # the whole FSM state register and feeds a cross-module diagnostic
+        # path (engine -> top glue -> CSR peripheral change-detect); a comb
+        # version measurably worsened routing congestion at 94% LUT. One
+        # cycle of lag is irrelevant for a stuck-phase breadcrumb.
+        ph_cbw = (fsm.ongoing("CBW-LOAD") | fsm.ongoing("CBW-XFER")
+                  | fsm.ongoing("CBW-WAIT"))
+        ph_tx = (fsm.ongoing("DATA-TX-START") | fsm.ongoing("DATA-TX-LOAD")
+                 | fsm.ongoing("DATA-TX-RELOAD") | fsm.ongoing("DATA-TX-XFER")
+                 | fsm.ongoing("DATA-TX-WAIT"))
+        ph_csw = fsm.ongoing("CSW") | fsm.ongoing("CSW-RX")
+        ph_rx = fsm.ongoing("DATA") | fsm.ongoing("DATA-RX")
+        ph_ctrl = (fsm.ongoing("CLEAR-HALT-LOAD") | fsm.ongoing("CLEAR-HALT-XFER")
+                   | fsm.ongoing("CLEAR-HALT-SETUP-WAIT")
+                   | fsm.ongoing("CLEAR-HALT-STATUS")
+                   | fsm.ongoing("CLEAR-HALT-STATUS-WAIT"))
+        m.d.usb += self.phase_o.eq(
+            Mux(ph_cbw, 1, Mux(ph_tx, 2, Mux(ph_csw, 3,
+                Mux(ph_rx, 4, Mux(ph_ctrl, 5, 0))))))
 
         return m
 
@@ -511,12 +838,28 @@ class USBMSCHost(wiring.Component):
     resp:    Out(Response)
     rx_data: Out(stream.Signature(Packet(unsigned(8))))
     tx_data: In(stream.Signature(unsigned(8)))   # block payload for write cmds
+    csw:     Out(CSW)   # last CSW (pass-through from SCSIBulkHost, diagnostics)
+    reject_response: Out(3)   # pass-through diagnostics (see SCSIBulkHost)
+    reject_phase:    Out(3)
+    reject_txdone:   Out(4)
+    nyets:           Out(8)   # pass-through: NYETs this command
+    phase_o:         Out(3)   # pass-through: live exchange phase
+    speed_o:         Out(2)   # negotiated link speed (USBHostSpeed)
+    # Auto-REQUEST-SENSE result after a failed WRITE ([19:16]=key, [15:8]=ASC,
+    # [7:0]=ASCQ). `sense_valid` set once captured, cleared on the next
+    # cmd.start. Issuing REQUEST SENSE after CHECK CONDITION is required BOT
+    # citizenship — some drives fail/STALL every later command until their
+    # pending sense data is drained (observed hardware cascade, 2026-07-15).
+    sense_o:       Out(20)
+    sense_valid_o: Out(1)
 
-    def __init__(self, *, bus=None, handle_clocking=True, device_address=0x12):
+    def __init__(self, *, bus=None, handle_clocking=True, device_address=0x12,
+                 tx_chunk_bytes=_TX_CHUNK_BYTES):
         self.scsi = SCSIBulkHost(
             bus=bus,
             handle_clocking=handle_clocking,
             device_address=device_address,
+            tx_chunk_bytes=tx_chunk_bytes,
         )
         super().__init__()
 
@@ -533,12 +876,30 @@ class USBMSCHost(wiring.Component):
 
         wiring.connect(m, scsi.rx_data, wiring.flipped(self.rx_data))
         wiring.connect(m, wiring.flipped(self.tx_data), scsi.tx_data)
+        m.d.comb += [
+            self.csw.eq(scsi.csw),
+            self.reject_response.eq(scsi.reject_response),
+            self.reject_phase.eq(scsi.reject_phase),
+            self.reject_txdone.eq(scsi.reject_txdone),
+            self.nyets.eq(scsi.nyets),
+            self.phase_o.eq(scsi.phase_o),
+        ]
+        # Sim stubs (StubEnumerator) have no SIE; leave speed_o at 0 there.
+        if hasattr(scsi.enumerator, "sie"):
+            m.d.comb += self.speed_o.eq(
+                scsi.enumerator.sie.ctrl.status.detected_speed)
 
         block_size = Signal(16, init=512)
         block_count = Signal(32)
         current_lba = Signal(32)
         is_write = Signal()
         init_retry = Signal(range(self._INIT_RETRY_MAX + 1))
+        sense_r = Signal(20)
+        sense_valid_r = Signal()
+        m.d.comb += [
+            self.sense_o.eq(sense_r),
+            self.sense_valid_o.eq(sense_valid_r),
+        ]
 
         watchdog = Signal(32)
         watchdog_expired = Signal()
@@ -625,6 +986,7 @@ class USBMSCHost(wiring.Component):
                     m.d.usb += [
                         current_lba.eq(self.cmd.lba),
                         is_write.eq(self.cmd.write),
+                        sense_valid_r.eq(0),
                     ]
                     with m.If(self.cmd.write):
                         m.next = "WRITE"
@@ -698,6 +1060,39 @@ class USBMSCHost(wiring.Component):
                         self.resp.done.eq(1),
                         self.resp.error.eq(scsi.status.error | scsi.status.rejected),
                     ]
+                    # A CSW FAILED (CHECK CONDITION) leaves pending sense data
+                    # on the drive; drain it with an auto REQUEST SENSE (and
+                    # capture key/ASC/ASCQ for firmware diagnostics). Only for
+                    # a clean CSW failure — after a rejected (bus-level)
+                    # exchange the transport may be desynced and another
+                    # command would just wedge again.
+                    with m.If(scsi.status.error & ~scsi.status.rejected):
+                        m.next = "SENSE"
+                    with m.Else():
+                        m.next = "READY"
+
+            def sense_cdb():
+                return [
+                    cdb6.opcode.eq(SCSIOpCode.REQUEST_SENSE),
+                    cdb6["_misc"].eq(18 << 24),   # allocation length (byte 4)
+                    scsi_cmd.data_len.eq(18),
+                    scsi_cmd.stream_data.eq(0),
+                    scsi_cmd.data_dir.eq(0),
+                ]
+
+            with m.State("SENSE"):
+                m.d.comb += sense_cdb() + [scsi_cmd.start.eq(1)]
+                m.next = "SENSE-WAIT"
+
+            with m.State("SENSE-WAIT"):
+                m.d.comb += sense_cdb()
+                with m.If(scsi.status.done):
+                    with m.If(~scsi.status.error & ~scsi.status.rejected):
+                        m.d.usb += [
+                            watchdog.eq(0),
+                            sense_r.eq(scsi.sense),
+                            sense_valid_r.eq(1),
+                        ]
                     m.next = "READY"
 
         return ResetInserter({"usb": watchdog_expired})(m)
