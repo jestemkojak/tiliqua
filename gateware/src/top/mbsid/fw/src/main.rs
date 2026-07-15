@@ -736,16 +736,18 @@ fn main() -> ! {
                                 d.rd_fail_first.get();
                             let (r2, w2, l2, s2, rr2, rp2, n2, p2) =
                                 d.rd_fail.get();
+                            let path1 = d.rd_path_first.get();
+                            let path2 = d.rd_path.get();
                             let mut msg: heapless::String<256> =
                                 heapless::String::new();
                             let _ = core::fmt::Write::write_fmt(&mut msg,
                                 format_args!(
                                     "export: rd1 rsn={} w={} lba={} sp={} \
-                                     rej={}/{} ny={} lph={}\r\n\
+                                     rej={}/{} ny={} lph={} pth={:08x}\r\n\
                                      export: rdL rsn={} w={} lba={} sp={} \
-                                     rej={}/{} ny={} lph={}\r\n",
-                                    r1, w1, l1, s1, rr1, rp1, n1, p1,
-                                    r2, w2, l2, s2, rr2, rp2, n2, p2));
+                                     rej={}/{} ny={} lph={} pth={:08x}\r\n",
+                                    r1, w1, l1, s1, rr1, rp1, n1, p1, path1,
+                                    r2, w2, l2, s2, rr2, rp2, n2, p2, path2));
                             core::fmt::Write::write_str(
                                 &mut stack_probe_serial, msg.as_str()).ok();
                         }
