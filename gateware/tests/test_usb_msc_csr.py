@@ -15,6 +15,17 @@ async def csr_write(ctx, dut, offset, value):
     await ctx.tick()
 
 
+async def csr_read32(ctx, dut, offset):
+    value = 0
+    for i in range(4):
+        ctx.set(dut.bus.addr, offset + i)
+        ctx.set(dut.bus.r_stb, 1)
+        await ctx.tick()
+        ctx.set(dut.bus.r_stb, 0)
+        value |= ctx.get(dut.bus.r_data) << (8 * i)
+    return value
+
+
 class UsbMscCsrTests(unittest.TestCase):
     def test_mode_register_drives_mode_o(self):
         dut = USBMSCPeripheral(with_mode=True)
@@ -52,6 +63,57 @@ class UsbMscCsrTests(unittest.TestCase):
         self.assertNotIn("start_write", joined)
         self.assertFalse(hasattr(dut, "_tx_data"))
         self.assertFalse(hasattr(dut, "_start_write"))
+        self.assertNotIn("read_path_info", joined)
+        self.assertFalse(hasattr(dut, "_read_path_info"))
+
+    def test_read_path_info_counts_and_resets_on_read_start(self):
+        dut = USBMSCPeripheral(with_mode=True, with_write=True)
+        m = Module()
+        m.submodules.dut = dut
+
+        async def testbench(ctx):
+            ctx.set(dut.engine_rx_bytes_i, 512)
+            ctx.set(dut.engine_stream_mode_i, 1)
+            ctx.set(dut.engine_data_len_512_i, 1)
+            ctx.set(dut.rx_data.valid, 1)
+            for b in range(8):
+                ctx.set(dut.rx_data.payload.data, b)
+                await ctx.tick()
+            ctx.set(dut.rx_data.valid, 0)
+            await ctx.tick()
+
+            raw = await csr_read32(ctx, dut, 0x38)
+            self.assertEqual(raw & 0x3FF, 512)
+            self.assertEqual((raw >> 10) & 0x3FF, 8)
+            self.assertEqual((raw >> 20) & 0xFF, 2)
+            self.assertEqual((raw >> 28) & 1, 1)
+            self.assertEqual((raw >> 29) & 1, 1)
+            self.assertEqual(raw >> 30, 0)
+
+            # Continue past both counter maxima. The byte counter must stop at
+            # 1023, and the accepted-word counter must stop at 255 rather than
+            # wrapping to zero when the 256-word FIFO becomes full.
+            ctx.set(dut.rx_data.valid, 1)
+            for b in range(1100):
+                ctx.set(dut.rx_data.payload.data, b & 0xFF)
+                await ctx.tick()
+            ctx.set(dut.rx_data.valid, 0)
+            await ctx.tick()
+            raw = await csr_read32(ctx, dut, 0x38)
+            self.assertEqual((raw >> 10) & 0x3FF, 1023)
+            self.assertEqual((raw >> 20) & 0xFF, 255)
+
+            await csr_write(ctx, dut, 0x10, 1)
+            await ctx.tick()
+            raw = await csr_read32(ctx, dut, 0x38)
+            self.assertEqual(raw & 0x3FF, 512)  # live engine input
+            self.assertEqual((raw >> 10) & 0x3FF, 0)
+            self.assertEqual((raw >> 20) & 0xFF, 0)
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
 
     def test_tx_words_unpack_to_byte_stream(self):
         dut = USBMSCPeripheral(with_mode=True, with_write=True)
