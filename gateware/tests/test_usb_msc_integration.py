@@ -376,6 +376,13 @@ class UsbMscIntegrationTests(unittest.TestCase):
                             return
                     w = await fw.csr_read32(ctx, 0x14)
                     data += list(w.to_bytes(4, "little"))
+                for _ in range(200000):
+                    if result.get("read_csw_nak_seen"):
+                        break
+                    await ctx.tick("sync")
+                else:
+                    raise AssertionError("drive never NAKed the read CSW")
+                result["read_path"] = await fw.csr_read32(ctx, 0x38)
                 result["rerr"] = False
                 result["rdata"] = data
             return tb
@@ -398,6 +405,8 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 for i in range(8):
                     await drive.do_in(ctx, sector[i*64:(i+1)*64],
                                       TransferResponse.ACK)
+                await drive.do_in(ctx, [], TransferResponse.NAK)
+                result["read_csw_nak_seen"] = True
                 await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
             return tb
 
@@ -408,6 +417,13 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertFalse(result.get("rerr"),
                          "read after write errored (glue bug)")
         self.assertEqual(result.get("rdata"), sector)
+        read_path = result.get("read_path", 0)
+        self.assertEqual(read_path & 0x3FF, 512)          # engine_bytes
+        self.assertEqual((read_path >> 10) & 0x3FF, 512) # periph_bytes
+        self.assertEqual((read_path >> 20) & 0xFF, 128)  # periph_words
+        self.assertEqual((read_path >> 28) & 1, 1)       # stream_mode
+        self.assertEqual((read_path >> 29) & 1, 1)       # data_len_512
+        self.assertEqual(read_path >> 30, 0)
 
     def test_csw_failed_reaches_firmware_diag_and_autosenses(self):
         """A CSW with bCSWStatus=1 must surface as resp.error=1, be readable
