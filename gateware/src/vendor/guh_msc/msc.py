@@ -924,6 +924,33 @@ class USBMSCHost(wiring.Component):
         m.d.usb += watchdog.eq(watchdog + 1)
         m.d.comb += watchdog_expired.eq(watchdog >= (self._WATCHDOG_CYCLES - 1))
 
+        # Handshake-fed watchdog (round seven, 2026-07-15). A drive answering
+        # NAK is PRESENT and flow-controlling (e.g. FTL commit right after a
+        # write); the completion-fed watchdog above used to hard-reset the
+        # whole engine 10 s into any long NAK wait — round six proved the
+        # post-write READ(10) dies exactly this way, wiping the diagnostics
+        # with it. Hold the watchdog cleared while the SIE's last completed
+        # transaction ended in a live handshake. Deliberately EXCLUDED so the
+        # reset keeps its unplug/recovery role:
+        #   TIMEOUT/NONE - silent bus is the only unplug signal there is
+        #                  (the firmware keepalive supplies the probe traffic);
+        #   STALL        - bounded by the clear-halt recovery paths; a drive
+        #                  that STALLs everything SHOULD get re-enumerated;
+        #   CRC/OVERFLOW - persistent garbage also wants the reset.
+        # Registered (m.d.usb): cross-module-fanout lesson from round five;
+        # one cycle of lag is nothing against a 600M-cycle budget.
+        # .as_value() comparison: the production SIE's `response` is an
+        # EnumView of guh's enum class (see ProductionElaborationTest).
+        resp_live = Signal()
+        resp_v = enum.ctrl.status.response.as_value()
+        m.d.usb += resp_live.eq(
+            enum.ctrl.status.idle
+            & ((resp_v == TransferResponse.ACK.value)
+               | (resp_v == TransferResponse.NAK.value)
+               | (resp_v == TransferResponse.NYET.value)))
+        with m.If(resp_live):
+            m.d.usb += watchdog.eq(0)
+
         m.d.comb += [
             self.status.connected.eq(enum.status.enumerated),
             self.status.ready.eq(~self.status.busy),
