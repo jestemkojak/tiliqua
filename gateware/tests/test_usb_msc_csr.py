@@ -110,6 +110,131 @@ class UsbMscCsrTests(unittest.TestCase):
         sim.add_testbench(testbench)
         sim.run()
 
+    def test_write_contract_strobe_then_fill_defers_start(self):
+        # THE regression test for the 2026-07-14 drive-corruption incident:
+        # the engine must never be started (start_write_o) until the full
+        # 512-byte payload is banked in the TX FIFO. Contract: strobe
+        # start_write FIRST (flushes leftovers, clears sticky resp), THEN
+        # push 128 words; start_write_o fires exactly once, only after the
+        # 128th word, and the byte stream then yields all 512 bytes intact.
+        dut = USBMSCPeripheral(with_mode=True, with_write=True)
+        m = Module()
+        m.submodules.dut = dut
+        # Count start_write_o pulses in hardware so no testbench-interleaving
+        # gap can miss a 1-cycle pulse.
+        pulse_count = Signal(8)
+        with m.If(dut.start_write_o):
+            m.d.sync += pulse_count.eq(pulse_count + 1)
+
+        def word_bytes(i):
+            return [(4 * i + k) & 0xFF for k in range(4)]
+
+        async def testbench(ctx):
+            ctx.set(dut.tx_data_o.ready, 0)
+            await csr_write(ctx, dut, 0x24, 1)   # start_write strobe FIRST
+            await ctx.tick()
+            self.assertEqual(ctx.get(pulse_count), 0,
+                             "engine started with an empty payload FIFO")
+            # 127 words: still no start.
+            for i in range(127):
+                for off, b in [(0x20 + k, word_bytes(i)[k]) for k in range(4)]:
+                    await csr_write(ctx, dut, off, b)
+            await ctx.tick()
+            self.assertEqual(ctx.get(pulse_count), 0,
+                             "engine started before the full payload was banked")
+            # 128th word completes the block: exactly one start pulse.
+            for off, b in [(0x20 + k, word_bytes(127)[k]) for k in range(4)]:
+                await csr_write(ctx, dut, off, b)
+            for _ in range(8):
+                await ctx.tick()
+            self.assertEqual(ctx.get(pulse_count), 1)
+            # Full payload must now stream out intact. Sample BEFORE each
+            # tick: the byte on the payload wires is the one consumed at
+            # that tick's edge (valid & ready).
+            ctx.set(dut.tx_data_o.ready, 1)
+            got = []
+            for _ in range(2048):
+                if ctx.get(dut.tx_data_o.valid):
+                    got.append(ctx.get(dut.tx_data_o.payload))
+                await ctx.tick()
+                if len(got) == 512:
+                    break
+            self.assertEqual(got, [i & 0xFF for i in range(512)])
+            self.assertEqual(ctx.get(pulse_count), 1)  # still exactly one
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+    def test_restrobe_after_partial_fill_flushes_and_rearms(self):
+        # An abandoned partial fill (e.g. firmware died mid-write) must not
+        # contaminate the next write: re-strobing flushes the leftovers and
+        # re-arms, and the next full 128-word fill starts the engine with
+        # ONLY the fresh payload.
+        dut = USBMSCPeripheral(with_mode=True, with_write=True)
+        m = Module()
+        m.submodules.dut = dut
+        pulse_count = Signal(8)
+        with m.If(dut.start_write_o):
+            m.d.sync += pulse_count.eq(pulse_count + 1)
+
+        async def testbench(ctx):
+            ctx.set(dut.tx_data_o.ready, 0)
+            await csr_write(ctx, dut, 0x24, 1)          # arm
+            for i in range(5):                          # partial fill, abandoned
+                for k in range(4):
+                    await csr_write(ctx, dut, 0x20 + k, 0xEE)
+            await csr_write(ctx, dut, 0x24, 1)          # re-strobe: flush+rearm
+            for i in range(128):                        # fresh full payload
+                for k in range(4):
+                    await csr_write(ctx, dut, 0x20 + k, (4 * i + k) & 0xFF)
+            for _ in range(8):
+                await ctx.tick()
+            self.assertEqual(ctx.get(pulse_count), 1)
+            ctx.set(dut.tx_data_o.ready, 1)
+            got = []
+            for _ in range(2048):
+                if ctx.get(dut.tx_data_o.valid):
+                    got.append(ctx.get(dut.tx_data_o.payload))
+                await ctx.tick()
+                if len(got) == 512:
+                    break
+            # No 0xEE leftovers — fresh payload only.
+            self.assertEqual(got, [i & 0xFF for i in range(512)])
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+    def test_read_start_cancels_armed_write(self):
+        # A read command (start strobe) issued after arming a write must
+        # cancel the pending write-start: stray tx words later reaching 128
+        # must NOT launch a surprise WRITE at a stale LBA.
+        dut = USBMSCPeripheral(with_mode=True, with_write=True)
+        m = Module()
+        m.submodules.dut = dut
+        pulse_count = Signal(8)
+        with m.If(dut.start_write_o):
+            m.d.sync += pulse_count.eq(pulse_count + 1)
+
+        async def testbench(ctx):
+            ctx.set(dut.tx_data_o.ready, 0)
+            await csr_write(ctx, dut, 0x24, 1)   # arm write
+            await csr_write(ctx, dut, 0x10, 1)   # read start: cancels
+            for i in range(128):
+                for k in range(4):
+                    await csr_write(ctx, dut, 0x20 + k, 0x55)
+            for _ in range(8):
+                await ctx.tick()
+            self.assertEqual(ctx.get(pulse_count), 0)
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+
     def test_start_write_resets_tx_fifo(self):
         # A leftover word from a prior (partial/failed) write must not
         # survive into the next write — start_write should flush the TX
