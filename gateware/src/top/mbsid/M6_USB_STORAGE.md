@@ -272,6 +272,68 @@ Interpret the failing `rd1` snapshot in this order:
 - `engine_bytes<512` or `data_len_512=0` while `lph=3`: re-examine the
   engine's CSW transition and sampled command length.
 
+#### Round-six diagnostic results (2026-07-15 hardware run, 8GB stick)
+
+```
+export: begin P000.SYX got=1 rdy=1 conn=1 bs=512
+export: ok=0 mount=1 d_rd=7 d_rderr=2 d_wr=1 d_wrok=1 ... spins=35533
+export: rd1 rsn=3 w=0 lba=2048 sp=10000000 rej=0/0 ny=0 lph=3 pth=00000000
+export: rdL rsn=1 w=0 lba=32560 sp=0 rej=0/0 ny=0 lph=3 pth=00000000
+usb: conn=0 rdy=0 bs=512 spd=3 t=99961ms
+```
+
+`pth=00000000` on both snapshots. Decoded carefully, this run settles more than it
+looks like it does:
+
+1. **The Tiliqua datapath is exonerated.** `periph_bytes`/`periph_words` live in the
+   CSR peripheral's `sync` domain, are immune to the engine watchdog, and reset only
+   on start strobes — and no start strobe happened after `rd1`'s (the `rdL` call
+   failed the ready check *before* strobing, and the keepalive stops once
+   `drive_ready` drops). So `periph_bytes=0` is trustworthy across the whole failure
+   window: **not one data byte crossed into the peripheral for the post-write
+   READ(10)**. The engine's stream FIFO drains combinationally into the peripheral
+   (`rx_data.ready` is tied high), so the engine itself also received ~0 bytes from
+   the SIE. Packer/FIFO/CSR/firmware legs of the interpretation table are all ruled
+   out — the loss is at the USB transaction level: the drive never delivered data.
+2. **The engine-side live fields were wiped by the watchdog — the snapshot happened
+   too late.** `stream_mode=0` + `data_len_512=0` cannot be a live mid-read
+   observation: both are latched from the command in `IDLE` (READ sets
+   `stream_data=1`, `data_len=512`) and `data_len` never decrements. The outer FSM
+   also accepted the read start cleanly (it was in `READY`; the write had completed
+   with a passing CSW). So by snapshot time the engine had been watchdog-reset:
+   **`MAX_SPIN=10_000_000` outlasts the 10 s watchdog** — each spin does two 32-bit
+   CSR reads (`status`, `resp`), each serialized as 4 byte-wide CSR bus accesses, so
+   the loop is far slower than the ~3 s the `usb_msc.rs` comment estimated.
+3. **`lph=3` is NOT the failing read's phase.** `last_phase` is last-change-wins and
+   was overwritten by the post-watchdog recovery: after re-enumeration the outer FSM
+   issues TEST UNIT READY (`data_len=0`, `stream=0`), which goes CBW→CSW directly —
+   and wedged in the CSW phase too. That also explains `rdL rsn=1` (engine never got
+   back to `READY`) and the final `conn=0 spd=3` (enumeration eventually lost; with
+   hotplug re-detection broken it stays lost).
+
+**Net picture:** the stick accepts WRITE(10)+data+CSW, then goes into a busy/wedged
+state where it NAKs the following READ(10) exchange (no data, no STALL, no reject)
+for >10 s, and after the watchdog reset it still won't complete a TEST UNIT READY.
+This is drive-side/transport behavior, not a Tiliqua data-path bug.
+
+**Gaps for the next diagnostic round** (the round-six plan's "snapshot happens ~3 s
+in, before the watchdog" assumption is disproven):
+
+- Latch the read-path fields watchdog-immune in the peripheral (same
+  change-to-nonzero pattern as `reject_info`), and/or take an *early* firmware
+  `pth` snapshot a fixed spin count in (e.g. 100k spins, safely pre-watchdog) in
+  addition to the final one.
+- A phases-seen OR-mask (5 bits, frozen when `connected` falls = watchdog fired)
+  would pin whether the failing read wedged at CBW (drive NAKed the command) or at
+  DATA (CBW accepted, data-IN NAKed forever) — `last_phase` alone can't, because
+  recovery traffic overwrites it.
+- Calibrate spins→ms once via Timer0 so `sp=` values convert to wall time.
+- Candidate *fix* directions (not diagnostics): BOT Bulk-Only Mass Storage Reset
+  recovery (never issued today — §6.7's reset recovery is class request 0xFF +
+  clear both halts, distinct from the clear-halt-only path added in round five),
+  and re-examining whether a drive that busy-NAKs reads for >10 s after a write
+  simply needs the watchdog/retry budget rethought around FTL commit time.
+
 **Testing lesson encoded in `tests/test_usb_msc_integration.py`:** every per-layer test was
 green while the assembled stack failed on hardware — the CSR peripheral, the engine, and the
 `top.py` command glue had never been simulated *together*, and the glue had zero sim coverage.
@@ -322,6 +384,41 @@ resource has only an `rx` subsignal on every board revision), the USB-C port is 
 (can never appear as a MIDI device to a PC, `CLAUDE.md`), and M4 already documents "No MIDI
 TX — ACK/DISACK is swallowed". A user-edited patch saved to the M4 flash bank currently can
 never leave the module except via debug flash tooling. USB drive export closes that gap.
+
+### Seventh round (2026-07-15) — handshake-fed watchdog + wall-clock firmware timeouts (behavior change, not just diagnostics)
+
+Round six established that the drive never sent one data byte for the post-write
+READ(10) and that the engine's completion-fed 10 s watchdog reset the engine (and
+wiped the live diagnostics) while firmware was still polling. Round seven changes
+behavior accordingly — direction (a) of the two fix candidates; BOT Reset Recovery
+is direction (b), not attempted here:
+
+- **Handshake-fed watchdog** (`vendor/guh_msc/msc.py`, `resp_live`): the watchdog
+  is held cleared while the SIE's last transaction ended ACK/NAK/NYET — a NAKing
+  drive is present and flow-controlling (FTL commit after a write) and now gets
+  unbounded engine-side patience. TIMEOUT/NONE (silent bus = unplug), STALL
+  (clear-halt paths own it; a stall-everything drive should re-enumerate), and
+  CRC/OVERFLOW still count. No new ports or CSRs. Sim:
+  `test_read_survives_nak_wait_longer_than_watchdog` (fails against the old
+  engine) + `test_watchdog_still_fires_on_silent_drive` (unplug guard).
+- **Firmware wall-clock timeouts** (`fw/src/uptime.rs` + `usb_msc.rs`): spin caps
+  were uncalibrated (round six's "10M spins ~ 3 s" was actually >10 s — 2
+  byte-serialized CSR reads per spin); read/write polls now budget
+  `READ_TIMEOUT_MS`/`WRITE_TIMEOUT_MS` = 30 s of Timer0 1 ms uptime, with an
+  early abort (new read reason **4**) when `connected` drops mid-command.
+  Failure lines print `ms=` beside `sp=`, giving spins->ms calibration for free
+  (`wms=` on the export summary line does the same for writes).
+
+**What the next disposable-media run tells us:** with the watchdog no longer
+firing mid-NAK-wait, the failing verify read either (1) completes after N s —
+the export just works and `wms=`/keepalive logs bound N; (2) fails at rsn=3 with
+`ms=30000` and a **live** `pth` (the engine is no longer reset, so
+engine_bytes/stream_mode/data_len_512 are finally trustworthy — decode against
+the round-six table); or (3) fails rsn=4 (engine lost the drive: the drive
+itself dropped off the bus, which no host-side patience fixes and which argues
+for direction (b)'s BOT Reset Recovery). UI note: the export runs synchronously,
+so worst case the menu now freezes up to ~30 s per failing read — expected, not
+a hang; the 8.3/`BUSY` caveats from the M6b gotcha block still apply.
 
 ## 1. Goal & non-goals
 
