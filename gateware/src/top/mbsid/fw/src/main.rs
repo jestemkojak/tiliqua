@@ -35,7 +35,7 @@ use tiliqua_fw::sysex_capture::SysexCapture;
 use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
 use tiliqua_fw::menu::PressResult;
 use tiliqua_fw::cv::{self, CvSink};
-use tiliqua_fw::{params, settings_store};
+use tiliqua_fw::{params, settings_store, uptime};
 use tiliqua_fw::usb_patch;
 use tiliqua_fw::fat::{FileSystem, FsOptions, MscStorage};
 use tiliqua_fw::menu::{DriveState, UsbInfo};
@@ -116,8 +116,6 @@ struct App {
     cv: cv::CvState,
     /// Calibrated Eurorack CV/gate input jacks, sampled once per ISR tick.
     pmod: EurorackPmod0,
-    /// ISR tick counter: main-loop debounce timebase (settings persist).
-    uptime_ms: u32,
 }
 
 impl App {
@@ -125,7 +123,7 @@ impl App {
         Self {
             diff_l: RegDiff::new(), diff_r: RegDiff::new(), wl: WriteList::new(),
             sysex_cap: SysexCapture::new(), sysex_idle_ms: 0, pending_save: None,
-            cv: cv::CvState::new(), pmod, uptime_ms: 0,
+            cv: cv::CvState::new(), pmod,
         }
     }
 }
@@ -138,10 +136,6 @@ impl CvSink for EngineSink {
     fn par(&mut self, par: u8, value16: u16) { mbsid_sys::par_set(par, value16); }
     fn note_on(&mut self, note: u8) { mbsid_sys::note_on(0, note, 100); } // MIDI ch 1
     fn note_off(&mut self, note: u8) { mbsid_sys::note_off(0, note); }
-}
-
-fn now_ms(app: &Mutex<RefCell<App>>) -> u32 {
-    critical_section::with(|cs| app.borrow_ref(cs).uptime_ms)
 }
 
 /// Drain a write list to a SID peripheral, respecting FIFO backpressure
@@ -250,7 +244,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         // (a3) CV modulation: sample the calibrated inputs and route per the
         // menu's target assignments (M5 §6b). Integer-only; engine calls are
         // the same knob/par paths MIDI CC takes.
-        app.uptime_ms = app.uptime_ms.wrapping_add(1);
+        uptime::tick_1ms();
         let x = app.pmod.sample_i();
         let App { cv, .. } = &mut *app;
         cv.tick(x, &mut EngineSink);
@@ -556,7 +550,7 @@ fn main() -> ! {
                     let _ = core::fmt::Write::write_fmt(&mut msg,
                         format_args!("usb: conn={} rdy={} bs={} spd={} t={}ms\r\n",
                             snap.0 as u8, snap.1 as u8, snap.2,
-                            usb_msc.speed(), now_ms(&app)));
+                            usb_msc.speed(), uptime::now_ms()));
                     core::fmt::Write::write_str(
                         &mut stack_probe_serial, msg.as_str()).ok();
                 }
@@ -574,7 +568,7 @@ fn main() -> ! {
             // fires as designed and `ready` drops.
             if drive_ready {
                 const MSC_KEEPALIVE_MS: u32 = 2000;
-                let now = now_ms(&app);
+                let now = uptime::now_ms();
                 if now.wrapping_sub(msc_keepalive_at) >= MSC_KEEPALIVE_MS {
                     msc_keepalive_at = now;
                     let mut scratch = [0u8; 512];
@@ -619,7 +613,7 @@ fn main() -> ! {
                             let App { cv, .. } = &mut *a;
                             cv.set_targets(state.cv_targets, &mut EngineSink);
                         });
-                        settings_dirty_at = Some(now_ms(&app));
+                        settings_dirty_at = Some(uptime::now_ms());
                     }
                     TurnResult::None => {}
                 }
@@ -803,7 +797,7 @@ fn main() -> ! {
 
             // Persist settings ~2s after the last change (flash wear; §6d).
             if let (Some(t0), Some(ref w)) = (settings_dirty_at, opt_window.as_ref()) {
-                if now_ms(&app).wrapping_sub(t0) >= 2000 {
+                if uptime::now_ms().wrapping_sub(t0) >= 2000 {
                     let s = settings_store::Settings {
                         midi_src: (state.midi_src == menu::MidiSource::Usb) as u8,
                         cv_targets: state.cv_targets.map(|t| t.to_u8()),
