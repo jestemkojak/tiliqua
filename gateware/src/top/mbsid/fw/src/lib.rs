@@ -12,5 +12,6 @@ pub mod settings_store;
 pub mod partition;
 pub mod fat;
 pub mod usb_patch;
+pub mod uptime;
 #[cfg(not(test))]
 pub mod usb_msc;            // pac-dependent: embedded only

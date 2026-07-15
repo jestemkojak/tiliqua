@@ -39,6 +39,11 @@ cc = "1.0"
 name = "tiliqua_fw"
 path = "src/lib.rs"
 
+[dev-dependencies]
+# Host tests only: provides the critical-section implementation the uptime
+# counter needs on x86 (the riscv crate's impl is riscv-gated).
+critical-section = { version = "1.2.0", features = ["std"] }
+
 [profile.release]
 codegen-units = 1
 debug = true
