@@ -110,6 +110,27 @@ class UsbMscCsrTests(unittest.TestCase):
             self.assertEqual((raw >> 10) & 0x3FF, 0)
             self.assertEqual((raw >> 20) & 0xFF, 0)
 
+            # Re-prime both peripheral counters, then verify a write start
+            # clears them without disturbing the live engine-side fields.
+            ctx.set(dut.rx_data.valid, 1)
+            for b in range(8):
+                ctx.set(dut.rx_data.payload.data, b)
+                await ctx.tick()
+            ctx.set(dut.rx_data.valid, 0)
+            await ctx.tick()
+            raw = await csr_read32(ctx, dut, 0x38)
+            self.assertEqual((raw >> 10) & 0x3FF, 8)
+            self.assertEqual((raw >> 20) & 0xFF, 2)
+
+            await csr_write(ctx, dut, 0x24, 1)
+            await ctx.tick()
+            raw = await csr_read32(ctx, dut, 0x38)
+            self.assertEqual(raw & 0x3FF, 512)  # live engine input
+            self.assertEqual((raw >> 10) & 0x3FF, 0)
+            self.assertEqual((raw >> 20) & 0xFF, 0)
+            self.assertEqual((raw >> 28) & 1, 1)  # live stream mode
+            self.assertEqual((raw >> 29) & 1, 1)  # live 512-byte flag
+
         sim = Simulator(m)
         sim.add_clock(1e-6)
         sim.add_testbench(testbench)
