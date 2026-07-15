@@ -253,7 +253,8 @@ class SCSIBulkHost(wiring.Component):
         stream_mode = Signal()
         data_dir_r = Signal()   # latched cmd.data_dir (0=IN, 1=OUT)
         m.d.comb += [
-            self.rx_bytes_o.eq(rx_data_count[:10]),
+            self.rx_bytes_o.eq(Mux(
+                rx_data_count >= 0x3FF, 0x3FF, rx_data_count[:10])),
             self.stream_mode_o.eq(stream_mode),
             self.data_len_512_o.eq(data_len == 512),
         ]
@@ -355,6 +356,7 @@ class SCSIBulkHost(wiring.Component):
                 with m.If(self.cmd.start):
                     m.d.usb += [
                         tx_byte_idx.eq(0),
+                        rx_data_count.eq(0),
                         data_len.eq(self.cmd.data_len),
                         stream_mode.eq(self.cmd.stream_data),
                         data_dir_r.eq(self.cmd.data_dir),
