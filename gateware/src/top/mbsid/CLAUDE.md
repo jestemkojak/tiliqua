@@ -319,6 +319,10 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   breadcrumb) restored 64.46 MHz PASS at the default seed. Cross-module diagnostic
   fanout wants a register at the source, same spirit as the root CLAUDE.md's
   register-the-MULT rule.
+  - **Round-six read-path `pth` diagnostic:** `pth` is the raw `read_path_info`
+    CSR: engine bytes `[9:0]`, peripheral bytes `[19:10]`, packed words
+    `[27:20]`, sampled stream mode `[28]`, sampled-length-is-512 `[29]`.
+    It is diagnostic-only and sampled before the engine's 10 s watchdog.
   **Per-layer sim tests all passed while the assembled stack failed on hardware** — the
   CSR peripheral + engine + `top.py` glue combination is now covered by
   `tests/test_usb_msc_integration.py` (firmware-exact CSR sequences vs a scripted
