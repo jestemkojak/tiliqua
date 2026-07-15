@@ -556,16 +556,14 @@ fn main() -> ! {
                 }
             }
             // --- end TEMPORARY --------------------------------------------
-            // Idle keepalive: the MSC engine's watchdog (vendor msc.py,
-            // _WATCHDOG_CYCLES = 10 s) is only fed by a *completed* SCSI
-            // command and keeps counting in the READY state, so an idle
-            // drive gets the whole USB engine reset + re-enumerated every
-            // 10 s (menu flickers Ready -> No drive -> Ready). That reset
-            // is also the only unplug detection the enumerator has, so
-            // instead of silencing it in gateware we feed it: read one
-            // block every couple of seconds while ready. A failed read
-            // (drive yanked) is deliberately ignored -- the watchdog then
-            // fires as designed and `ready` drops.
+            // Idle keepalive: the MSC engine's watchdog (vendor msc.py) is
+            // handshake-fed since round seven — any ACK/NAK/NYET holds it
+            // cleared — but an IDLE bus produces no handshakes at all (SOFs
+            // don't touch the SIE response), so a quiet READY drive would
+            // still be reset every 10 s without probe traffic. The keepalive
+            // is ALSO what turns an unplug into evidence: a yanked drive
+            // answers the probe with silence (TIMEOUT), the watchdog runs
+            // out, `ready` drops. Do not remove it in either direction.
             if drive_ready {
                 const MSC_KEEPALIVE_MS: u32 = 2000;
                 let now = uptime::now_ms();
@@ -695,7 +693,8 @@ fn main() -> ! {
                             let _ = core::fmt::Write::write_fmt(&mut msg,
                                 format_args!(
                                     "export: ok={} mount={} d_rd={} d_rderr={} d_wr={} \
-                                     d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} spins={}\r\n",
+                                     d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} \
+                                     spins={} wms={}\r\n",
                                     ok as u8, mounted.get() as u8,
                                     d.rd.get().wrapping_sub(snap0.0),
                                     d.rd_err.get().wrapping_sub(snap0.1),
@@ -704,7 +703,7 @@ fn main() -> ! {
                                     d.wr_notready.get().wrapping_sub(snap0.4),
                                     d.wr_resp_err.get().wrapping_sub(snap0.5),
                                     d.wr_timeout.get().wrapping_sub(snap0.6),
-                                    d.wr_spins_last.get()));
+                                    d.wr_spins_last.get(), d.wr_ms_last.get()));
                             let (cs, cr) = d.wr_csw.get();
                             let (rr, rp, rt, rn, rl) = d.wr_reject.get();
                             let (fcs, fcr) = d.wr_csw_first.get();
@@ -723,25 +722,27 @@ fn main() -> ! {
                         }
                         {
                             // Round-six read-failure diag: reason 1=notready
-                            // 2=resp_err 3=spin_timeout, at word w of lba,
-                            // after sp spins; rej/ny/lph = reject_info CSR
-                            // snapshot at the failure.
+                            // 2=resp_err 3=deadline 4=conn_lost, at word w of
+                            // lba, after sp spins; rej/ny/lph = reject_info
+                            // CSR snapshot at the failure.
                             let (r1, w1, l1, s1, rr1, rp1, n1, p1) =
                                 d.rd_fail_first.get();
                             let (r2, w2, l2, s2, rr2, rp2, n2, p2) =
                                 d.rd_fail.get();
                             let path1 = d.rd_path_first.get();
                             let path2 = d.rd_path.get();
+                            let ms1 = d.rd_ms_first.get();
+                            let ms2 = d.rd_ms.get();
                             let mut msg: heapless::String<256> =
                                 heapless::String::new();
                             let _ = core::fmt::Write::write_fmt(&mut msg,
                                 format_args!(
-                                    "export: rd1 rsn={} w={} lba={} sp={} \
+                                    "export: rd1 rsn={} w={} lba={} sp={} ms={} \
                                      rej={}/{} ny={} lph={} pth={:08x}\r\n\
-                                     export: rdL rsn={} w={} lba={} sp={} \
+                                     export: rdL rsn={} w={} lba={} sp={} ms={} \
                                      rej={}/{} ny={} lph={} pth={:08x}\r\n",
-                                    r1, w1, l1, s1, rr1, rp1, n1, p1, path1,
-                                    r2, w2, l2, s2, rr2, rp2, n2, p2, path2));
+                                    r1, w1, l1, s1, ms1, rr1, rp1, n1, p1, path1,
+                                    r2, w2, l2, s2, ms2, rr2, rp2, n2, p2, path2));
                             core::fmt::Write::write_str(
                                 &mut stack_probe_serial, msg.as_str()).ok();
                         }
