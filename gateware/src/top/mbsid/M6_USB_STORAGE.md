@@ -244,6 +244,34 @@ engine still busy from the previous command.
 read-after-write failure; diagnostics are in the flashable archive awaiting the next
 round.**
 
+#### Read-path discriminator (`read_path_info`, CSR `0x38`)
+
+The next diagnostic-only build snapshots a packed `pth=XXXXXXXX` word on the
+first and last failed reads. It does not change USB command sequencing, retry
+policy, watchdogs, or firmware timeouts.
+
+| Bits | Field | Meaning |
+|---|---|---|
+| `[9:0]` | `engine_bytes` | Data-IN bytes accepted from the SIE for the current command |
+| `[19:10]` | `periph_bytes` | Bytes accepted by `USBMSCPeripheral`'s RX packer |
+| `[27:20]` | `periph_words` | Complete 32-bit words successfully enqueued by the packer |
+| `[28]` | `stream_mode` | `stream_data` value sampled by `SCSIBulkHost` |
+| `[29]` | `data_len_512` | Sampled command length was exactly 512 bytes |
+| `[31:30]` | reserved | Always zero |
+
+Interpret the failing `rd1` snapshot in this order:
+
+- `engine_bytes=512, stream_mode=0, periph_bytes=0`: the command ran in
+  capture mode; investigate command sampling/state handoff.
+- `engine_bytes=512, stream_mode=1, periph_bytes=0`: bytes entered the
+  engine's stream FIFO but did not cross into the CSR peripheral.
+- `engine_bytes=512, periph_bytes=512, periph_words=0`: the RX byte packer
+  saw data but complete words were not accepted by its FIFO.
+- `engine_bytes=512, periph_bytes=512, periph_words=128`: the full data path
+  completed; investigate FIFO reset/readback visibility rather than USB.
+- `engine_bytes<512` or `data_len_512=0` while `lph=3`: re-examine the
+  engine's CSW transition and sampled command length.
+
 **Testing lesson encoded in `tests/test_usb_msc_integration.py`:** every per-layer test was
 green while the assembled stack failed on hardware — the CSR peripheral, the engine, and the
 `top.py` command glue had never been simulated *together*, and the glue had zero sim coverage.
