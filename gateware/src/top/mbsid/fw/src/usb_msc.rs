@@ -48,6 +48,12 @@ pub struct MscDiag {
     ///  engine-level rejection (2, with the reject snapshot saying where).
     pub rd_fail_first: core::cell::Cell<(u8, u8, u32, u32, u8, u8, u8, u8)>,
     pub rd_fail: core::cell::Cell<(u8, u8, u32, u32, u8, u8, u8, u8)>,
+    /// Packed read_path_info CSR captured with rd_fail_first/rd_fail.
+    /// [9:0]=engine bytes, [19:10]=peripheral bytes,
+    /// [27:20]=peripheral words, [28]=stream mode,
+    /// [29]=sampled data length was 512.
+    pub rd_path_first: core::cell::Cell<u32>,
+    pub rd_path: core::cell::Cell<u32>,
     pub rd_first_set: core::cell::Cell<bool>,
 }
 
@@ -61,13 +67,21 @@ impl MscDiag {
         self.rd_first_set.set(false);
         self.rd_fail_first.set((0, 0, 0, 0, 0, 0, 0, 0));
         self.rd_fail.set((0, 0, 0, 0, 0, 0, 0, 0));
+        self.rd_path_first.set(0);
+        self.rd_path.set(0);
     }
 
-    fn record_rd_failure(&self, v: (u8, u8, u32, u32, u8, u8, u8, u8)) {
+    fn record_rd_failure(
+        &self,
+        v: (u8, u8, u32, u32, u8, u8, u8, u8),
+        path: u32,
+    ) {
         self.rd_fail.set(v);
+        self.rd_path.set(path);
         if !self.rd_first_set.get() {
             self.rd_first_set.set(true);
             self.rd_fail_first.set(v);
+            self.rd_path_first.set(path);
         }
     }
 
@@ -127,12 +141,23 @@ impl UsbMsc {
          ri.nyets().bits(), ri.last_phase().bits())
     }
 
+    fn read_path_snapshot(&self) -> u32 {
+        let p = self.regs.read_path_info().read();
+        u32::from(p.engine_bytes().bits())
+            | (u32::from(p.periph_bytes().bits()) << 10)
+            | (u32::from(p.periph_words().bits()) << 20)
+            | (u32::from(p.stream_mode().bit_is_set()) << 28)
+            | (u32::from(p.data_len_512().bit_is_set()) << 29)
+    }
+
     pub fn read_block(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), MscError> {
         self.diag.rd.set(self.diag.rd.get().wrapping_add(1)); // TEMPORARY diag
         if !self.ready() {
             self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
             let (rr, rp, ny, lp) = self.reject_snapshot();
-            self.diag.record_rd_failure((1, 0, lba, 0, rr, rp, ny, lp));
+            let path = self.read_path_snapshot();
+            self.diag.record_rd_failure(
+                (1, 0, lba, 0, rr, rp, ny, lp), path);
             return Err(MscError::NotReady);
         }
         self.regs.lba().write(|w| unsafe { w.value().bits(lba) });
@@ -159,8 +184,9 @@ impl UsbMsc {
                     #[cfg(test)]
                     let sp = 0u32;
                     let (rr, rp, ny, lp) = self.reject_snapshot();
+                    let path = self.read_path_snapshot();
                     self.diag.record_rd_failure(
-                        (2, i as u8, lba, sp, rr, rp, ny, lp));
+                        (2, i as u8, lba, sp, rr, rp, ny, lp), path);
                     return Err(MscError::ReadError);
                 }
                 #[cfg(not(test))]
@@ -169,8 +195,9 @@ impl UsbMsc {
                     if spins >= MAX_SPIN {
                         self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
                         let (rr, rp, ny, lp) = self.reject_snapshot();
+                        let path = self.read_path_snapshot();
                         self.diag.record_rd_failure(
-                            (3, i as u8, lba, spins, rr, rp, ny, lp));
+                            (3, i as u8, lba, spins, rr, rp, ny, lp), path);
                         return Err(MscError::ReadError);
                     }
                 }
