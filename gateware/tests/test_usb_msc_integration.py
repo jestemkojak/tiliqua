@@ -178,6 +178,9 @@ def _build():
         periph.reject_txdone_i.eq(host.reject_txdone),
         periph.nyet_count_i.eq(host.nyets),
         periph.phase_i.eq(host.phase_o),
+        periph.engine_rx_bytes_i.eq(host.rx_bytes_o),
+        periph.engine_stream_mode_i.eq(host.stream_mode_o),
+        periph.engine_data_len_512_i.eq(host.data_len_512_o),
         periph.speed_i.eq(host.speed_o),
     ]
     # ------------------------------------------------------------------------
