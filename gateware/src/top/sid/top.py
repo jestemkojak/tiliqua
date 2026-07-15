@@ -496,7 +496,7 @@ class SIDSoc(TiliquaSoc):
     )
 
     def __init__(self, *, with_scope=True, n_sids=1, with_sysex=False,
-                 with_usb_msc=False, **kwargs):
+                 with_usb_msc=False, usb_msc_tx_chunk_bytes=64, **kwargs):
         # Don't finalize CSR bridge yet. Default mainram (BRAM) is 0x4000 — the big
         # opts struct eats stack. Subclasses (e.g. top/mbsid, whose by-value C++
         # engine state needs more .bss) may override via the mainram_size kwarg.
@@ -508,6 +508,7 @@ class SIDSoc(TiliquaSoc):
         self.n_sids = n_sids
         self.with_sysex = with_sysex
         self.with_usb_msc = with_usb_msc
+        self.usb_msc_tx_chunk_bytes = usb_msc_tx_chunk_bytes
 
         # Add SID peripheral
         self.sid_periph = SIDPeripheral(with_sysex=with_sysex)
@@ -645,7 +646,8 @@ class SIDSoc(TiliquaSoc):
                 m.d.comb += storage_mode.eq(self.usb_msc.mode_o)
 
                 usb = USBMIDIHost(bus=None)
-                msc = USBMSCHost(bus=None)
+                msc = USBMSCHost(bus=None,
+                                 tx_chunk_bytes=self.usb_msc_tx_chunk_bytes)
                 m.submodules.usb = _RI({"usb": storage_mode})(usb)
                 m.submodules.usb_msc_host = _RI({"usb": ~storage_mode})(msc)
 
@@ -705,6 +707,16 @@ class SIDSoc(TiliquaSoc):
                                       (write_pending & ~self.usb_msc.start_o)),
                     self.usb_msc.resp_i.done.eq(msc.resp.done),
                     self.usb_msc.resp_i.error.eq(msc.resp.error),
+                    self.usb_msc.csw_status_i.eq(msc.csw.bCSWStatus),
+                    self.usb_msc.csw_residue_i.eq(msc.csw.dCSWDataResidue),
+                    self.usb_msc.reject_response_i.eq(msc.reject_response),
+                    self.usb_msc.reject_phase_i.eq(msc.reject_phase),
+                    self.usb_msc.sense_i.eq(msc.sense_o),
+                    self.usb_msc.sense_valid_i.eq(msc.sense_valid_o),
+                    self.usb_msc.reject_txdone_i.eq(msc.reject_txdone),
+                    self.usb_msc.nyet_count_i.eq(msc.nyets),
+                    self.usb_msc.phase_i.eq(msc.phase_o),
+                    self.usb_msc.speed_i.eq(msc.speed_o),
                 ]
 
             m.submodules.midi_decode_usb = midi_decode_usb = midi.MidiDecodeUSB(

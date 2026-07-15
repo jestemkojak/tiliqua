@@ -56,6 +56,12 @@ class MBSIDSoc(SIDSoc):
         # M6: USB mass-storage patch load/export (M6_USB_STORAGE.md). Adds the
         # USBMSCHost + UTMI mux + usb_msc CSR block at 0x1300 (PAC regen!).
         kwargs.setdefault("with_usb_msc", True)
+        # The 2026-07-15 chunk-size diagnostic sweep (64/32/31 bytes, all
+        # rej=4/2/0) is settled: the "silent" drive was answering NYET (HS
+        # bulk-OUT flow control) and the stock guh SIE didn't decode it —
+        # fixed in the vendored SIE (src/vendor/guh_msc/sie.py, NYET=7) and
+        # engine (msc.py treats NYET as ACK). Back at the default 64-byte
+        # chunks (the SIE TX FIFO depth; M6_USB_STORAGE.md round four).
         super().__init__(**kwargs)
 
 
