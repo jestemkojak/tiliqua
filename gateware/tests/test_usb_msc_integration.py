@@ -139,10 +139,18 @@ class _Drive:
         await self.do_in(ctx, _csw(), TransferResponse.ACK)
 
 
-def _build():
-    """Assemble peripheral + engine + the top.py command glue, verbatim."""
+def _build(watchdog_cycles=None):
+    """Assemble peripheral + engine + the top.py command glue, verbatim.
+    `watchdog_cycles` shrinks the engine watchdog for tests that must
+    provoke (or must NOT provoke) it inside a simulable horizon; None
+    keeps the production 10 s value."""
     periph = USBMSCPeripheral(with_mode=True, with_write=True)
-    host = USBMSCHost(bus=None)
+    if watchdog_cycles is None:
+        host = USBMSCHost(bus=None)
+    else:
+        class _ShortWatchdogHost(USBMSCHost):
+            _WATCHDOG_CYCLES = watchdog_cycles
+        host = _ShortWatchdogHost(bus=None)
     host.scsi = SCSIBulkHost(enumerator=StubEnumerator())  # inject stub SIE
 
     m = Module()
@@ -258,8 +266,8 @@ class ProductionElaborationTest(unittest.TestCase):
 
 class UsbMscIntegrationTests(unittest.TestCase):
 
-    def _run(self, fw_tb, drive_tb, deadline_us=40000):
-        m, periph, host = _build()
+    def _run(self, fw_tb, drive_tb, deadline_us=40000, watchdog_cycles=None):
+        m, periph, host = _build(watchdog_cycles=watchdog_cycles)
         sim = Simulator(m)
         sim.add_clock(1e-6, domain="sync")
         sim.add_clock(1e-6, domain="usb")
@@ -427,6 +435,131 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertEqual((read_path >> 28) & 1, 1)       # stream_mode
         self.assertEqual((read_path >> 29) & 1, 1)       # data_len_512
         self.assertEqual(read_path >> 30, 0)
+
+    def test_read_survives_nak_wait_longer_than_watchdog(self):
+        """Round seven: a drive that busy-NAKs the data-IN phase for longer
+        than the engine watchdog budget (the round-six post-write failure:
+        FTL commit right after a WRITE) must NOT get the engine reset out
+        from under it — NAK is a live handshake, the drive is present. With
+        the old completion-fed watchdog this test fails: the engine resets
+        mid-NAK-loop, re-runs init, and the read never completes."""
+        payload = [(i * 3 + 9) & 0xFF for i in range(BLOCK)]
+        sector = [(i * 17 + 4) & 0xFF for i in range(BLOCK)]
+        result = {}
+        WD = 2500  # usb cycles; the NAK loop below spans well past this
+        NAKS = 1000  # empirically ~5 usb cycles/NAK round trip in this stub
+                     # harness (measured via VCD), so >> WD/5=500 is required
+                     # to guarantee the watchdog expires mid-loop; 250 (a
+                     # naive "15-25 cycles/NAK" estimate) was not enough and
+                     # let the read finish before the watchdog ever fired.
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                result["werr"] = await fw.write_block(ctx, 0x40, payload)
+                await fw.csr_write32(ctx, 0x0C, 0x41)
+                await fw.csr_write(ctx, 0x10, 1)          # start (read)
+                data = []
+                for _ in range(128):
+                    for _ in range(400000):
+                        st = await fw.csr_read(ctx, 0x00)
+                        if st & 0b1000:                    # rx_avail
+                            break
+                        r = await fw.csr_read(ctx, 0x18)
+                        if r & 0b01:
+                            result["rerr"] = True
+                            return
+                    w = await fw.csr_read32(ctx, 0x14)
+                    data += list(w.to_bytes(4, "little"))
+                result["rerr"] = False
+                result["rdata"] = data
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                drive = _Drive(host.scsi.enumerator)
+                await drive.init_to_ready(ctx)
+                # WRITE: CBW + 8 data OUTs + CSW (all clean)
+                await drive.do_out(ctx, TransferResponse.ACK, [])
+                for _ in range(8):
+                    await drive.do_out(ctx, TransferResponse.ACK, [])
+                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                # READ: accept the CBW, then busy-NAK the data phase for
+                # far longer than WD cycles (see NAKS comment above).
+                rcbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, rcbw)
+                result["read_opcode"] = rcbw[15]
+                for _ in range(NAKS):
+                    await drive.do_in(ctx, [], TransferResponse.NAK)
+                # Drive finally frees up: serve the block + a clean CSW.
+                for i in range(8):
+                    await drive.do_in(ctx, sector[i*64:(i+1)*64],
+                                      TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                result["drive_done"] = True
+            return tb
+
+        self._run(fw_tb, drive_tb, deadline_us=120000, watchdog_cycles=WD)
+        self.assertFalse(result.get("werr"), "write leg failed")
+        self.assertEqual(result.get("read_opcode"), 0x28)   # READ(10)
+        self.assertTrue(result.get("drive_done"),
+                        "drive script never finished (engine was reset "
+                        "mid-NAK-wait and abandoned the exchange)")
+        self.assertFalse(result.get("rerr"),
+                         "read errored instead of riding out the NAKs")
+        self.assertEqual(result.get("rdata"), sector)
+
+    def test_watchdog_still_fires_on_silent_drive(self):
+        """Guard for the handshake-fed watchdog: TIMEOUT (silent bus — the
+        yanked-drive signature) must NOT feed it. After a read whose CBW
+        times out, the engine holds response=TIMEOUT; the watchdog must
+        still expire and restart init (a fresh TUR CBW appears without any
+        firmware command). This is the only unplug detection there is."""
+        result = {}
+        WD = 2500
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                await fw.csr_write32(ctx, 0x0C, 0x10)
+                await fw.csr_write(ctx, 0x10, 1)          # start (read)
+                for _ in range(400000):
+                    r = await fw.csr_read(ctx, 0x18)
+                    if r & 0b10:                           # resp.done
+                        result["rerr"] = (r & 0b01) != 0
+                        break
+                # Now go quiet, exactly like firmware after a failed read;
+                # wait for the drive script to observe the watchdog reinit.
+                for _ in range(400000):
+                    if result.get("reinit_seen"):
+                        return
+                    await ctx.tick()
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                drive = _Drive(host.scsi.enumerator)
+                await drive.init_to_ready(ctx)
+                # The read's CBW: answer TIMEOUT (device gone / no handshake).
+                await drive.do_out(ctx, TransferResponse.TIMEOUT, [])
+                # Engine rejects the command. With no further live handshake
+                # the watchdog must fire and re-run init: the next transfer
+                # the "drive" sees is a fresh TUR CBW it never asked for.
+                cbw = []
+                xtype, _pid = await drive.wait_start(ctx, cbw,
+                                                     max_ticks=20 * WD)
+                result["reinit_xfer_is_out"] = (xtype == TransferType.OUT)
+                result["reinit_seen"] = True
+            return tb
+
+        self._run(fw_tb, drive_tb, deadline_us=120000, watchdog_cycles=WD)
+        self.assertTrue(result.get("rerr"),
+                        "TIMEOUT CBW should surface as resp.error")
+        self.assertTrue(result.get("reinit_seen"),
+                        "watchdog never fired on a silent drive")
+        self.assertTrue(result.get("reinit_xfer_is_out"))
 
     def test_csw_failed_reaches_firmware_diag_and_autosenses(self):
         """A CSW with bCSWStatus=1 must surface as resp.error=1, be readable
