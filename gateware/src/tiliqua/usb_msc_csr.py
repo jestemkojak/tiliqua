@@ -117,6 +117,10 @@ class USBMSCPeripheral(wiring.Component):
         # On a wedged-then-watchdogged command this is the phase the engine
         # was STUCK in, even though `phase` (a reject latch) stayed 0.
         last_phase: csr.Field(csr.action.R, unsigned(3))
+        # BOT §6.3.1 validation: 1 = the command's CSW failed the
+        # signature/tag/length check (round eight). Latched here like the
+        # other reject diagnostics (survives the engine watchdog reset).
+        csw_bad: csr.Field(csr.action.R, unsigned(1))
 
     class SenseInfo(csr.Register, access="r"):
         """Auto-REQUEST-SENSE result after a failed write. code[19:16]=sense
@@ -188,6 +192,7 @@ class USBMSCPeripheral(wiring.Component):
             "reject_txdone_i":   In(4),  # with_write only: ACKed 32B units
             "nyet_count_i":      In(8),  # with_write only: NYETs this command
             "phase_i":           In(3),  # with_write only: live engine phase
+            "csw_bad_i":         In(1),  # with_write only: invalid CSW seen
             "sense_i":           In(20), # with_write only: key/ASC/ASCQ
             "sense_valid_i":     In(1),
             "speed_i":           In(2),  # with_write only: link speed
@@ -370,6 +375,11 @@ class USBMSCPeripheral(wiring.Component):
             m.d.sync += phase_prev.eq(self.phase_i)
             with m.If((self.phase_i != phase_prev) & (self.phase_i != 0)):
                 m.d.sync += last_phase_r.eq(self.phase_i)
+            csw_bad_r = Signal()
+            cswb_prev = Signal()
+            m.d.sync += cswb_prev.eq(self.csw_bad_i)
+            with m.If(self.csw_bad_i & ~cswb_prev):
+                m.d.sync += csw_bad_r.eq(1)
             sense_in = Cat(self.sense_i, self.sense_valid_i)
             sense_prev = Signal.like(sense_in)
             m.d.sync += sense_prev.eq(sense_in)
@@ -381,7 +391,7 @@ class USBMSCPeripheral(wiring.Component):
             with m.If(start_strobe | start_write):
                 m.d.sync += [
                     rej_resp_r.eq(0), rej_phase_r.eq(0), rej_txdone_r.eq(0),
-                    nyets_r.eq(0), last_phase_r.eq(0),
+                    nyets_r.eq(0), last_phase_r.eq(0), csw_bad_r.eq(0),
                     sense_code_r.eq(0), sense_valid_r.eq(0),
                 ]
             m.d.comb += [
@@ -392,6 +402,7 @@ class USBMSCPeripheral(wiring.Component):
                 self._reject_info.f.txdone.r_data.eq(rej_txdone_r),
                 self._reject_info.f.nyets.r_data.eq(nyets_r),
                 self._reject_info.f.last_phase.r_data.eq(last_phase_r),
+                self._reject_info.f.csw_bad.r_data.eq(csw_bad_r),
                 self._sense_info.f.code.r_data.eq(sense_code_r),
                 self._sense_info.f.valid.r_data.eq(sense_valid_r),
                 self._read_path_info.f.engine_bytes.r_data.eq(

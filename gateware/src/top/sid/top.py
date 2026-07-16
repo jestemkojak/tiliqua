@@ -719,6 +719,7 @@ class SIDSoc(TiliquaSoc):
                     self.usb_msc.reject_txdone_i.eq(msc.reject_txdone),
                     self.usb_msc.nyet_count_i.eq(msc.nyets),
                     self.usb_msc.phase_i.eq(msc.phase_o),
+                    self.usb_msc.csw_bad_i.eq(msc.csw_bad_o),
                     self.usb_msc.engine_rx_bytes_i.eq(msc.rx_bytes_o),
                     self.usb_msc.engine_stream_mode_i.eq(msc.stream_mode_o),
                     self.usb_msc.engine_data_len_512_i.eq(msc.data_len_512_o),
