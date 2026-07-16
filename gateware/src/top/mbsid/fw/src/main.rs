@@ -672,7 +672,8 @@ fn main() -> ! {
                         d.begin();   // capture FIRST failure of this attempt
                         let snap0 = (d.rd.get(), d.rd_err.get(), d.wr.get(),
                                      d.wr_ok.get(), d.wr_notready.get(),
-                                     d.wr_resp_err.get(), d.wr_timeout.get());
+                                     d.wr_resp_err.get(), d.wr_timeout.get(),
+                                     d.wr_conn_lost.get());
                         {
                             let mut msg: heapless::String<96> = heapless::String::new();
                             let _ = core::fmt::Write::write_fmt(&mut msg,
@@ -693,7 +694,7 @@ fn main() -> ! {
                             let _ = core::fmt::Write::write_fmt(&mut msg,
                                 format_args!(
                                     "export: ok={} mount={} d_rd={} d_rderr={} d_wr={} \
-                                     d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} \
+                                     d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} d_wrconn={} \
                                      spins={} wms={}\r\n",
                                     ok as u8, mounted.get() as u8,
                                     d.rd.get().wrapping_sub(snap0.0),
@@ -703,6 +704,7 @@ fn main() -> ! {
                                     d.wr_notready.get().wrapping_sub(snap0.4),
                                     d.wr_resp_err.get().wrapping_sub(snap0.5),
                                     d.wr_timeout.get().wrapping_sub(snap0.6),
+                                    d.wr_conn_lost.get().wrapping_sub(snap0.7),
                                     d.wr_spins_last.get(), d.wr_ms_last.get()));
                             let (cs, cr) = d.wr_csw.get();
                             let (rr, rp, rt, rn, rl) = d.wr_reject.get();
