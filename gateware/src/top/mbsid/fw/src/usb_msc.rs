@@ -317,8 +317,19 @@ impl UsbMsc {
                          ri.last_phase().bits()));
                     Err(MscError::WriteError)
                 } else {
-                    self.diag.wr_ok.set(self.diag.wr_ok.get().wrapping_add(1));
-                    Ok(())
+                    // BOT: PASSED + residue != 0 means the device silently
+                    // declined part of the 512-byte data phase — the sector
+                    // on media is NOT what we sent. Round-eight fix.
+                    let residue = self.regs.csw_residue().read().value().bits();
+                    if residue != 0 {
+                        self.diag.wr_resp_err.set(
+                            self.diag.wr_resp_err.get().wrapping_add(1));
+                        self.diag.record_failure((0, residue), (0, 0, 0, 0, 0));
+                        Err(MscError::WriteError)
+                    } else {
+                        self.diag.wr_ok.set(self.diag.wr_ok.get().wrapping_add(1));
+                        Ok(())
+                    }
                 };
             }
             spins = spins.wrapping_add(1);
@@ -347,6 +358,46 @@ impl UsbMsc {
                         (ri.response().bits(), ri.phase().bits(),
                          ri.txdone().bits(), ri.nyets().bits(),
                          ri.last_phase().bits()));
+                    return Err(MscError::WriteError);
+                }
+            }
+        }
+    }
+
+    /// SYNCHRONIZE CACHE(10): ask the drive to commit its volatile write
+    /// cache to media (round eight — WRITE(10) carries no FUA, so without
+    /// this an unplug after export can lose data the verify read already
+    /// confirmed from cache). One call per export, after the last write.
+    pub fn flush(&self) -> Result<(), MscError> {
+        const READY_WAIT_MS: u32 = 1_000;
+        let t0r = crate::uptime::now_ms();
+        while !self.ready() {
+            if crate::uptime::deadline_expired(
+                t0r, crate::uptime::now_ms(), READY_WAIT_MS) {
+                return Err(MscError::NotReady);
+            }
+        }
+        self.regs.start_flush().write(|w| w.strobe().set_bit());
+        // A cache commit can legitimately take a while on cheap flash;
+        // reuse the write budget (poll shape mirrors write_block).
+        const FLUSH_TIMEOUT_MS: u32 = 30_000;
+        let t0 = crate::uptime::now_ms();
+        let mut spins: u32 = 0;
+        loop {
+            let r = self.regs.resp().read();
+            if r.done().bit_is_set() {
+                return if r.error().bit_is_set() {
+                    Err(MscError::WriteError)
+                } else {
+                    Ok(())
+                };
+            }
+            spins = spins.wrapping_add(1);
+            if spins % 1024 == 0 {
+                let now = crate::uptime::now_ms();
+                if !self.connected()
+                    || crate::uptime::deadline_expired(t0, now, FLUSH_TIMEOUT_MS)
+                {
                     return Err(MscError::WriteError);
                 }
             }
