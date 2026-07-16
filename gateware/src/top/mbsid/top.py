@@ -62,6 +62,13 @@ class MBSIDSoc(SIDSoc):
         # fixed in the vendored SIE (src/vendor/guh_msc/sie.py, NYET=7) and
         # engine (msc.py treats NYET as ACK). Back at the default 64-byte
         # chunks (the SIE TX FIFO depth; M6_USB_STORAGE.md round four).
+        # Round eight (M6_USB_STORAGE.md): force the MSC engine to Full
+        # Speed. At FS the 64-byte TX chunks equal wMaxPacketSize (legal
+        # packets) and the PING protocol doesn't exist — this removes both
+        # critical HS violations behind the write-path drive wedges. FS
+        # ~1 MB/s is ample for 512 B patch files. USB-MIDI keeps its own
+        # engine/speed; only storage mode is affected.
+        kwargs.setdefault("usb_msc_fullspeed_only", True)
         super().__init__(**kwargs)
 
 

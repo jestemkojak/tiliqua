@@ -496,7 +496,8 @@ class SIDSoc(TiliquaSoc):
     )
 
     def __init__(self, *, with_scope=True, n_sids=1, with_sysex=False,
-                 with_usb_msc=False, usb_msc_tx_chunk_bytes=64, **kwargs):
+                 with_usb_msc=False, usb_msc_tx_chunk_bytes=64,
+                 usb_msc_fullspeed_only=False, **kwargs):
         # Don't finalize CSR bridge yet. Default mainram (BRAM) is 0x4000 — the big
         # opts struct eats stack. Subclasses (e.g. top/mbsid, whose by-value C++
         # engine state needs more .bss) may override via the mainram_size kwarg.
@@ -509,6 +510,7 @@ class SIDSoc(TiliquaSoc):
         self.with_sysex = with_sysex
         self.with_usb_msc = with_usb_msc
         self.usb_msc_tx_chunk_bytes = usb_msc_tx_chunk_bytes
+        self.usb_msc_fullspeed_only = usb_msc_fullspeed_only
 
         # Add SID peripheral
         self.sid_periph = SIDPeripheral(with_sysex=with_sysex)
@@ -647,7 +649,8 @@ class SIDSoc(TiliquaSoc):
 
                 usb = USBMIDIHost(bus=None)
                 msc = USBMSCHost(bus=None,
-                                 tx_chunk_bytes=self.usb_msc_tx_chunk_bytes)
+                                 tx_chunk_bytes=self.usb_msc_tx_chunk_bytes,
+                                 fullspeed_only=self.usb_msc_fullspeed_only)
                 m.submodules.usb = _RI({"usb": storage_mode})(usb)
                 m.submodules.usb_msc_host = _RI({"usb": ~storage_mode})(msc)
 
