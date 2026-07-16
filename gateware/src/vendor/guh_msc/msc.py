@@ -188,6 +188,12 @@ class SCSIBulkHost(wiring.Component):
     # ([19:16]=sense key, [15:8]=ASC, [7:0]=ASCQ), valid after a REQUEST
     # SENSE command completes.
     sense: Out(20)
+    # BOT §5.3.4 Reset Recovery: strobe rr_start (engine must be IDLE) to run
+    # Bulk-Only Mass Storage Reset -> clear IN halt -> clear OUT halt ->
+    # reset both toggles. rr_done strobes on success; failure surfaces as
+    # status.done+rejected with reject_phase=5 (CTRL), same as clear-halt.
+    rr_start: In(1)
+    rr_done:  Out(1)
 
     def __init__(self, *, enumerator=None, tx_chunk_bytes=_TX_CHUNK_BYTES,
                  fullspeed_only=False, **kwargs):
@@ -273,15 +279,28 @@ class SCSIBulkHost(wiring.Component):
         ch_retry = Signal(2)          # SETUP NAK/TIMEOUT retries (bounded)
         csw_halt_retried = Signal()   # only one CSW clear-halt per command
         setup_ix = Signal(range(8))
-        # CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType=0x02 (endpoint),
-        # bRequest=1, wValue=0 (ENDPOINT_HALT), wIndex=ch_ep, wLength=0.
+        rr_setup = Signal()     # SETUP loader source: 0=CLEAR_FEATURE, 1=MSC reset
+        ch_next = Signal(2)     # after CLEAR-HALT-STATUS-WAIT ACK: 0 = go read
+                                 # the CSW (mid-command recovery, pre-round-eight
+                                 # behavior); 1 = recovery: clear OUT halt next;
+                                 # 2 = recovery: finished, strobe rr_done.
+        # Two SETUP payloads share the loader. CLEAR_FEATURE(ENDPOINT_HALT):
+        # bmRequestType=0x02 (endpoint), bRequest=1, wValue=0, wIndex=ch_ep.
+        # Bulk-Only Mass Storage Reset (BOT §5.3.4): bmRequestType=0x21
+        # (class, interface), bRequest=0xFF, wValue=0, wIndex=interface.
+        # wIndex is hardwired to interface 0: the guh descriptor parser
+        # exposes only endpoint numbers, and BOT thumb drives are
+        # single-interface in practice (documented limitation).
         ch_setup_byte = Signal(8)
         with m.Switch(setup_ix):
-            for i, const_b in enumerate([0x02, 0x01, 0x00, 0x00,
-                                         None, 0x00, 0x00, 0x00]):
+            for i, (cf_b, rr_b) in enumerate([(0x02, 0x21), (0x01, 0xFF),
+                                              (0x00, 0x00), (0x00, 0x00),
+                                              (None, 0x00), (0x00, 0x00),
+                                              (0x00, 0x00), (0x00, 0x00)]):
                 with m.Case(i):
                     m.d.comb += ch_setup_byte.eq(
-                        ch_ep if const_b is None else const_b)
+                        Mux(rr_setup, rr_b,
+                            ch_ep if cf_b is None else cf_b))
 
         # --- bulk-OUT (write) data phase state ---------------------------------
         # tx_chunk_bytes-sized chunks (default 64, see _TX_CHUNK_BYTES). The
@@ -360,7 +379,14 @@ class SCSIBulkHost(wiring.Component):
 
             with m.State("IDLE"):
                 m.d.comb += self.status.idle.eq(1)
-                with m.If(self.cmd.start):
+                with m.If(self.rr_start):
+                    m.d.usb += [
+                        rr_setup.eq(1),
+                        ch_retry.eq(0),
+                        setup_ix.eq(0),
+                    ]
+                    m.next = "CLEAR-HALT-LOAD"
+                with m.Elif(self.cmd.start):
                     m.d.usb += [
                         tx_byte_idx.eq(0),
                         rx_data_count.eq(0),
@@ -371,6 +397,7 @@ class SCSIBulkHost(wiring.Component):
                         self.nyets.eq(0),
                         csw_halt_retried.eq(0),
                         ch_retry.eq(0),
+                        ch_next.eq(0),
                         # Per-command reject scope: the CSR peripheral latches
                         # these on change-to-nonzero, so they must return to 0
                         # between commands or a stale reject would re-latch
@@ -746,6 +773,8 @@ class SCSIBulkHost(wiring.Component):
                                     self.reject_response.eq(
                                         enum.ctrl.status.response),
                                     self.reject_phase.eq(5),   # CTRL
+                                    rr_setup.eq(0),
+                                    ch_next.eq(0),
                                 ]
                                 m.d.comb += [
                                     self.status.done.eq(1),
@@ -760,6 +789,8 @@ class SCSIBulkHost(wiring.Component):
                                 self.reject_response.eq(
                                     enum.ctrl.status.response),
                                 self.reject_phase.eq(5),   # CTRL
+                                rr_setup.eq(0),
+                                ch_next.eq(0),
                             ]
                             m.d.comb += [
                                 self.status.done.eq(1),
@@ -783,14 +814,42 @@ class SCSIBulkHost(wiring.Component):
                 with m.If(enum.ctrl.status.idle):
                     with m.Switch(enum.ctrl.status.response):
                         with m.Case(TransferResponse.ACK):
-                            # Halt cleared — reset our copy of the endpoint's
-                            # toggle and go read the CSW.
-                            with m.If(ch_ep[7]):
-                                m.d.usb += pid_in.eq(DataPID.DATA0)
+                            with m.If(rr_setup):
+                                # MSC reset done -> clear the IN halt next.
+                                m.d.usb += [
+                                    rr_setup.eq(0),
+                                    ch_ep.eq(0x80 | endp_in),
+                                    ch_retry.eq(0),
+                                    ch_next.eq(1),
+                                ]
+                                m.next = "CLEAR-HALT-LOAD"
+                            with m.Elif(ch_next == 1):
+                                # IN halt cleared -> reset its toggle, clear
+                                # the OUT halt next (USB 2.0 §9.4.5).
+                                m.d.usb += [
+                                    pid_in.eq(DataPID.DATA0),
+                                    ch_ep.eq(endp_out),
+                                    ch_retry.eq(0),
+                                    ch_next.eq(2),
+                                ]
+                                m.next = "CLEAR-HALT-LOAD"
+                            with m.Elif(ch_next == 2):
+                                # OUT halt cleared -> recovery complete.
+                                m.d.usb += [
+                                    pid_out.eq(DataPID.DATA0),
+                                    ch_next.eq(0),
+                                ]
+                                m.d.comb += self.rr_done.eq(1)
+                                m.next = "IDLE"
                             with m.Else():
-                                m.d.usb += pid_out.eq(DataPID.DATA0)
-                            m.d.usb += rx_byte_idx.eq(0)
-                            m.next = "CSW"
+                                # Pre-round-eight path: mid-command clear-halt
+                                # -> reset the one toggle and read the CSW.
+                                with m.If(ch_ep[7]):
+                                    m.d.usb += pid_in.eq(DataPID.DATA0)
+                                with m.Else():
+                                    m.d.usb += pid_out.eq(DataPID.DATA0)
+                                m.d.usb += rx_byte_idx.eq(0)
+                                m.next = "CSW"
                         with m.Case(TransferResponse.NAK):
                             m.next = "CLEAR-HALT-STATUS"
                         with m.Default():
@@ -798,6 +857,8 @@ class SCSIBulkHost(wiring.Component):
                                 self.reject_response.eq(
                                     enum.ctrl.status.response),
                                 self.reject_phase.eq(5),   # CTRL
+                                rr_setup.eq(0),
+                                ch_next.eq(0),
                             ]
                             m.d.comb += [
                                 self.status.done.eq(1),
@@ -945,6 +1006,26 @@ class USBMSCHost(wiring.Component):
         current_lba = Signal(32)
         is_write = Signal()
         init_retry = Signal(range(self._INIT_RETRY_MAX + 1))
+        # Set entering TEST-UNIT-READY from RECOVERY-WAIT (post BOT §5.3.4
+        # reset recovery): the drive's capacity hasn't changed, so a
+        # successful revalidation goes straight to READY instead of
+        # re-running READ CAPACITY (the normal WAIT-ENUMERATION path).
+        post_recovery = Signal()
+        # Snapshot of scsi.status.{error,rejected} taken on the status.done
+        # cycle: scsi's own diagnostic registers consumed by need_rr below
+        # (csw_bad_o, reject_phase, reject_response) are m.d.usb-updated on
+        # that SAME edge inside SCSIBulkHost, so they lag one usb cycle
+        # behind status.done itself — reading them combinationally in the
+        # same state as status.done sees their PRE-update (stale) value.
+        # *-DONE states below wait exactly one cycle so both these local
+        # snapshots and scsi's registers have settled together. (Found via
+        # test: a first-time bad-tag CSW read csw_bad_o as still 0 on the
+        # status.done cycle and silently skipped recovery — masked in the
+        # double-STALL case only because reject_phase/response were already
+        # left at the needed values by the FIRST STALL, several cycles
+        # earlier.)
+        xfer_error_r = Signal()
+        xfer_rejected_r = Signal()
         sense_r = Signal(20)
         sense_valid_r = Signal()
         m.d.comb += [
@@ -1018,10 +1099,15 @@ class USBMSCHost(wiring.Component):
                 with m.If(scsi.status.done):
                     with m.If(~scsi.status.error & ~scsi.status.rejected):
                         m.d.usb += [watchdog.eq(0), init_retry.eq(0)]
-                        m.next = "READ-CAPACITY"
+                        with m.If(post_recovery):
+                            m.d.usb += post_recovery.eq(0)
+                            m.next = "READY"
+                        with m.Else():
+                            m.next = "READ-CAPACITY"
                     with m.Else():
                         m.d.usb += init_retry.eq(init_retry + 1)
                         with m.If(init_retry >= self._INIT_RETRY_MAX):
+                            m.d.usb += post_recovery.eq(0)
                             m.next = "WAIT-ENUMERATION"
                         with m.Else():
                             m.next = "TEST-UNIT-READY"
@@ -1108,6 +1194,29 @@ class USBMSCHost(wiring.Component):
                         self.resp.done.eq(1),
                         self.resp.error.eq(scsi.status.error | scsi.status.rejected),
                     ]
+                    m.d.usb += [
+                        xfer_error_r.eq(scsi.status.error),
+                        xfer_rejected_r.eq(scsi.status.rejected),
+                    ]
+                    m.next = "READ-DONE"
+
+            with m.State("READ-DONE"):
+                # See xfer_error_r's comment: wait one cycle for scsi's own
+                # diagnostic registers to settle before deciding.
+                # BOT §5.3.4: phase error, an invalid CSW, or a CSW that
+                # STALLed twice all mean the transport is desynced —
+                # Reset Recovery is REQUIRED before any next CBW (the
+                # old behavior sent REQUEST SENSE into the desync).
+                need_rr = (scsi.csw_bad_o
+                           | (~xfer_rejected_r
+                              & (scsi.csw.bCSWStatus == CSWStatus.PHASE_ERROR))
+                           | (xfer_rejected_r
+                              & (scsi.reject_phase == 3)
+                              & (scsi.reject_response
+                                 == TransferResponse.STALL.value)))
+                with m.If(need_rr):
+                    m.next = "RECOVERY"
+                with m.Else():
                     m.next = "READY"
 
             def write_cdb():
@@ -1138,16 +1247,38 @@ class USBMSCHost(wiring.Component):
                         self.resp.done.eq(1),
                         self.resp.error.eq(scsi.status.error | scsi.status.rejected),
                     ]
-                    # A CSW FAILED (CHECK CONDITION) leaves pending sense data
-                    # on the drive; drain it with an auto REQUEST SENSE (and
-                    # capture key/ASC/ASCQ for firmware diagnostics). Only for
-                    # a clean CSW failure — after a rejected (bus-level)
-                    # exchange the transport may be desynced and another
-                    # command would just wedge again.
-                    with m.If(scsi.status.error & ~scsi.status.rejected):
-                        m.next = "SENSE"
-                    with m.Else():
-                        m.next = "READY"
+                    m.d.usb += [
+                        xfer_error_r.eq(scsi.status.error),
+                        xfer_rejected_r.eq(scsi.status.rejected),
+                    ]
+                    m.next = "WRITE-DONE"
+
+            with m.State("WRITE-DONE"):
+                # See xfer_error_r's comment: wait one cycle for scsi's own
+                # diagnostic registers to settle before deciding.
+                # BOT §5.3.4: phase error, an invalid CSW, or a CSW that
+                # STALLed twice all mean the transport is desynced —
+                # Reset Recovery is REQUIRED before any next CBW (the
+                # old behavior sent REQUEST SENSE into the desync).
+                need_rr = (scsi.csw_bad_o
+                           | (~xfer_rejected_r
+                              & (scsi.csw.bCSWStatus == CSWStatus.PHASE_ERROR))
+                           | (xfer_rejected_r
+                              & (scsi.reject_phase == 3)
+                              & (scsi.reject_response
+                                 == TransferResponse.STALL.value)))
+                with m.If(need_rr):
+                    m.next = "RECOVERY"
+                # A CSW FAILED (CHECK CONDITION) leaves pending sense data
+                # on the drive; drain it with an auto REQUEST SENSE (and
+                # capture key/ASC/ASCQ for firmware diagnostics). Only for
+                # a clean CSW failure — after a rejected (bus-level)
+                # exchange the transport may be desynced and another
+                # command would just wedge again.
+                with m.Elif(xfer_error_r & ~xfer_rejected_r):
+                    m.next = "SENSE"
+                with m.Else():
+                    m.next = "READY"
 
             def sense_cdb():
                 return [
@@ -1172,5 +1303,21 @@ class USBMSCHost(wiring.Component):
                             sense_valid_r.eq(1),
                         ]
                     m.next = "READY"
+
+            with m.State("RECOVERY"):
+                # scsi is back in IDLE on the cycle after status.done.
+                m.d.comb += scsi.rr_start.eq(1)
+                m.next = "RECOVERY-WAIT"
+
+            with m.State("RECOVERY-WAIT"):
+                with m.If(scsi.rr_done):
+                    m.d.usb += [
+                        watchdog.eq(0), init_retry.eq(0), post_recovery.eq(1),
+                    ]
+                    m.next = "TEST-UNIT-READY"   # revalidate before READY
+                with m.Elif(scsi.status.done):
+                    # Recovery's own control transfers failed: the control
+                    # pipe is broken too — only re-enumeration can help.
+                    m.next = "WAIT-ENUMERATION"
 
         return ResetInserter({"usb": watchdog_expired})(m)
