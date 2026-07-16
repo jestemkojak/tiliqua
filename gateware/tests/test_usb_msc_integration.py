@@ -385,6 +385,41 @@ class UsbMscIntegrationTests(unittest.TestCase):
         # NYET counter diag: 1 (CBW) + 8 (data packets), latched CSR-side.
         self.assertEqual(result["nyets"], 9)
 
+    def test_write_passed_csw_with_nonzero_residue_visible_to_firmware(self):
+        """BOT: PASSED (status 0) + dCSWDataResidue != 0 on a write means the
+        device did NOT accept the whole data phase. The residue is exposed
+        live at CSR 0x28; firmware's write_block (fw/src/usb_msc.rs) treats
+        this as WriteError — this test pins the CSR-visible contract."""
+        result = {}
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                err = await fw.write_block(ctx, 100, [0x11] * BLOCK)
+                residue = await fw.csr_read32(ctx, 0x28)
+                result["err"] = err
+                result["residue"] = residue
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                stub = host.scsi.enumerator
+                drive = _Drive(stub)
+                await drive.init_to_ready(ctx)
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)
+                for _ in range(8):
+                    await drive.do_out(ctx, TransferResponse.ACK)
+                await drive.do_in(
+                    ctx, _csw(status=0x00, residue=64, tag=drive.last_tag),
+                    TransferResponse.ACK)
+            return tb
+
+        self._run(fw_tb, drive_tb)
+        self.assertFalse(result["err"])       # engine-level resp.error stays 0
+        self.assertEqual(result["residue"], 64)  # firmware maps this to failure
+
     def test_read_immediately_after_successful_write(self):
         """Round six (2026-07-15): on hardware, the first device READ after
         the first successful WRITE failed deterministically (d_wrok=1 then
