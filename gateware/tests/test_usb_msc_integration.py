@@ -943,6 +943,72 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertEqual(result["tur_opcode"], 0x00)  # TEST UNIT READY
         self.assertEqual(result["tur_pid"], DataPID.DATA0)
 
+    def test_read_data_stall_recovers_via_clear_halt_and_reads_csw(self):
+        """BOT §6.7.2 / case 4: a device that halts the IN endpoint mid
+        data phase (e.g. unrecoverable read error) still owes a CSW. The
+        engine must clear the halt, read the CSW, and — on CSW FAILED —
+        drain sense, exactly like the write side has since round five.
+        Before round eight the Default arm rejected and left both the halt
+        and the queued CSW in place, desyncing the next command."""
+        result = {}
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                # Reuse the read sequence from
+                # test_read_immediately_after_successful_write: lba+start,
+                # then poll resp; expect error.
+                await fw.csr_write32(ctx, 0x0C, 40)   # lba
+                await fw.csr_write(ctx, 0x10, 1)      # start (read)
+                for _ in range(400000):
+                    r = await fw.csr_read(ctx, 0x18)
+                    if r & 0b10:
+                        result["err"] = (r & 0b01) != 0
+                        break
+                # sense captured after the auto-REQUEST-SENSE, which runs
+                # in the background after resp.done fires — poll for it
+                # (same pattern as test_data_stall_recovers_via_clear_halt_
+                # and_reads_csw on the write side).
+                for _ in range(20000):
+                    si = await fw.csr_read32(ctx, 0x34)
+                    if (si >> 20) & 1:
+                        result["sense_valid"] = (si >> 20) & 1
+                        result["sense_key"] = (si >> 16) & 0xF
+                        break
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                stub = host.scsi.enumerator
+                drive = _Drive(stub)
+                await drive.init_to_ready(ctx)
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)  # READ(10) CBW
+                # STALL the first data-IN transaction (no payload).
+                await drive.do_in(ctx, [], TransferResponse.STALL)
+                s = []
+                await drive.do_setup(ctx, s)                    # clear halt IN
+                assert s == [0x02, 0x01, 0, 0, 0x81, 0, 0, 0], s
+                await drive.do_in(ctx, [], TransferResponse.ACK)  # status ZLP
+                await drive.do_in(                                 # CSW FAILED
+                    ctx, _csw(status=0x01, residue=512, tag=drive.last_tag),
+                    TransferResponse.ACK)
+                # auto-REQUEST-SENSE: CBW, 18 bytes, CSW
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)
+                assert cbw[15] == 0x03, cbw                        # REQUEST SENSE
+                sense = [0x70, 0, 0x03, 0, 0, 0, 0, 10] + [0] * 10  # key=3 MEDIUM ERROR
+                await drive.do_in(ctx, sense, TransferResponse.ACK)
+                await drive.do_in(
+                    ctx, _csw(tag=drive.last_tag), TransferResponse.ACK)
+            return tb
+
+        self._run(fw_tb, drive_tb, deadline_us=80000)
+        self.assertTrue(result["err"])
+        self.assertEqual(result["sense_valid"], 1)
+        self.assertEqual(result["sense_key"], 0x3)
+
 
 if __name__ == "__main__":
     unittest.main()
