@@ -4,7 +4,13 @@ Status: **M6a hardware-verified. M6b (write/export) root-caused and fixed in gat
 simulation (2026-07-14, same day as the incident); the export path is re-enabled in
 firmware for §7b hardware validation, which must run on a disposable drive.** M6a (read)
 passed its full hardware checklist (§7a). See the incident writeup + root cause right
-below and §8's risk table.
+below and §8's risk table. **Update (2026-07-15): round seven (below) landed a
+handshake-fed watchdog + firmware wall-clock read/write timeouts — simulation/compile
+-verified only, hardware validation still pending. The most recent full build's `sync`
+post-route Fmax was 59.61 MHz, a FAIL against the 60 MHz target (traced to an unrelated
+VexiiRiscv CPU/wishbone critical path, not this round's change, but not yet
+re-confirmed) — do not read the round-five 64.46 MHz PASS figures elsewhere in this file
+as current.**
 
 ## M6b hardware incident (2026-07-14) — write path corrupts real media, DO NOT re-enable
 
@@ -416,7 +422,16 @@ the export just works and `wms=`/keepalive logs bound N; (2) fails at rsn=3 with
 engine_bytes/stream_mode/data_len_512 are finally trustworthy — decode against
 the round-six table); or (3) fails rsn=4 (engine lost the drive: the drive
 itself dropped off the bus, which no host-side patience fixes and which argues
-for direction (b)'s BOT Reset Recovery). UI note: the export runs synchronously,
+for direction (b)'s BOT Reset Recovery); or (4) a drive that NAKs a data phase
+forever — never completing, never going silent — keeps the engine's watchdog
+held cleared by design (that's the point of this round), so it never fires, but
+firmware's 30 s wall-clock deadline still bounds the *firmware* hang: at 30 s
+firmware gives up (rsn=3), while the gateware engine itself is left parked
+mid-command (`status.busy`/ready only clears when the engine's own FSM reaches
+READY, which it never will while the drive keeps NAKing) — the drive shows
+`not ready` afterward with no automatic recovery, and a bitstream restart is
+the only way out today. This is exactly the direction-(b) BOT Reset Recovery
+gap this round scoped out, not attempted here. UI note: the export runs synchronously,
 so worst case the menu now freezes up to ~30 s per failing read — expected, not
 a hang; the 8.3/`BUSY` caveats from the M6b gotcha block still apply.
 
