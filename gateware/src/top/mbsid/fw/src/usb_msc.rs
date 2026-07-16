@@ -14,6 +14,11 @@ pub struct MscDiag {
     pub wr_notready: core::cell::Cell<u32>,
     pub wr_resp_err: core::cell::Cell<u32>,
     pub wr_timeout: core::cell::Cell<u32>,
+    /// Distinct from wr_timeout: incremented when the write's completion
+    /// poll bailed because `connected()` dropped (drive gone / watchdog
+    /// fired) rather than because the WRITE_TIMEOUT_MS wall-clock deadline
+    /// genuinely expired. Mirrors read_block's reason-4-vs-3 split.
+    pub wr_conn_lost: core::cell::Cell<u32>,
     pub wr_spins_last: core::cell::Cell<u32>,
     /// Last reject info after a failed write:
     /// (SIE response, phase, txdone, nyets, last_phase).
@@ -319,13 +324,22 @@ impl UsbMsc {
             spins = spins.wrapping_add(1);
             if spins % 1024 == 0 {
                 let now = crate::uptime::now_ms();
-                if !self.connected()
+                let conn_lost = !self.connected();
+                if conn_lost
                     || crate::uptime::deadline_expired(t0, now, WRITE_TIMEOUT_MS)
                 {
                     self.diag.wr_spins_last.set(spins); // TEMPORARY diag
                     self.diag.wr_ms_last.set(now.wrapping_sub(t0));
-                    self.diag.wr_timeout.set(
-                        self.diag.wr_timeout.get().wrapping_add(1));
+                    // Distinguish "drive gone mid-write" from a genuine
+                    // wall-clock timeout, same fail-fast-on-lost-connection
+                    // ordering as read_block's rsn=4 check.
+                    if conn_lost {
+                        self.diag.wr_conn_lost.set(
+                            self.diag.wr_conn_lost.get().wrapping_add(1));
+                    } else {
+                        self.diag.wr_timeout.set(
+                            self.diag.wr_timeout.get().wrapping_add(1));
+                    }
                     let ri = self.regs.reject_info().read();
                     self.diag.record_failure(
                         (self.regs.csw_status().read().value().bits(),
