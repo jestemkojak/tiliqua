@@ -57,6 +57,20 @@ the CV settles inside its deadband the Edit value applies. The Edit value
 is always what gets Saved. Subtle but intended — documented in the user
 guide.
 
+### USB storage runs at Full Speed only, by design
+The MSC (storage) USB engine is forced to Full Speed (`fullspeed_only`,
+`top/mbsid/top.py`), not High Speed, even though the port and PHY support
+HS — a real-hardware bring-up (round eight, `M6_USB_STORAGE.md`) found the
+vendored write path's High Speed behavior violated two USB 2.0 bulk
+requirements (short packets mid-transfer, no PING protocol) in ways that
+wedged real drive firmware. At Full Speed both are legal by construction.
+Practical effect: storage transfers cap around ~1 MB/s, which is ample for
+the small `.syx` patch files this feature moves — MIDI-over-USB (a
+separate host engine instance) is unaffected and stays at High Speed. Every
+`Export` also issues a SYNCHRONIZE CACHE(10) after the write completes, so
+the drive's volatile write cache is flushed before the status line reports
+success — durability is not left to a later unplug/idle flush.
+
 ### GPL boundary
 The vendored engine is GPL; the repo is CERN-OHL-S. Hence `mios32/` is
 gitignored and fetched per-clone, and a *distributed* firmware/bitstream

@@ -435,6 +435,218 @@ gap this round scoped out, not attempted here. UI note: the export runs synchron
 so worst case the menu now freezes up to ~30 s per failing read — expected, not
 a hang; the 8.3/`BUSY` caveats from the M6b gotcha block still apply.
 
+### Eighth round (2026-07-16) — round-seven hardware result + full spec-compliance review
+
+#### Hardware result (8GB stick, round-seven build): outcome (2)+(4), and fsck evidence
+
+The disposable-media run landed on round seven's predicted outcomes (2) and (4)
+combined:
+
+```
+export: ok=0 mount=1 d_rd=7 d_rderr=2 d_wr=1 d_wrok=1 ... spins=32152 wms=192
+export: rd1 rsn=3 w=0 lba=2048 sp=3211264 ms=30011 rej=0/0 ny=0 lph=1 pth=30000000
+export: rdL rsn=1 w=0 lba=32560 sp=0 ms=0 ...
+usb: conn=1 rdy=0 ... t=51397ms
+```
+
+- The WRITE(10) itself **succeeded** (`d_wrok=1`, 192 ms, no reject, `ny=0`,
+  clean CSW — the change-to-nonzero CSW latches correctly stay silent on a
+  fully clean write).
+- The verify read of the BPB (lba=2048, partition start) then burned the full
+  30 s budget (`rsn=3`, `ms=30011`) with the engine parked in the **CBW phase**
+  (`lph=1`) and `pth=0x30000000`: mode/length sampled, **zero** bytes engine- or
+  peripheral-side. The engine-side `pth` fields surviving proves no watchdog
+  reset happened during the window — i.e. the drive was returning **live
+  handshakes** (with `ny=0`, that means NAKs) on the READ(10) CBW for 30+
+  seconds straight, exactly outcome (4)'s NAK-forever profile.
+- ~10 s after the firmware abort the watchdog fired (`rdy=0` at t=51397 ms ≈
+  abort + 10 s): the drive went *silent* after the NAK marathon. With hotplug
+  re-detect broken, the session is dead from there (`rdL rsn=1` = not-ready at
+  entry).
+- **fsck evidence (stick inspected on a PC):** minimal, interrupted-mid-flush
+  damage only — 3 orphaned clusters (FAT1 updated, FAT2 not), dirty bit, free
+  count off by 3, boot sector fine, **no `P000.SYX` dirent**. Cross-checked
+  with `d_wr=1`: exactly one 512 B sector (a FAT1 sector) ever reached the
+  drive, it landed cleanly at the right LBA, and everything else was still in
+  the fatfs write-back cache when the drive stopped taking commands. The LBA
+  math and datapath are exonerated with filesystem-level confirmation.
+
+Conclusion: a single clean 512 B write should commit in milliseconds; a drive
+that instead NAKs *all* bulk traffic for 30+ s after it and then drops off the
+bus has a **wedged MSC firmware**, not a slow FTL. That prompted the question:
+does our write exchange itself violate the specs in a way that wedges drive
+firmware? Answer below: yes, twice.
+
+#### Spec-compliance review of the write path (USB 2.0 ch. 5/8, BOT usbmassbulk_10, SBC)
+
+Reviewed: `vendor/guh_msc/sie.py`, `vendor/guh_msc/msc.py`, CSR glue. Findings
+in severity order:
+
+1. **CRITICAL — every HS write violates wMaxPacketSize (USB 2.0 §5.8.3).**
+   `_TX_CHUNK_BYTES = 64` sends a 512 B block as 8 × 64 B DATA packets. At High
+   Speed bulk wMaxPacketSize is mandatorily **512**, so *all eight* are short
+   packets — and a short packet legally **terminates** a bulk transfer. A
+   compliant HS drive sees "transfer over after 64 B" followed by seven
+   unsolicited continuations, every write, mid-BOT-command. The in-code comment
+   ("intermediate short packets are technically out of spec") assumed 64 B
+   chunks were the legal baseline — true only at Full Speed. This retro-explains
+   round five (stick STALLs OUT after exactly 2 chunks = a firmware objecting
+   mid-data-phase) *and* this round (a byte-counting-tolerant firmware ACKs all
+   8, returns a clean CSW, then wedges on the next CBW). Reads never trip this:
+   the RX path receives whatever packet size the device sends (the 64-deep SIE
+   RX FIFO drains at 1 B/cycle into the 600-deep engine FIFO), which is why M6a
+   always worked at HS.
+2. **CRITICAL — no PING protocol (USB 2.0 §8.5.1, mandatory for HS hosts).**
+   The SIE's `TokenPID` cannot even express PING. After NYET the engine sends
+   the next full DATA packet directly; a NAKed CBW is re-sent as full 31 B DATA
+   at line rate (thousands/s — 30 s of that in this run) where §8.5.1 requires
+   the host to probe with PING tokens and resume DATA only after a PING is
+   ACKed.
+3. **HIGH — no BOT Reset Recovery (BOT §5.3.4/§6.7).** No Bulk-Only Mass
+   Storage Reset (class request 0xFF) capability at all; CSW `PHASE_ERROR`
+   (0x02) is not distinguished from `FAILED` (0x01) — both set `status.error`,
+   and the write path then issues REQUEST SENSE where the spec mandates Reset
+   Recovery before any next CBW. Failed clear-halt / persistent-STALL paths
+   dead-end into IDLE with a desynced transport; the only remaining recovery is
+   the 10 s watchdog's full re-enumeration (hotplug re-detect: broken). Reset
+   Recovery is also the missing firmware-abort path (a firmware timeout
+   currently strands the engine mid-command; new `cmd.start`s are silently
+   ignored outside READY).
+4. **HIGH — CSW never validated (BOT §6.3.1).** `CSW-RX` checks neither
+   `dCSWSignature`, nor `dCSWTag == dCBWTag`, nor length == 13. Stale IN data
+   on a desynced transport can be misparsed as a passing CSW → false "write
+   succeeded". Firmware also ignores `dCSWDataResidue` (PASSED + residue≠0 on a
+   write = device didn't take all the data).
+5. **MEDIUM — data-IN STALL handling asymmetric (BOT §6.7.2).** `DATA-RX`'s
+   Default arm lumps STALL with TIMEOUT/CRC and rejects to IDLE without
+   clear-halt or CSW read (the write side has done both since round five). A
+   read-phase STALL (BOT case 4 — device returns less than requested, routine)
+   leaves a halted IN endpoint and an undelivered CSW that the next command's
+   data phase eats as data. Short-packet-terminates-transfer is also
+   unimplemented on IN (the engine counts bytes only).
+6. **MEDIUM — no durability step.** WRITE(10) without FUA and no
+   SYNCHRONIZE CACHE(10) after export: data may sit in the drive's volatile
+   cache at unplug time.
+7. **LOW — `bCBWLUN` hardwired 0, no GET_MAX_LUN** (fine for thumb drives).
+8. **LOW — no 3-strikes bus-error retry**: one TIMEOUT/CRC rejects the whole
+   command; conventional hosts retry 3× (any fix must keep TIMEOUT feeding the
+   watchdog's unplug detection).
+
+Both CRITICAL findings are **HS-only**: at Full Speed, bulk max packet is 64 B
+(the existing chunking becomes exactly legal) and the PING protocol does not
+exist. `USBSIE.__init__` already accepts `fullspeed_only=True` — it just isn't
+plumbed through `SCSIBulkHost`. Forcing the MSC engine to FS is therefore both
+the discriminating experiment for the wedge and a plausible shippable fix
+(~1 MB/s is ample for 512 B patch files; the MIDI host is a separate engine
+instance and keeps HS).
+
+**Fix plan (round eight):** (1) plumb `fullspeed_only` through
+`SCSIBulkHost`/`USBMSCHost`/`SIDSoc`, defaulted on for mbsid; (2) validate CSW
+signature/tag/length in `CSW-RX`, new `csw_bad` diag in `reject_info`; (3) BOT
+Reset Recovery (MSC reset 0xFF + clear both halts + toggle resets), run
+autonomously on phase-error/invalid/twice-STALLed CSW, revalidated via TEST
+UNIT READY; (4) data-IN STALL → clear-halt + CSW read (write-side parity) and
+auto-sense after failed reads; (5) SYNCHRONIZE CACHE(10) via a new
+`start_flush` CSR at 0x3C, one per export; (6) firmware treats PASSED+residue≠0
+writes as failures. Items 7/8 (GET_MAX_LUN, 3-strikes retry, short-packet-on-IN,
+HS support) deliberately deferred. Detailed task breakdown in the (gitignored)
+plan scratch `docs/superpowers/plans/2026-07-16-usb-msc-fs-and-bot-compliance.md`.
+
+#### What landed (2026-07-16, six commits, Tasks 1–6 of the plan above)
+
+- **FS forcing.** `fullspeed_only` plumbed `USBSIE`/`SCSIBulkHost` (already
+  supported it) → `USBMSCHost` → `SIDSoc.__init__` (new
+  `usb_msc_fullspeed_only` kwarg, `top/sid/top.py:500,513,653`) →
+  `MBSIDSoc` defaults it on (`top/mbsid/top.py:71`,
+  `kwargs.setdefault("usb_msc_fullspeed_only", True)`). Removes both
+  CRITICAL findings above (8×64 B short-packet HS writes; missing PING) by
+  construction — at FS, 64 B chunking is the legal max packet size and PING
+  doesn't exist.
+- **CSW validation (BOT §6.3.1).** New `csw_bad_o` engine port on
+  `SCSIBulkHost`/the outer `USBMSCHost` (`vendor/guh_msc/msc.py:182,
+  409, 699, 967, 1011`) — set when a received CSW's signature, tag, or
+  length don't check out. Exposed as `RejectInfo.csw_bad`, bit 21 of
+  `reject_info` (CSR `0x30`) in `usb_msc_csr.py:123,418`. Required
+  regenerating test fixtures across `tests/test_usb_msc_integration.py`
+  and `tests/test_guh_msc_write.py` (~20 call sites) so scripted CSWs echo
+  the real captured CBW tag, or the (now-stricter) engine rejects them.
+- **BOT Reset Recovery (§5.3.4/§6.7).** Autonomous Bulk-Only Mass Storage
+  Reset (class request 0xFF) + clear-both-halts + toggle reset, triggered
+  by `need_rr` in the `READ-DONE`/`WRITE-DONE`/`FLUSH-DONE` three-way
+  branch (`vendor/guh_msc/msc.py:1229-1248, 1291-1309, 1347-1367`) whenever
+  `csw_bad_o`, a clean `PHASE_ERROR` CSW, or a CSW-phase (`reject_phase
+  == 3`) STALL is seen; revalidated with a TEST UNIT READY afterward
+  (`post_recovery` skips the redundant READ CAPACITY on that path). The
+  three `*-WAIT`→`*-DONE` state-pair restructuring was needed because
+  `csw_bad_o`/`reject_phase`/`reject_response` are only valid one cycle
+  after `status.done` fires.
+- **Data-IN STALL parity (§6.7.2).** `DATA-RX`'s Default arm
+  (`vendor/guh_msc/msc.py:492-546`, `reject_phase.eq(4)`) now clears the
+  halt and reads the CSW instead of rejecting with the endpoint left
+  halted, mirroring the data-OUT STALL handling that's existed since round
+  five; failed reads now also auto-REQUEST-SENSE like writes already did.
+- **Write-residue check.** `write_block`/`export_patch`'s write path
+  (`fw/src/usb_msc.rs:314-328`) now reads `csw_residue` on a PASSED CSW
+  and treats a nonzero residue as `MscError::WriteError` — the device
+  silently declining part of the 512-byte data phase used to read back as
+  a clean success.
+- **SYNCHRONIZE CACHE(10).** New `Command.flush`, `FLUSH`/`FLUSH-WAIT`/
+  `FLUSH-DONE` engine states (`vendor/guh_msc/msc.py:1311-1367`, mirroring
+  `WRITE-DONE`'s Reset-Recovery-aware branch) issuing SYNCHRONIZE
+  CACHE(10) LBA=0/count=0 (commit-whole-cache, no data phase); `start_flush`
+  CSR strobe at offset `0x3C` (`usb_msc_csr.py:184-185, 292-294`); firmware
+  `UsbMsc::flush()` (`fw/src/usb_msc.rs:371-380`) is called once per export,
+  after the last write, before reporting success
+  (`ok && usb_msc.flush().is_ok()` in `main.rs`'s `UsbExport` arm).
+
+**Known limitation carried forward, deliberately not fixed this round:
+command-phase (CBW) bulk-OUT STALL still has no Reset Recovery.** The
+`need_rr` check above (identical in all three `*-DONE` states) only fires
+for a CSW-phase STALL (`reject_phase == 3`) or a bad/`PHASE_ERROR` CSW. A
+STALL on the CBW itself takes the `CBW-WAIT` state's `Default` arm
+(`vendor/guh_msc/msc.py:476-485`), which sets `reject_phase.eq(1)` (CBW)
+and just rejects the command back to `READY` — no halt clear, no reset.
+Since the endpoint stays halted, the next CBW is very likely to STALL too,
+reproducing the "only a bitstream restart recovers it" symptom flagged in
+the prior research doc's quirk table as a still-open gap (NAK-on-CBW is
+fine — same state already retries with the same PID; it's specifically
+STALL-on-CBW that falls through uncaught). Deferred to a future round,
+not urgent for disposable-media validation of this round's fixes.
+
+#### Build snapshot after round eight (Tasks 1–6, commit `c92d539`, built 2026-07-16)
+
+Full bitstream, both M6a (read) and M6b (write+flush) legs included. All
+five clocks PASS (post-route Fmax, second `Max frequency for clock`
+occurrence in `build/mbsid-r5/top.tim`, lines 1492–1496):
+
+| Clock | Fmax | Target | Result |
+|---|---|---|---|
+| `sid_clk` | 52.00 MHz | 30.00 MHz | PASS |
+| `dvi5x_clk` | 411.02 MHz | 371.33 MHz | PASS |
+| `dvi_clk` | 82.84 MHz | 74.25 MHz | PASS |
+| `clkex_0__i` | 68.32 MHz | 12.29 MHz | PASS |
+| `sync` (`$glbnet$clk`) | **63.72 MHz** | 60.00 MHz | **PASS** |
+
+`TRELLIS_COMB` 23158/24288 = **95%** (`build/mbsid-r5/top.tim:305`). `sync`
+recovering from round seven's 59.61 MHz FAIL to 63.72 MHz PASS here, with no
+sync-domain logic touched by this round's changes (Reset Recovery/CSW-
+validation/flush states are all in the `usb`-domain MSC engine, plus one new
+`sync`-domain CSR strobe), is consistent with the root CLAUDE.md's
+placement-seed-noise caveat rather than evidence the FS-forcing/BOT-compliance
+work improved timing — the prior FAIL was traced to an unrelated VexiiRiscv
+CPU/wishbone path, not this round's area. LUT climbed slightly (94%→95%)
+from the new Reset Recovery/CSW-validation/flush FSM states and CSR bits,
+as expected, still comfortably routable. Flashable archive:
+`build/mbsid-r5/mbsid-mbs-M5.1-r5.tar.gz`.
+
+Host-side: `cd fw && cargo test --target x86_64-unknown-linux-gnu --lib` is
+**121/121** (unchanged from before this round — round eight touched no
+firmware-visible test surface beyond the `flush()`/residue-check tests
+already counted). `pdm run pytest tests/ -n auto -q` is **179 passed, 1
+skipped**, plus 4 pre-existing failures in `tests/test_sid_periph.py`
+(`_SidStub` missing a `voice0_dca` attribute — a `top/sid` test-fixture
+gap, unrelated to and not introduced by this round's mbsid-only changes).
+
 ## 1. Goal & non-goals
 
 Goals:
@@ -738,6 +950,39 @@ Plain checklist, not something executable in this environment — no hardware is
 here. Walk this in order on a real Tiliqua r5 with a USB-C-to-A adapter and a writable
 FAT32 thumb drive, after first confirming the M6a checklist (§7a) passes on the same drive:
 
+**Re-scoped for round eight (2026-07-16).** The MSC engine now forces Full Speed
+(`fullspeed_only`, see the "What landed" list above), so the next hardware run's
+first job is confirming that discriminating change, not re-running the full
+matrix blind. Before working the items below, confirm from the UART log:
+
+- **`spd=1` (FULL)** on the `status.speed` line — this is the LUNA xcvr_select
+  encoding (0=HIGH, 1=FULL, 2=LOW, 3=UNKNOWN; mis-documented inverted earlier
+  in this doc's round-four section, since corrected — see §"Fourth bring-up
+  round" above) — a drive still showing
+  `spd=0` means FS forcing didn't take and the whole round-eight fix set is
+  running against the wrong link speed.
+- **The export completing** (`ok=1` on the export summary line) rather than
+  hanging into the 30 s wall-clock budget or the watchdog.
+- **fsck-clean media** afterward (`fsck.vfat -n <device>`, same bar as the
+  items below).
+- **The 8 GB stick specifically** — it's the round-five/round-eight wedger
+  (the drive that produced both the mid-data STALL and the 30 s NAK-forever
+  outcome this round's fixes target); a clean run on it is the discriminating
+  result, not just "some drive worked."
+
+Known limitations, still deferred as of round eight (do not treat as fixed by
+this checklist passing): **HS support for MSC** (would need 512-byte SIE TX
+packets + PING — the engine is FS-only by design now), **short-packet-
+terminates-transfer on data-IN** (the read path counts bytes only), **no
+GET_MAX_LUN** (`bCBWLUN` hardwired 0, fine for thumb drives), **no 3-strikes
+bus-error retry** (one TIMEOUT/CRC still rejects the whole command), and
+**command-phase (CBW) bulk-OUT STALL has no Reset Recovery** (see the "What
+landed" section's known-limitation note above — a STALL on the CBW itself
+still just rejects to `READY` with the halt in place, so a drive that STALLs
+the very first CBW of a session is not expected to recover without a
+bitstream restart; not exercised by the checklist items below, which all
+start from a working CBW exchange).
+
 - [ ] **Exported file mounts clean on a PC.** From the `Usb` card, `Export` the live EDIT
   buffer (or a User slot) to the drive. Unplug from Tiliqua, plug into a PC/Linux box, run
   `fsck.vfat -n <device>` — clean, no errors, no lost chains. Confirm the file appears under
@@ -803,7 +1048,14 @@ FAT32 thumb drive, after first confirming the M6a checklist (§7a) passes on the
 - `CLAUDE.md` (this dir): **done.** USB mode mux + `0x1300` CSR + PAC-regen note (M6a); M6b
   gotcha block (vendored `guh_msc`, write CSR contract, 8.3 filenames, missing live `BUSY`
   indicator); the "no export path" framing in the no-MIDI-TX gotcha updated now that export
-  exists.
+  exists. Round eight (2026-07-16): status paragraph + M6b gotcha sub-bullet added (FS
+  forcing, BOT compliance fixes, deferred CBW-STALL Reset Recovery gap).
+- `docs/limitations.md`: **done (round eight).** Added a by-design limitation entry for
+  FS-only USB storage (why, and that MIDI-over-USB is unaffected) and the
+  flush-after-write durability guarantee.
+- `docs/user-guide.md`: **done (round eight).** Export section now notes the post-write
+  cache flush; the existing "no live BUSY indicator, frozen screen is the busy signal"
+  caveat is unchanged by this round and still holds.
 - `DESIGN.md`: M6 (both halves) is in the milestone table (§7) as of M6a; not touched by this
   checkpoint — see `DESIGN.md §7`'s own M6 entry for the up-to-date phrasing if it needs a
   pass.
