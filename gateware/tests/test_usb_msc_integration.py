@@ -169,8 +169,13 @@ def _build(watchdog_cycles=None):
     write_pending = Signal()
     with m.If(periph.start_write_o):
         m.d.sync += write_pending.eq(1)
-    with m.If(periph.start_o):
+    with m.If(periph.start_o | periph.start_flush_o):
         m.d.sync += write_pending.eq(0)
+    flush_pending = Signal()
+    with m.If(periph.start_flush_o):
+        m.d.sync += flush_pending.eq(1)
+    with m.If(periph.start_o | periph.start_write_o):
+        m.d.sync += flush_pending.eq(0)
     m.d.comb += [
         periph.status_i.connected.eq(host.status.connected),
         periph.status_i.ready.eq(host.status.ready),
@@ -178,9 +183,15 @@ def _build(watchdog_cycles=None):
         periph.status_i.block_size.eq(host.status.block_size),
         periph.status_i.block_count.eq(host.status.block_count),
         host.cmd.lba.eq(periph.lba_o),
-        host.cmd.start.eq(periph.start_o | periph.start_write_o),
+        host.cmd.start.eq(periph.start_o
+                           | periph.start_write_o
+                           | periph.start_flush_o),
         host.cmd.write.eq(periph.start_write_o |
-                          (write_pending & ~periph.start_o)),
+                          (write_pending & ~periph.start_o
+                           & ~periph.start_flush_o)),
+        host.cmd.flush.eq(periph.start_flush_o |
+                          (flush_pending & ~periph.start_o
+                           & ~periph.start_write_o)),
         periph.resp_i.done.eq(host.resp.done),
         periph.resp_i.error.eq(host.resp.error),
         periph.csw_status_i.eq(host.csw.bCSWStatus),
@@ -1008,6 +1019,43 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertTrue(result["err"])
         self.assertEqual(result["sense_valid"], 1)
         self.assertEqual(result["sense_key"], 0x3)
+
+    def test_flush_issues_synchronize_cache_10(self):
+        """Round eight durability: strobing start_flush (0x3C) must emit a
+        SYNCHRONIZE CACHE(10) CBW — opcode 0x35, zero data length — and
+        complete via the sticky resp bits like a write."""
+        result = {}
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                await fw.csr_write(ctx, 0x3C, 1)      # start_flush
+                for _ in range(400000):
+                    r = await fw.csr_read(ctx, 0x18)  # resp
+                    if r & 0b10:
+                        result["err"] = (r & 0b01) != 0
+                        return
+                raise AssertionError("flush never completed")
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                stub = host.scsi.enumerator
+                drive = _Drive(stub)
+                await drive.init_to_ready(ctx)
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)
+                result["opcode"] = cbw[15]
+                result["dlen"] = int.from_bytes(bytes(cbw[8:12]), "little")
+                await drive.do_in(
+                    ctx, _csw(tag=drive.last_tag), TransferResponse.ACK)
+            return tb
+
+        self._run(fw_tb, drive_tb)
+        self.assertFalse(result["err"])
+        self.assertEqual(result["opcode"], 0x35)
+        self.assertEqual(result["dlen"], 0)
 
 
 if __name__ == "__main__":
