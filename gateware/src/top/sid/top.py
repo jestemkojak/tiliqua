@@ -696,8 +696,13 @@ class SIDSoc(TiliquaSoc):
                 write_pending = Signal()
                 with m.If(self.usb_msc.start_write_o):
                     m.d.sync += write_pending.eq(1)
-                with m.If(self.usb_msc.start_o):
+                with m.If(self.usb_msc.start_o | self.usb_msc.start_flush_o):
                     m.d.sync += write_pending.eq(0)
+                flush_pending = Signal()
+                with m.If(self.usb_msc.start_flush_o):
+                    m.d.sync += flush_pending.eq(1)
+                with m.If(self.usb_msc.start_o | self.usb_msc.start_write_o):
+                    m.d.sync += flush_pending.eq(0)
                 m.d.comb += [
                     self.usb_msc.status_i.connected.eq(msc.status.connected),
                     self.usb_msc.status_i.ready.eq(msc.status.ready),
@@ -705,9 +710,15 @@ class SIDSoc(TiliquaSoc):
                     self.usb_msc.status_i.block_size.eq(msc.status.block_size),
                     self.usb_msc.status_i.block_count.eq(msc.status.block_count),
                     msc.cmd.lba.eq(self.usb_msc.lba_o),
-                    msc.cmd.start.eq(self.usb_msc.start_o | self.usb_msc.start_write_o),
+                    msc.cmd.start.eq(self.usb_msc.start_o
+                                     | self.usb_msc.start_write_o
+                                     | self.usb_msc.start_flush_o),
                     msc.cmd.write.eq(self.usb_msc.start_write_o |
-                                      (write_pending & ~self.usb_msc.start_o)),
+                                      (write_pending & ~self.usb_msc.start_o
+                                       & ~self.usb_msc.start_flush_o)),
+                    msc.cmd.flush.eq(self.usb_msc.start_flush_o |
+                                      (flush_pending & ~self.usb_msc.start_o
+                                       & ~self.usb_msc.start_write_o)),
                     self.usb_msc.resp_i.done.eq(msc.resp.done),
                     self.usb_msc.resp_i.error.eq(msc.resp.error),
                     self.usb_msc.csw_status_i.eq(msc.csw.bCSWStatus),
