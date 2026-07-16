@@ -72,6 +72,7 @@ class _Sie:
         self.dut = dut
         self.stub = stub
         self.tx_counter = 0   # counting pattern fed into dut.tx_data
+        self.last_tag = 0
 
     async def tick(self, ctx, capture=None):
         c = self.stub.ctrl
@@ -115,6 +116,9 @@ class _Sie:
         await self.tick(ctx)                       # commit XFER -> *-WAIT (idle=1)
         ctx.set(c.status.response, response)
         await self.tick(ctx)                       # DUT reads response
+        if (capture is not None and len(capture) >= 8
+                and bytes(capture[:4]) == b"USBC"):
+            self.last_tag = int.from_bytes(bytes(capture[4:8]), "little")
         return pid, xtype, ep
 
     async def do_in(self, ctx, payload, response):
@@ -150,17 +154,17 @@ def _build():
     return m, dut, stub
 
 
-def _passing_csw():
+def _passing_csw(tag=1):
     b = [0x55, 0x53, 0x42, 0x53]          # dCSWSignature
-    b += [0, 0, 0, 0]                      # dCSWTag
+    b += list(int(tag).to_bytes(4, "little"))  # dCSWTag (must echo the CBW's)
     b += [0, 0, 0, 0]                      # dCSWDataResidue
-    b += [0x00]                            # bCSWStatus = PASSED
+    b += [0x00]                            # bCSWStatus = passed
     return b
 
 
-def _failing_csw():
-    b = _passing_csw()
-    b[-1] = 0x01                           # bCSWStatus = FAILED
+def _failing_csw(tag=1):
+    b = _passing_csw(tag)
+    b[-1] = 0x01                           # bCSWStatus = failed
     return b
 
 
@@ -195,7 +199,7 @@ class GuhMscWriteTests(unittest.TestCase):
                 ctx, data_dir=0, opcode=SCSIOpCode.READ_10, data_len=1)
             await sie.expect_out(ctx, TransferResponse.ACK, [])
             await sie.do_in(ctx, [0xA5], TransferResponse.ACK)
-            await sie.do_in(ctx, _passing_csw(), TransferResponse.ACK)
+            await sie.do_in(ctx, _passing_csw(sie.last_tag), TransferResponse.ACK)
             self.assertEqual(ctx.get(dut.rx_bytes_o), 1)
 
             ctx.set(dut.cmd.start, 1)
@@ -297,7 +301,7 @@ class GuhMscWriteTests(unittest.TestCase):
                 meta.append((pid, xtype, ep))
             # Command completes with a passing CSW.
             done, error = await sie.do_in(
-                ctx, _passing_csw(), TransferResponse.ACK)
+                ctx, _passing_csw(sie.last_tag), TransferResponse.ACK)
             self.assertTrue(done)
             self.assertFalse(error)
 
@@ -351,21 +355,22 @@ class GuhMscWriteTests(unittest.TestCase):
 
     def test_write_csw_pass_and_fail(self):
         """(4) CSW status is reflected in status.done / status.error."""
-        for csw, exp_err in ((_passing_csw(), 0), (_failing_csw(), 1)):
+        for build_csw, exp_err in ((_passing_csw, 0), (_failing_csw, 1)):
             with self.subTest(fail=exp_err):
                 m, dut, stub = _build()
                 result = {}
 
-                async def tb(ctx, csw=csw, result=result):
+                async def tb(ctx, build_csw=build_csw, result=result):
                     sie = _Sie(dut, stub)
                     await sie.to_idle_and_start(
                         ctx, data_dir=1, opcode=SCSIOpCode.WRITE_10,
                         data_len=BLOCK_SIZE)
-                    await sie.expect_out(ctx, TransferResponse.ACK, [])
+                    cbw = []
+                    await sie.expect_out(ctx, TransferResponse.ACK, cbw)
                     for _ in range(8):
                         await sie.expect_out(ctx, TransferResponse.ACK, [])
                     done, error = await sie.do_in(
-                        ctx, csw, TransferResponse.ACK)
+                        ctx, build_csw(sie.last_tag), TransferResponse.ACK)
                     result["done"] = done
                     result["error"] = error
 
@@ -449,6 +454,53 @@ class GuhMscWriteTests(unittest.TestCase):
         self.assertEqual(len(cbw), CBW_SIZE_BYTES)
         self.assertEqual(cbw[12], CBWFlags.DATA_IN.value)     # 0x80
         self.assertEqual(cbw[15], SCSIOpCode.READ_10.value)   # 0x28
+
+    def test_csw_bad_tag_rejected(self):
+        """BOT §6.3.1: a CSW whose dCSWTag doesn't echo the CBW's dCBWTag is
+        not a valid CSW — the command must be rejected (and csw_bad_o set),
+        never reported as success."""
+        m, dut, stub = _build()
+        sie = _Sie(dut, stub)
+
+        async def tb(ctx):
+            await sie.to_idle_and_start(
+                ctx, data_dir=0, opcode=0x00, data_len=0)  # TEST UNIT READY
+            cbw = []
+            await sie.expect_out(ctx, TransferResponse.ACK, cbw)
+            done, error = await sie.do_in(
+                ctx, _passing_csw(tag=sie.last_tag + 1), TransferResponse.ACK)
+            self.assertEqual(done, 1)
+            self.assertEqual(ctx.get(dut.csw_bad_o), 1)
+            self.assertEqual(ctx.get(dut.status.rejected), 0)  # strobe passed
+            # csw_bad_o persists until the next cmd.start
+            await sie.tick(ctx)
+            self.assertEqual(ctx.get(dut.csw_bad_o), 1)
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6, domain="usb")
+        sim.add_testbench(tb)
+        sim.run()
+
+    def test_csw_bad_signature_rejected(self):
+        """BOT §6.3.1: bad dCSWSignature = not a CSW at all."""
+        m, dut, stub = _build()
+        sie = _Sie(dut, stub)
+
+        async def tb(ctx):
+            await sie.to_idle_and_start(
+                ctx, data_dir=0, opcode=0x00, data_len=0)
+            cbw = []
+            await sie.expect_out(ctx, TransferResponse.ACK, cbw)
+            bad = _passing_csw(tag=sie.last_tag)
+            bad[0] = 0x00                     # corrupt the signature
+            done, _ = await sie.do_in(ctx, bad, TransferResponse.ACK)
+            self.assertEqual(done, 1)
+            self.assertEqual(ctx.get(dut.csw_bad_o), 1)
+
+        sim = Simulator(m)
+        sim.add_clock(1e-6, domain="usb")
+        sim.add_testbench(tb)
+        sim.run()
 
 
 if __name__ == "__main__":
