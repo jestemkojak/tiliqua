@@ -1222,15 +1222,16 @@ class USBMSCHost(wiring.Component):
             with m.State("READ-DONE"):
                 # See xfer_error_r's comment: wait one cycle for scsi's own
                 # diagnostic registers to settle before deciding.
-                # BOT §5.3.4: phase error, an invalid CSW, or a CSW that
-                # STALLed twice all mean the transport is desynced —
+                # BOT §5.3.4: phase error, invalid CSW, a STALLed CBW, or a
+                # CSW that STALLed twice mean the transport is desynced —
                 # Reset Recovery is REQUIRED before any next CBW (the
                 # old behavior sent REQUEST SENSE into the desync).
                 need_rr = (scsi.csw_bad_o
                            | (~xfer_rejected_r
                               & (scsi.csw.bCSWStatus == CSWStatus.PHASE_ERROR))
                            | (xfer_rejected_r
-                              & (scsi.reject_phase == 3)
+                              & ((scsi.reject_phase == 1)
+                                 | (scsi.reject_phase == 3))
                               & (scsi.reject_response
                                  == TransferResponse.STALL.value)))
                 with m.If(need_rr):
@@ -1284,15 +1285,16 @@ class USBMSCHost(wiring.Component):
             with m.State("WRITE-DONE"):
                 # See xfer_error_r's comment: wait one cycle for scsi's own
                 # diagnostic registers to settle before deciding.
-                # BOT §5.3.4: phase error, an invalid CSW, or a CSW that
-                # STALLed twice all mean the transport is desynced —
+                # BOT §5.3.4: phase error, invalid CSW, a STALLed CBW, or a
+                # CSW that STALLed twice mean the transport is desynced —
                 # Reset Recovery is REQUIRED before any next CBW (the
                 # old behavior sent REQUEST SENSE into the desync).
                 need_rr = (scsi.csw_bad_o
                            | (~xfer_rejected_r
                               & (scsi.csw.bCSWStatus == CSWStatus.PHASE_ERROR))
                            | (xfer_rejected_r
-                              & (scsi.reject_phase == 3)
+                              & ((scsi.reject_phase == 1)
+                                 | (scsi.reject_phase == 3))
                               & (scsi.reject_response
                                  == TransferResponse.STALL.value)))
                 with m.If(need_rr):
@@ -1340,15 +1342,16 @@ class USBMSCHost(wiring.Component):
             with m.State("FLUSH-DONE"):
                 # See xfer_error_r's comment: wait one cycle for scsi's own
                 # diagnostic registers to settle before deciding.
-                # BOT §5.3.4: phase error, an invalid CSW, or a CSW that
-                # STALLed twice all mean the transport is desynced —
+                # BOT §5.3.4: phase error, invalid CSW, a STALLed CBW, or a
+                # CSW that STALLed twice mean the transport is desynced —
                 # Reset Recovery is REQUIRED before any next CBW (the
                 # old behavior sent REQUEST SENSE into the desync).
                 need_rr = (scsi.csw_bad_o
                            | (~xfer_rejected_r
                               & (scsi.csw.bCSWStatus == CSWStatus.PHASE_ERROR))
                            | (xfer_rejected_r
-                              & (scsi.reject_phase == 3)
+                              & ((scsi.reject_phase == 1)
+                                 | (scsi.reject_phase == 3))
                               & (scsi.reject_response
                                  == TransferResponse.STALL.value)))
                 with m.If(need_rr):

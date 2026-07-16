@@ -265,10 +265,11 @@ impl UsbMsc {
     /// an empty payload and left the device hanging mid-command (bulk-only
     /// transport desync -> mostly-zero sectors written at arbitrary LBAs).
     /// Root-caused and fixed in gateware simulation
-    /// (`tests/test_usb_msc_csr.py::test_write_contract_strobe_then_fill_defers_start`);
-    /// the export path is re-enabled for hardware validation, which must run
-    /// on **disposable media only** until the `M6_USB_STORAGE.md` §7b
-    /// checklist passes (§8 risk table).
+    /// (`tests/test_usb_msc_csr.py::test_write_contract_strobe_then_fill_defers_start`),
+    /// then hardware-retested 2026-07-16: exported files verified byte-correct
+    /// against the source patch, no drive damage. Export is permanently
+    /// enabled; see `M6_USB_STORAGE.md` §7b/§8 for the still-outstanding
+    /// stack-paint remeasure of this write leg.
     pub fn write_block(&self, lba: u32, buf: &[u8; 512]) -> Result<(), MscError> {
         self.diag.wr.set(self.diag.wr.get().wrapping_add(1)); // TEMPORARY diag
         // Bounded ready-wait instead of an instant NotReady: after a failed
