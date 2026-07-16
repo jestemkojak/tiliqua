@@ -185,7 +185,10 @@ only way to get a patch off the device (MIDI is receive-only; see
 3. Press again to commit. The status line reports `Exported <filename>` on
    success or `Export FAILED` if the write didn't go through (drive
    removed, filesystem full, or the peripheral reported a SCSI write
-   error) — nothing is left half-written on a `FAILED` result.
+   error) — nothing is left half-written on a `FAILED` result. On success,
+   the device also flushes the drive's write cache before reporting
+   `Exported` — the file is durably on the drive, not just handed off to
+   its firmware, at that point.
 
 **Don't unplug the drive while an export is in progress.** There is no
 separate `BUSY` indicator for this — the whole menu (encoder input,
