@@ -175,6 +175,10 @@ class SCSIBulkHost(wiring.Component):
     # (the 2026-07-15 64GB-stick hang came back rej=0/0/0 — all evidence
     # zeroed by the very reset that ended the hang).
     phase_o: Out(3)
+    # BOT §6.3.1 CSW validation result: 1 = the last command's CSW failed the
+    # signature/tag/length check (transport likely desynced — the MSC layer
+    # escalates to Reset Recovery). Registered; cleared on the next cmd.start.
+    csw_bad_o: Out(1)
     # Live read-path diagnostics. Firmware samples these before the outer
     # 10-second watchdog can reset the engine.
     rx_bytes_o:       Out(10)  # bytes accepted from the SIE this data-IN phase
@@ -374,6 +378,7 @@ class SCSIBulkHost(wiring.Component):
                         self.reject_response.eq(0),
                         self.reject_phase.eq(0),
                         self.reject_txdone.eq(0),
+                        self.csw_bad_o.eq(0),
                     ]
                     m.next = "CBW-LOAD"
 
@@ -626,14 +631,36 @@ class SCSIBulkHost(wiring.Component):
                 with m.If(enum.ctrl.status.idle):
                     with m.Switch(enum.ctrl.status.response):
                         with m.Case(TransferResponse.ACK):
+                            # BOT §6.3.1: the host shall consider the CSW
+                            # valid only if it is exactly 13 bytes, carries
+                            # the CSW signature, and echoes the CBW's tag.
+                            # Anything else means the transport is desynced
+                            # (e.g. stale IN data misparsed as a CSW) and
+                            # MUST NOT be reported as command status —
+                            # before round eight a garbage "CSW" with a zero
+                            # status byte reported false success.
+                            csw_ok = ((rx_byte_idx == CSW_SIZE_BYTES)
+                                      & (csw_sig.dCSWSignature == CSW_SIGNATURE)
+                                      & (csw_sig.dCSWTag == cbw_tag))
                             m.d.usb += [
                                 pid_in.eq(Mux(pid_in, DataPID.DATA0, DataPID.DATA1)),
                                 cbw_tag.eq(cbw_tag + 1),
                             ]
-                            m.d.comb += [
-                                self.status.done.eq(1),
-                                self.status.error.eq(csw_sig.bCSWStatus != CSWStatus.PASSED),
-                            ]
+                            with m.If(csw_ok):
+                                m.d.comb += [
+                                    self.status.done.eq(1),
+                                    self.status.error.eq(csw_sig.bCSWStatus != CSWStatus.PASSED),
+                                ]
+                            with m.Else():
+                                m.d.usb += [
+                                    self.csw_bad_o.eq(1),
+                                    self.reject_response.eq(enum.ctrl.status.response),
+                                    self.reject_phase.eq(3),   # CSW
+                                ]
+                                m.d.comb += [
+                                    self.status.done.eq(1),
+                                    self.status.rejected.eq(1),
+                                ]
                             m.next = "IDLE"
                         with m.Case(TransferResponse.NAK):
                             m.next = "CSW"
@@ -859,6 +886,7 @@ class USBMSCHost(wiring.Component):
     reject_txdone:   Out(4)
     nyets:           Out(8)   # pass-through: NYETs this command
     phase_o:         Out(3)   # pass-through: live exchange phase
+    csw_bad_o:       Out(1)   # pass-through: BOT §6.3.1 CSW validation failed
     rx_bytes_o:       Out(10)
     stream_mode_o:    Out(1)
     data_len_512_o:   Out(1)
@@ -902,6 +930,7 @@ class USBMSCHost(wiring.Component):
             self.reject_txdone.eq(scsi.reject_txdone),
             self.nyets.eq(scsi.nyets),
             self.phase_o.eq(scsi.phase_o),
+            self.csw_bad_o.eq(scsi.csw_bad_o),
             self.rx_bytes_o.eq(scsi.rx_bytes_o),
             self.stream_mode_o.eq(scsi.stream_mode_o),
             self.data_len_512_o.eq(scsi.data_len_512_o),

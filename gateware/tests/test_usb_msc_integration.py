@@ -34,9 +34,9 @@ from test_guh_msc_write import StubEnumerator
 BLOCK = 512
 
 
-def _csw(status=0x00, residue=0):
+def _csw(status=0x00, residue=0, tag=1):
     b = [0x55, 0x53, 0x42, 0x53]                     # dCSWSignature
-    b += [0, 0, 0, 0]                                # dCSWTag (engine ignores)
+    b += list(int(tag).to_bytes(4, "little"))        # dCSWTag (echo the CBW's)
     b += list(residue.to_bytes(4, "little"))         # dCSWDataResidue
     b += [status]                                    # bCSWStatus
     return b
@@ -55,6 +55,7 @@ class _Drive:
     def __init__(self, stub):
         self.stub = stub
         self.out_log = []   # list of (bytes, response) per OUT transaction
+        self.last_tag = 0
 
     async def tick(self, ctx, capture=None):
         c = self.stub.ctrl
@@ -83,12 +84,17 @@ class _Drive:
 
     async def do_out(self, ctx, response, capture=None):
         """Serve one OUT transaction: bytes were already captured while
-        waiting; commit start, then answer."""
-        xtype, pid = await self.wait_start(ctx, capture)
+        waiting; commit start, then answer. Records the dCBWTag of any CBW
+        seen so the test can echo it in the CSW (the engine validates tag
+        echo per BOT §6.3.1 since round eight)."""
+        buf = capture if capture is not None else []
+        xtype, pid = await self.wait_start(ctx, buf)
         assert xtype == TransferType.OUT, f"expected OUT, got {xtype}"
         await self.tick_noconsume(ctx)              # commit -> engine *-WAIT
         ctx.set(self.stub.ctrl.status.response, response)
         await self.tick_noconsume(ctx)              # engine reads response
+        if len(buf) >= 8 and bytes(buf[:4]) == b"USBC":
+            self.last_tag = int.from_bytes(bytes(buf[4:8]), "little")
         return pid
 
     async def do_setup(self, ctx, capture=None,
@@ -131,12 +137,12 @@ class _Drive:
         cbw = []
         await self.do_out(ctx, TransferResponse.ACK, cbw)
         assert len(cbw) == CBW_SIZE_BYTES
-        await self.do_in(ctx, _csw(), TransferResponse.ACK)
+        await self.do_in(ctx, _csw(tag=self.last_tag), TransferResponse.ACK)
         # READ CAPACITY: CBW out, 8 bytes in, CSW in.
         cbw = []
         await self.do_out(ctx, TransferResponse.ACK, cbw)
         await self.do_in(ctx, _capacity(), TransferResponse.ACK)
-        await self.do_in(ctx, _csw(), TransferResponse.ACK)
+        await self.do_in(ctx, _csw(tag=self.last_tag), TransferResponse.ACK)
 
 
 def _build(watchdog_cycles=None):
@@ -186,6 +192,7 @@ def _build(watchdog_cycles=None):
         periph.reject_txdone_i.eq(host.reject_txdone),
         periph.nyet_count_i.eq(host.nyets),
         periph.phase_i.eq(host.phase_o),
+        periph.csw_bad_i.eq(host.csw_bad_o),
         periph.engine_rx_bytes_i.eq(host.rx_bytes_o),
         periph.engine_stream_mode_i.eq(host.stream_mode_o),
         periph.engine_data_len_512_i.eq(host.data_len_512_o),
@@ -317,7 +324,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                     await drive.do_out(ctx, TransferResponse.ACK, data)
                 result["data"] = data
                 await drive.do_in(ctx, [], TransferResponse.NAK)      # CSW: NAK
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
             return tb
 
         self._run(fw_tb, drive_tb)
@@ -356,7 +363,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 for _ in range(8):                                    # data
                     await drive.do_out(ctx, TransferResponse.NYET, data)
                 result["data"] = data
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
             return tb
 
         self._run(fw_tb, drive_tb)
@@ -420,7 +427,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 for _ in range(8):
                     await drive.do_out(ctx, TransferResponse.ACK, wdata)
                 result["wdata"] = wdata
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
                 # READ: CBW must be a READ(10) opcode, then serve the block
                 rcbw = []
                 await drive.do_out(ctx, TransferResponse.ACK, rcbw)
@@ -430,7 +437,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                                       TransferResponse.ACK)
                 await drive.do_in(ctx, [], TransferResponse.NAK)
                 result["read_csw_nak_seen"] = True
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
             return tb
 
         self._run(fw_tb, drive_tb)
@@ -496,7 +503,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 await drive.do_out(ctx, TransferResponse.ACK, [])
                 for _ in range(8):
                     await drive.do_out(ctx, TransferResponse.ACK, [])
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
                 # READ: accept the CBW, then busy-NAK the data phase for
                 # far longer than WD cycles (see NAKS comment above).
                 rcbw = []
@@ -508,7 +515,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 for i in range(8):
                     await drive.do_in(ctx, sector[i*64:(i+1)*64],
                                       TransferResponse.ACK)
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
                 result["drive_done"] = True
             return tb
 
@@ -604,7 +611,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 await drive.do_out(ctx, TransferResponse.ACK, [])     # CBW
                 for _ in range(8):
                     await drive.do_out(ctx, TransferResponse.ACK, [])
-                await drive.do_in(ctx, _csw(0x01, residue=512),
+                await drive.do_in(ctx, _csw(0x01, residue=512, tag=drive.last_tag),
                                   TransferResponse.ACK)
                 # Engine auto-issues REQUEST SENSE: CBW out, 18 bytes in, CSW.
                 sense_cbw = []
@@ -613,7 +620,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 result["sense_alloc"] = sense_cbw[19]
                 sense = [0x70, 0, 0x07] + [0] * 9 + [0x27, 0x00] + [0] * 4
                 await drive.do_in(ctx, sense, TransferResponse.ACK)
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
             return tb
 
         self._run(fw_tb, drive_tb)
@@ -666,7 +673,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 await drive.do_setup(ctx, setup)      # CLEAR_FEATURE(HALT)
                 result["setup"] = setup
                 await drive.do_in(ctx, [], TransferResponse.ACK)      # status
-                await drive.do_in(ctx, _csw(0x01, residue=384),
+                await drive.do_in(ctx, _csw(0x01, residue=384, tag=drive.last_tag),
                                   TransferResponse.ACK)               # CSW
                 # Auto REQUEST SENSE; its CBW must restart at DATA0.
                 sense_cbw = []
@@ -675,7 +682,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 result["sense_opcode"] = sense_cbw[15]
                 sense = [0x70, 0, 0x07] + [0] * 9 + [0x27, 0x00] + [0] * 4
                 await drive.do_in(ctx, sense, TransferResponse.ACK)
-                await drive.do_in(ctx, _csw(0x00), TransferResponse.ACK)
+                await drive.do_in(ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)
             return tb
 
         self._run(fw_tb, drive_tb)
@@ -727,7 +734,7 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 result["setup"] = setup
                 await drive.do_in(ctx, [], TransferResponse.ACK)      # status
                 result["csw_pid"] = await drive.do_in(
-                    ctx, _csw(0x00), TransferResponse.ACK)            # retry
+                    ctx, _csw(0x00, tag=drive.last_tag), TransferResponse.ACK)            # retry
             return tb
 
         self._run(fw_tb, drive_tb)
@@ -782,6 +789,45 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertEqual(result["rej_phase"], 3)
         # The live-phase breadcrumb saw the CSW phase last.
         self.assertEqual(result["last_phase"], 3)
+
+    def test_csw_with_wrong_tag_is_write_failure(self):
+        """A stale/garbage CSW (wrong tag) after a write must surface as
+        resp.error with reject_info.csw_bad set — before round eight it
+        read as a clean success if its status byte happened to be 0."""
+        result = {}
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                err = await fw.write_block(ctx, 100, [0xAB] * BLOCK)
+                # reject_info is a 32-bit read at 0x30; csw_bad is the field
+                # above last_phase (bit position per the generated layout —
+                # read via the packed register and check nonzero phase=3
+                # plus the csw_bad bit; simplest robust check: the write
+                # errored and rej phase == 3).
+                rej = await fw.csr_read32(ctx, 0x30)
+                result["err"] = err
+                result["rej_phase"] = (rej >> 3) & 0b111
+                result["csw_bad"] = (rej >> 21) & 1
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                drive = _Drive(host.scsi.enumerator)
+                await drive.init_to_ready(ctx)
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)  # CBW
+                for _ in range(8):                                   # 8x64B data
+                    await drive.do_out(ctx, TransferResponse.ACK)
+                await drive.do_in(
+                    ctx, _csw(tag=drive.last_tag + 7), TransferResponse.ACK)
+            return tb
+
+        self._run(fw_tb, drive_tb)
+        self.assertTrue(result["err"])
+        self.assertEqual(result["rej_phase"], 3)
+        self.assertEqual(result["csw_bad"], 1)
 
 
 if __name__ == "__main__":
