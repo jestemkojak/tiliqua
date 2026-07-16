@@ -748,13 +748,14 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertEqual(result["rej_resp"], TransferResponse.STALL.value)
         self.assertEqual(result["rej_phase"], 3)
 
-    def test_csw_double_stall_rejects_promptly(self):
+    def test_csw_double_stall_escalates_to_reset_recovery(self):
         """If the CSW STALLs again after a clear-halt, reset recovery is
-        needed — the engine must fail the command promptly (resp.done=1,
-        error=1, reject phase=3) instead of looping clear-halt/CSW forever
-        or wedging until the 10 s watchdog."""
+        needed — before round eight the engine failed the command promptly
+        and parked; now it runs the full BOT §5.3.4 recovery sequence
+        autonomously and returns to ready."""
         payload = [0xC3] * BLOCK
         result = {}
+        setups = []
 
         def fw_tb(periph, host):
             async def tb(ctx):
@@ -766,6 +767,8 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 result["rej_resp"] = ri & 0b111
                 result["rej_phase"] = (ri >> 3) & 0b111
                 result["last_phase"] = (ri >> 18) & 0b111
+                await fw.wait_ready(ctx)      # ready again post-recovery
+                result["recovered"] = True
             return tb
 
         def drive_tb(host):
@@ -779,9 +782,27 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 await drive.do_setup(ctx, [])         # CLEAR_FEATURE(HALT)
                 await drive.do_in(ctx, [], TransferResponse.ACK)      # status
                 await drive.do_in(ctx, [], TransferResponse.STALL)    # again!
+                # --- Reset Recovery ---
+                s = []
+                await drive.do_setup(ctx, s)          # MSC reset (0x21, 0xFF)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)  # status ZLP
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt IN (0x81)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt OUT (0x02)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                # --- post-recovery revalidation: TEST UNIT READY ---
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)
+                await drive.do_in(
+                    ctx, _csw(tag=drive.last_tag), TransferResponse.ACK)
             return tb
 
-        self._run(fw_tb, drive_tb)
+        self._run(fw_tb, drive_tb, deadline_us=80000)
         self.assertIn("error", result,
                       "engine hung on a double-STALLed CSW (no resp.done)")
         self.assertTrue(result["error"])
@@ -789,12 +810,19 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertEqual(result["rej_phase"], 3)
         # The live-phase breadcrumb saw the CSW phase last.
         self.assertEqual(result["last_phase"], 3)
+        self.assertTrue(result.get("recovered"))
+        self.assertEqual(setups[0], [0x21, 0xFF, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(setups[1], [0x02, 0x01, 0, 0, 0x81, 0, 0, 0])
+        self.assertEqual(setups[2], [0x02, 0x01, 0, 0, 0x02, 0, 0, 0])
 
     def test_csw_with_wrong_tag_is_write_failure(self):
         """A stale/garbage CSW (wrong tag) after a write must surface as
         resp.error with reject_info.csw_bad set — before round eight it
-        read as a clean success if its status byte happened to be 0."""
+        read as a clean success if its status byte happened to be 0. Since
+        this task, an invalid CSW also triggers BOT §5.3.4 Reset Recovery,
+        so the drive script must play out the recovery sequence too."""
         result = {}
+        setups = []
 
         def fw_tb(periph, host):
             async def tb(ctx):
@@ -810,6 +838,8 @@ class UsbMscIntegrationTests(unittest.TestCase):
                 result["err"] = err
                 result["rej_phase"] = (rej >> 3) & 0b111
                 result["csw_bad"] = (rej >> 21) & 1
+                await fw.wait_ready(ctx)      # ready again post-recovery
+                result["recovered"] = True
             return tb
 
         def drive_tb(host):
@@ -822,12 +852,96 @@ class UsbMscIntegrationTests(unittest.TestCase):
                     await drive.do_out(ctx, TransferResponse.ACK)
                 await drive.do_in(
                     ctx, _csw(tag=drive.last_tag + 7), TransferResponse.ACK)
+                # --- Reset Recovery ---
+                s = []
+                await drive.do_setup(ctx, s)          # MSC reset (0x21, 0xFF)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)  # status ZLP
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt IN (0x81)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt OUT (0x02)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                # --- post-recovery revalidation: TEST UNIT READY ---
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)
+                await drive.do_in(
+                    ctx, _csw(tag=drive.last_tag), TransferResponse.ACK)
             return tb
 
-        self._run(fw_tb, drive_tb)
+        self._run(fw_tb, drive_tb, deadline_us=80000)
         self.assertTrue(result["err"])
         self.assertEqual(result["rej_phase"], 3)
         self.assertEqual(result["csw_bad"], 1)
+        self.assertTrue(result.get("recovered"))
+        self.assertEqual(setups[0], [0x21, 0xFF, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(setups[1], [0x02, 0x01, 0, 0, 0x81, 0, 0, 0])
+        self.assertEqual(setups[2], [0x02, 0x01, 0, 0, 0x02, 0, 0, 0])
+
+    def test_phase_error_csw_triggers_reset_recovery(self):
+        """BOT §5.3.4: CSW status 0x02 (phase error) requires Reset Recovery
+        (MSC reset + clear both halts) before the next CBW - issuing any
+        other command (the old auto-REQUEST-SENSE) is a spec violation.
+        The engine must: fail the write to firmware, run the recovery
+        sequence autonomously, re-run TEST UNIT READY, and return to ready
+        with both toggles back at DATA0."""
+        result = {}
+        setups = []
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                result["err"] = await fw.write_block(ctx, 100, [0x5A] * BLOCK)
+                await fw.wait_ready(ctx)      # ready again post-recovery
+                result["recovered"] = True
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                stub = host.scsi.enumerator
+                drive = _Drive(stub)
+                await drive.init_to_ready(ctx)
+                cbw = []
+                await drive.do_out(ctx, TransferResponse.ACK, cbw)   # CBW
+                for _ in range(8):
+                    await drive.do_out(ctx, TransferResponse.ACK)    # data
+                await drive.do_in(
+                    ctx, _csw(status=0x02, tag=drive.last_tag),
+                    TransferResponse.ACK)                            # PHASE ERROR
+                # --- Reset Recovery ---
+                s = []
+                await drive.do_setup(ctx, s)          # MSC reset (0x21, 0xFF)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)  # status ZLP
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt IN (0x81)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt OUT (0x02)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                # --- post-recovery revalidation: TEST UNIT READY ---
+                cbw = []
+                pid = await drive.do_out(ctx, TransferResponse.ACK, cbw)
+                result["tur_pid"] = pid               # toggle reset -> DATA0
+                result["tur_opcode"] = cbw[15]
+                await drive.do_in(
+                    ctx, _csw(tag=drive.last_tag), TransferResponse.ACK)
+            return tb
+
+        self._run(fw_tb, drive_tb, deadline_us=80000)
+        self.assertTrue(result["err"])                # firmware saw failure
+        self.assertTrue(result.get("recovered"))
+        self.assertEqual(setups[0], [0x21, 0xFF, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(setups[1], [0x02, 0x01, 0, 0, 0x81, 0, 0, 0])
+        self.assertEqual(setups[2], [0x02, 0x01, 0, 0, 0x02, 0, 0, 0])
+        self.assertEqual(result["tur_opcode"], 0x00)  # TEST UNIT READY
+        self.assertEqual(result["tur_pid"], DataPID.DATA0)
 
 
 if __name__ == "__main__":
