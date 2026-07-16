@@ -22,6 +22,12 @@ a promise; LUT climbed from M6a's 91% as expected with the write leg added, stil
 routable. The one thing NOT yet validated is **playback and the M4 SysEx/user-bank and M6
 USB-drive load/export flows on real hardware** (DESIGN §7 milestones 2–3;
 `M4_USER_PATCH_BANKS.md §7`, `M6_USB_STORAGE.md`'s hardware checklists for both M6a and M6b).
+**Round seven (2026-07-15, landed after the M6b write path above) added a handshake-fed
+engine watchdog + firmware wall-clock read/write timeouts** (`M6_USB_STORAGE.md`'s "Seventh
+round" section) — simulation/compile-verified only, hardware validation still pending. The
+most recent full build's `sync` post-route Fmax was **59.61 MHz, a FAIL** against the 60 MHz
+target; traced to an unrelated VexiiRiscv CPU/wishbone critical path, not this round's
+change, but not yet re-confirmed with a clean re-run.
 
 ## Vendored engine (not in this repo)
 
