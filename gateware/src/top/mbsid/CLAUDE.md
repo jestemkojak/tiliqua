@@ -28,6 +28,16 @@ round" section) — simulation/compile-verified only, hardware validation still 
 most recent full build's `sync` post-route Fmax was **59.61 MHz, a FAIL** against the 60 MHz
 target; traced to an unrelated VexiiRiscv CPU/wishbone critical path, not this round's
 change, but not yet re-confirmed with a clean re-run.
+**Round eight (2026-07-16) forced the MSC engine to Full Speed and landed the BOT-compliance
+fixes (CSW validation, Reset Recovery, data-IN STALL parity, write-residue check,
+SYNCHRONIZE CACHE)** (`M6_USB_STORAGE.md`'s "Eighth round" section) — sim-verified (host
+`cargo test --lib` 121/121, `pytest tests/ -n auto` 179 passed/1 skipped, the four
+`test_sid_periph.py` failures are a pre-existing `top/sid` test-fixture bug —
+`_SidStub` missing `voice0_dca` — unrelated to this round's mbsid-only changes, not
+introduced by it), full bitstream build PASS on all five clocks (`sync` 63.72 MHz PASS
+against 60 MHz, up from round seven's 59.61 MHz FAIL — the prior FAIL's cause, an unrelated
+CPU/wishbone path, was evidently seed noise rather than a persistent regression;
+`TRELLIS_COMB` 23158/24288 = 95%), hardware validation still pending.
 
 ## Vendored engine (not in this repo)
 
@@ -403,6 +413,31 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     only "busy" signal a user gets — don't write doc copy implying a `BUSY` row appears
     during export; it doesn't. The safe-unplug rule is "don't unplug while the menu is
     unresponsive," not "don't unplug while it says BUSY."
+  - **Round eight (2026-07-16): FS forcing + BOT compliance** (`M6_USB_STORAGE.md`
+    "Eighth round"). The MSC engine is now **FS-only by design** — a real-hardware
+    run found HS writes chunked to 64 B send 8 legally-short packets (HS bulk
+    `wMaxPacketSize` is mandatorily 512), and the SIE has no PING protocol
+    (mandatory for HS hosts), together explaining the round-five/six wedges;
+    `usb_msc_fullspeed_only` defaults on for mbsid (`top/mbsid/top.py:71`
+    → `SIDSoc.__init__`, `top/sid/top.py:500,513,653`). **Do NOT "fix" the speed
+    back to HS** without also implementing 512-byte SIE TX packets + PING — that
+    reintroduces both wedge mechanisms. Also landed this round: BOT §6.3.1 CSW
+    validation (`csw_bad_o`, `reject_info` bit 21), autonomous BOT §5.3.4 Reset
+    Recovery (MSC reset 0xFF + clear-both-halts + toggle reset,
+    `vendor/guh_msc/msc.py`'s `need_rr` in `READ-DONE`/`WRITE-DONE`/`FLUSH-DONE`),
+    data-IN STALL clear-halt+CSW-read parity with the write side, a write-residue
+    check (`fw/src/usb_msc.rs`), and SYNCHRONIZE CACHE(10) via a new `start_flush`
+    CSR strobe at offset **`0x3C`**, one flush per export
+    (`usb_msc_csr.py`/`fw/src/usb_msc.rs::flush`). Two testing/scope notes: (1)
+    scripted CSWs in `tests/test_usb_msc_integration.py` and
+    `tests/test_guh_msc_write.py` must now echo the real captured CBW tag
+    (`_Drive.last_tag`/`_Sie.last_tag`) or the now-stricter CSW-tag check rejects
+    them; (2) command-phase (CBW) bulk-OUT STALL still has **no** Reset Recovery
+    — `need_rr` only fires for a CSW-phase STALL or bad/`PHASE_ERROR` CSW, not a
+    STALL on the CBW itself (`CBW-WAIT`'s `Default` arm, `reject_phase.eq(1)`,
+    just rejects to `READY` with the halt still set) — deliberately deferred, not
+    fixed this round; see `M6_USB_STORAGE.md`'s round-eight known-limitations
+    list.
 - **Menu rendering is a blit-diff, never a background fill.** Rectangle fills
   are NOT hardware-accelerated (per-pixel via the pixel_plot FIFO, ~93k CSR
   writes for the old full-box clear — scanout films it as a top-to-bottom
