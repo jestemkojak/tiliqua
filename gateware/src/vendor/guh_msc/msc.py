@@ -519,8 +519,23 @@ class SCSIBulkHost(wiring.Component):
                                 m.next = "DATA"
                         with m.Case(TransferResponse.NAK):
                             m.next = "DATA"
+                        with m.Case(TransferResponse.STALL):
+                            # BOT §6.7.2: the device halted the IN endpoint
+                            # to truncate the data phase. Clear the halt and
+                            # read the CSW it still owes — mirror of the
+                            # DATA-TX STALL path (round five); previously
+                            # this fell into the Default arm, rejecting with
+                            # the halt in place and the CSW undelivered
+                            # (the next command's data phase would eat it).
+                            m.d.usb += [
+                                self.reject_response.eq(enum.ctrl.status.response),
+                                self.reject_phase.eq(4),   # DATA-RX
+                                ch_ep.eq(0x80 | endp_in),
+                                ch_retry.eq(0),
+                            ]
+                            m.next = "CLEAR-HALT-LOAD"
                         with m.Default():
-                            # STALL/TIMEOUT/CRC on the data-IN phase: fail the
+                            # TIMEOUT/CRC on the data-IN phase: fail the
                             # command instead of looping forever. (Gap found
                             # 2026-07-15 alongside the CSW-RX one below —
                             # previously no Default arm existed and the switch
@@ -1216,6 +1231,15 @@ class USBMSCHost(wiring.Component):
                                  == TransferResponse.STALL.value)))
                 with m.If(need_rr):
                     m.next = "RECOVERY"
+                # A CSW FAILED (CHECK CONDITION) leaves pending sense data
+                # on the drive; drain it with an auto REQUEST SENSE, same
+                # as the write side (round-two lesson — undrained sense
+                # wedges some drives on every later command). Only for a
+                # clean CSW failure — after a rejected (bus-level) exchange
+                # the transport may be desynced and another command would
+                # just wedge again.
+                with m.Elif(xfer_error_r & ~xfer_rejected_r):
+                    m.next = "SENSE"
                 with m.Else():
                     m.next = "READY"
 
