@@ -186,7 +186,7 @@ class SCSIBulkHost(wiring.Component):
     sense: Out(20)
 
     def __init__(self, *, enumerator=None, tx_chunk_bytes=_TX_CHUNK_BYTES,
-                 **kwargs):
+                 fullspeed_only=False, **kwargs):
         # `enumerator` is an injection seam for sim (a stub SIE); production code
         # leaves it None and gets the real USBHostEnumerator built from **kwargs.
         assert 1 <= tx_chunk_bytes <= 64   # SIE tx FIFO depth
@@ -206,11 +206,14 @@ class SCSIBulkHost(wiring.Component):
                 ),
             )
             # Swap the stock SIE for the vendored one (NYET decode — see
-            # sie.py's docstring). Same ctor args the enumerator itself used;
-            # the enumerator elaborates whatever instance `self.sie` holds.
+            # sie.py's docstring). fullspeed_only skips the HS chirp so the
+            # device operates at FS, where the 64-byte bulk-OUT chunking is
+            # exactly wMaxPacketSize (legal) and PING does not exist —
+            # round-eight fix for the two critical HS violations.
             self.enumerator.sie = USBSIE(
                 bus=kwargs.get("bus"),
-                handle_clocking=kwargs.get("handle_clocking", True))
+                handle_clocking=kwargs.get("handle_clocking", True),
+                fullspeed_only=fullspeed_only)
         super().__init__()
 
     def elaborate(self, platform):
@@ -869,12 +872,13 @@ class USBMSCHost(wiring.Component):
     sense_valid_o: Out(1)
 
     def __init__(self, *, bus=None, handle_clocking=True, device_address=0x12,
-                 tx_chunk_bytes=_TX_CHUNK_BYTES):
+                 tx_chunk_bytes=_TX_CHUNK_BYTES, fullspeed_only=False):
         self.scsi = SCSIBulkHost(
             bus=bus,
             handle_clocking=handle_clocking,
             device_address=device_address,
             tx_chunk_bytes=tx_chunk_bytes,
+            fullspeed_only=fullspeed_only,
         )
         super().__init__()
 
