@@ -689,6 +689,10 @@ fn main() -> ! {
                             mounted.set(true);
                             usb_patch::export_patch(fs, &fname, &patch_buf, slot)
                         }).unwrap_or(false);
+                        // Commit the drive's volatile cache before reporting
+                        // success — the verify read may have been served
+                        // from cache (round eight durability fix).
+                        let ok = ok && usb_msc.flush().is_ok();
                         {
                             let mut msg: heapless::String<320> = heapless::String::new();
                             let _ = core::fmt::Write::write_fmt(&mut msg,
