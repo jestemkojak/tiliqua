@@ -647,8 +647,12 @@ fn main() -> ! {
                         // WRITE(10) from the CSR TX-FIFO flush-on-strobe; now
                         // strobe-then-fill + deferred engine start, see
                         // M6_USB_STORAGE.md's incident writeup). Hardware
-                        // validation per §7b: DISPOSABLE MEDIA ONLY until the
-                        // checklist passes.
+                        // re-tested 2026-07-16: multiple exports produced
+                        // byte-correct .SYX files (header/slot/checksum all
+                        // verified against the source patch) with no drive
+                        // damage — permanently enabled. §7b's stack-paint
+                        // remeasure for this write leg is still outstanding;
+                        // see M6_USB_STORAGE.md §7b/§8.
                         let (slot, got) = match source {
                             menu::ExportSource::Edit => {
                                 critical_section::with(|_cs| {
