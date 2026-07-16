@@ -129,6 +129,13 @@ class USBMSCPeripheral(wiring.Component):
         code:  csr.Field(csr.action.R, unsigned(20))
         valid: csr.Field(csr.action.R, unsigned(1))
 
+    class StartFlush(csr.Register, access="w"):
+        """Strobes a SYNCHRONIZE CACHE(10) — asks the drive to commit its
+        volatile write cache to media. Completion via the same sticky
+        resp.done/resp.error as writes. Firmware issues one per export,
+        after the last write (round eight durability fix)."""
+        strobe: csr.Field(csr.action.W, unsigned(1))
+
     class ReadPathInfo(csr.Register, access="r"):
         """Live read-path discriminator for post-write READ(10) failures.
         engine_bytes counts bytes accepted from the SIE; periph_bytes and
@@ -174,6 +181,8 @@ class USBMSCPeripheral(wiring.Component):
             self._sense_info  = regs.add("sense_info",  self.SenseInfo(),  offset=0x34)
             self._read_path_info = regs.add(
                 "read_path_info", self.ReadPathInfo(), offset=0x38)
+            self._start_flush = regs.add(
+                "start_flush", self.StartFlush(), offset=0x3C)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus":           In(csr.Signature(addr_width=addr_width, data_width=8)),
@@ -185,6 +194,7 @@ class USBMSCPeripheral(wiring.Component):
             "mode_o":        Out(1),   # with_mode only: 0=MIDI owns PHY, 1=MSC
             "tx_data_o":     Out(stream.Signature(unsigned(8))),  # with_write only
             "start_write_o": Out(1),                              # with_write only
+            "start_flush_o": Out(1),                              # with_write only
             "csw_status_i":  In(8),    # with_write only: last CSW status byte
             "csw_residue_i": In(32),   # with_write only: last CSW data residue
             "reject_response_i": In(3),  # with_write only: last rejected xfer
@@ -279,6 +289,9 @@ class USBMSCPeripheral(wiring.Component):
         if self._with_write:
             start_write = (self._start_write.f.strobe.w_stb
                            & self._start_write.f.strobe.w_data)
+            start_flush = (self._start_flush.f.strobe.w_stb
+                           & self._start_flush.f.strobe.w_data)
+            m.d.comb += self.start_flush_o.eq(start_flush)
             # Wrap the TX word FIFO with ResetInserter so start_write flushes
             # any leftover words from a prior (partial/failed) write before
             # the new one begins — symmetric to the RX word FIFO's
@@ -299,7 +312,7 @@ class USBMSCPeripheral(wiring.Component):
             m.d.comb += fire_write.eq(write_armed & (txf.r_level == 128))
             with m.If(start_write):
                 m.d.sync += write_armed.eq(1)
-            with m.Elif(fire_write | start_strobe):
+            with m.Elif(fire_write | start_strobe | start_flush):
                 m.d.sync += write_armed.eq(0)
             m.d.comb += [
                 txf.w_en.eq(self._tx_data.f.word.w_stb),
@@ -330,7 +343,7 @@ class USBMSCPeripheral(wiring.Component):
             resp_done_r = Signal()
             with m.If(self.resp_i.done):
                 m.d.sync += resp_done_r.eq(1)
-            with m.If(start_strobe | start_write):
+            with m.If(start_strobe | start_write | start_flush):
                 m.d.sync += [resp_done_r.eq(0), resp_error_r.eq(0)]
             m.d.comb += self._resp.f.done.r_data.eq(resp_done_r)
             # Diagnostic latches. The engine-side reject/sense/nyet registers
@@ -388,7 +401,7 @@ class USBMSCPeripheral(wiring.Component):
                     sense_code_r.eq(self.sense_i),
                     sense_valid_r.eq(1),
                 ]
-            with m.If(start_strobe | start_write):
+            with m.If(start_strobe | start_write | start_flush):
                 m.d.sync += [
                     rej_resp_r.eq(0), rej_phase_r.eq(0), rej_txdone_r.eq(0),
                     nyets_r.eq(0), last_phase_r.eq(0), csw_bad_r.eq(0),

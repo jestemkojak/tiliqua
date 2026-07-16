@@ -46,6 +46,7 @@ class SCSIOpCode(enum.Enum, shape=unsigned(8)):
     READ_CAPACITY_10 = 0x25
     READ_10          = 0x28
     WRITE_10         = 0x2A
+    SYNCHRONIZE_CACHE_10 = 0x35
 
 
 class CBWFlags(enum.Enum, shape=unsigned(8)):
@@ -941,6 +942,7 @@ class USBMSCHost(wiring.Component):
         start: unsigned(1)           # Strobe to begin transfer
         lba:   unsigned(32)          # block address to read/write
         write: unsigned(1)           # 0=read block, 1=write block (start+write=1)
+        flush: unsigned(1)           # start+flush=1: SYNCHRONIZE CACHE(10)
 
     class Response(data.Struct):
         done:  unsigned(1)           # Transfer complete (strobed for 1 cycle)
@@ -1167,7 +1169,9 @@ class USBMSCHost(wiring.Component):
                         is_write.eq(self.cmd.write),
                         sense_valid_r.eq(0),
                     ]
-                    with m.If(self.cmd.write):
+                    with m.If(self.cmd.flush):
+                        m.next = "FLUSH"
+                    with m.Elif(self.cmd.write):
                         m.next = "WRITE"
                     with m.Else():
                         m.next = "READ"
@@ -1297,6 +1301,64 @@ class USBMSCHost(wiring.Component):
                 # on the drive; drain it with an auto REQUEST SENSE (and
                 # capture key/ASC/ASCQ for firmware diagnostics). Only for
                 # a clean CSW failure — after a rejected (bus-level)
+                # exchange the transport may be desynced and another
+                # command would just wedge again.
+                with m.Elif(xfer_error_r & ~xfer_rejected_r):
+                    m.next = "SENSE"
+                with m.Else():
+                    m.next = "READY"
+
+            def flush_cdb():
+                # SYNCHRONIZE CACHE(10), LBA=0 count=0 = commit the whole
+                # volatile cache; no data phase.
+                return [
+                    cdb10.opcode.eq(SCSIOpCode.SYNCHRONIZE_CACHE_10),
+                    scsi_cmd.data_len.eq(0),
+                    scsi_cmd.stream_data.eq(0),
+                    scsi_cmd.data_dir.eq(0),
+                ]
+
+            with m.State("FLUSH"):
+                m.d.comb += flush_cdb() + [scsi_cmd.start.eq(1)]
+                m.next = "FLUSH-WAIT"
+
+            with m.State("FLUSH-WAIT"):
+                m.d.comb += flush_cdb()
+                with m.If(scsi.status.done):
+                    with m.If(~scsi.status.error & ~scsi.status.rejected):
+                        m.d.usb += watchdog.eq(0)
+                    m.d.comb += [
+                        self.resp.done.eq(1),
+                        self.resp.error.eq(scsi.status.error | scsi.status.rejected),
+                    ]
+                    m.d.usb += [
+                        xfer_error_r.eq(scsi.status.error),
+                        xfer_rejected_r.eq(scsi.status.rejected),
+                    ]
+                    m.next = "FLUSH-DONE"
+
+            with m.State("FLUSH-DONE"):
+                # See xfer_error_r's comment: wait one cycle for scsi's own
+                # diagnostic registers to settle before deciding.
+                # BOT §5.3.4: phase error, an invalid CSW, or a CSW that
+                # STALLed twice all mean the transport is desynced —
+                # Reset Recovery is REQUIRED before any next CBW (the
+                # old behavior sent REQUEST SENSE into the desync).
+                need_rr = (scsi.csw_bad_o
+                           | (~xfer_rejected_r
+                              & (scsi.csw.bCSWStatus == CSWStatus.PHASE_ERROR))
+                           | (xfer_rejected_r
+                              & (scsi.reject_phase == 3)
+                              & (scsi.reject_response
+                                 == TransferResponse.STALL.value)))
+                with m.If(need_rr):
+                    m.next = "RECOVERY"
+                # A CSW FAILED (CHECK CONDITION) leaves pending sense data
+                # on the drive; drain it with an auto REQUEST SENSE, same
+                # as the write side. SYNCHRONIZE CACHE(10) failures are a
+                # valid REQUEST SENSE target per SPC, so mirror WRITE-DONE
+                # rather than inventing a different branch for FLUSH. Only
+                # for a clean CSW failure — after a rejected (bus-level)
                 # exchange the transport may be desynced and another
                 # command would just wedge again.
                 with m.Elif(xfer_error_r & ~xfer_rejected_r):
