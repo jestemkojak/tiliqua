@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # MBSID-on-Tiliqua (`top/mbsid`)
 
-**Status (2026-07-14): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented; M6a (USB read/load) hardware-verified and working. M6b (USB write/export): first real-hardware exercise (2026-07-14) corrupted a test drive's GPT partition table and FAT32 boot sector; **root-caused the same day and fixed in gateware, sim-verified** (the CSR TX FIFO's flush-on-start_write erased the just-loaded payload, so every WRITE(10) went out payload-less and desynced the drive's bulk-only transport — fix: strobe-then-fill contract + engine start deferred until all 128 words are banked, `usb_msc_csr.py` + `fw/src/usb_msc.rs`, regression tests in `tests/test_usb_msc_csr.py`). The `Export` path is re-enabled in firmware for hardware validation — `M6_USB_STORAGE.md` §7b's checklist must pass on **disposable media only** before trusting it near real data. See `M6_USB_STORAGE.md`'s incident writeup + root cause and §8 risk table.**
+**Status (2026-07-14): All four engines validated (Lead/Bassline/Drum/Multi); M2 dual-SID implemented; M3 factory patch bank done (MIDI PC → 128 patches); M4 writable user patch bank + on-device save UI + MIDI SysEx patch upload implemented (`M4_USER_PATCH_BANKS.md`); M5 menu/CV implemented; M6a (USB read/load) hardware-verified and working. M6b (USB write/export): first real-hardware exercise (2026-07-14) corrupted a test drive's GPT partition table and FAT32 boot sector; **root-caused the same day and fixed in gateware, sim-verified** (the CSR TX FIFO's flush-on-start_write erased the just-loaded payload, so every WRITE(10) went out payload-less and desynced the drive's bulk-only transport — fix: strobe-then-fill contract + engine start deferred until all 128 words are banked, `usb_msc_csr.py` + `fw/src/usb_msc.rs`, regression tests in `tests/test_usb_msc_csr.py`). The `Export` path is re-enabled in firmware and, as of 2026-07-16, hardware-retested — multiple real exports produced byte-correct `.SYX` files (header/slot/checksum verified against the source patch) with no drive damage, so **export is now permanently enabled, not disposable-media-only.** A few `M6_USB_STORAGE.md` §7b checklist items remain outstanding (write-leg stack-paint remeasure, unplug-mid-write, 50x repeat, quirky-drive sweep, MIDI round-trip). See `M6_USB_STORAGE.md`'s incident writeup + root cause and §8 risk table.**
 `DESIGN.md` is the approved spec (authoritative for interfaces/milestones/acceptance).
 `docs/` holds the narrative documentation set (user guide, architecture, developer
 guide, limitations, extending) — update the relevant page when a feature lands.
@@ -38,6 +38,10 @@ introduced by it), full bitstream build PASS on all five clocks (`sync` 63.72 MH
 against 60 MHz, up from round seven's 59.61 MHz FAIL — the prior FAIL's cause, an unrelated
 CPU/wishbone path, was evidently seed noise rather than a persistent regression;
 `TRELLIS_COMB` 23158/24288 = 95%), hardware validation still pending.
+Post-round-eight follow-up coverage now also routes command-phase (CBW)
+bulk-OUT STALLs through the same autonomous Reset Recovery sequence; the
+focused integration regression is sim-verified, with hardware validation
+still pending alongside the rest of round eight.
 
 ## Vendored engine (not in this repo)
 
@@ -278,8 +282,12 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   started every write flushed the just-loaded payload — each WRITE(10) CBW went out with no
   data phase, hanging the drive mid-command until the 10 s watchdog reset, and the resulting
   bulk-only-transport desync committed mostly-zero sectors at arbitrary LBAs (the LBA math
-  itself was never wrong). `PressResult::UsbExport` (`fw/src/main.rs`) stays hard-disabled —
-  zero USB I/O, always "Export FAILED" — until §7b's checklist passes on disposable media.
+  itself was never wrong). `PressResult::UsbExport` (`fw/src/main.rs`) was re-enabled after
+  the fix and, as of 2026-07-16, hardware-retested: multiple real exports produced files with
+  correct header/slot/checksum matching the source patch and no drive damage — **export is
+  now permanently enabled, no longer disposable-media-only.** §7b's stack-paint remeasure for
+  the write leg and a few other checklist items (unplug-mid-write, 50x repeat, quirky-drive
+  sweep, MIDI round-trip) are still outstanding — see `M6_USB_STORAGE.md` §7b/§8.
   **Second bring-up round (2026-07-15) found three more engine bugs** (see
   `M6_USB_STORAGE.md`'s round-two writeup): CBW NAK treated as rejection (upstream `guh`
   bug, latent on reads — now retried with same PID), CSW-RX/DATA-RX missing Default arms
@@ -433,12 +441,11 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     scripted CSWs in `tests/test_usb_msc_integration.py` and
     `tests/test_guh_msc_write.py` must now echo the real captured CBW tag
     (`_Drive.last_tag`/`_Sie.last_tag`) or the now-stricter CSW-tag check rejects
-    them; (2) command-phase (CBW) bulk-OUT STALL still has **no** Reset Recovery
-    — `need_rr` only fires for a CSW-phase STALL or bad/`PHASE_ERROR` CSW, not a
-    STALL on the CBW itself (`CBW-WAIT`'s `Default` arm, `reject_phase.eq(1)`,
-    just rejects to `READY` with the halt still set) — deliberately deferred, not
-    fixed this round; see `M6_USB_STORAGE.md`'s round-eight known-limitations
-    list.
+    them; (2) a follow-up fix extended all three identical `need_rr` predicates
+    to command-phase (CBW, `reject_phase == 1`) STALL as well as CSW-phase
+    (`reject_phase == 3`) STALL. `test_cbw_stall_escalates_to_reset_recovery`
+    pins the full reset + clear-IN + clear-OUT + DATA0 TEST UNIT READY sequence
+    and the preserved phase-1 diagnostic.
 - **Menu rendering is a blit-diff, never a background fill.** Rectangle fills
   are NOT hardware-accelerated (per-pixel via the pixel_plot FIFO, ~93k CSR
   writes for the old full-box clear — scanout films it as a top-to-bottom

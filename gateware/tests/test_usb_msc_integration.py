@@ -794,6 +794,69 @@ class UsbMscIntegrationTests(unittest.TestCase):
         self.assertEqual(result["rej_resp"], TransferResponse.STALL.value)
         self.assertEqual(result["rej_phase"], 3)
 
+    def test_cbw_stall_escalates_to_reset_recovery(self):
+        """A command-phase bulk-OUT STALL requires full BOT Reset Recovery.
+        The CBW is rejected before any data phase, so media is untouched, but
+        the OUT endpoint remains halted: returning directly to READY would
+        make every following CBW STALL too. Recover autonomously, preserve the
+        phase-1 diagnostic, revalidate with TEST UNIT READY, and return ready
+        with the OUT toggle reset to DATA0."""
+        result = {}
+        setups = []
+
+        def fw_tb(periph, host):
+            async def tb(ctx):
+                fw = _Fw(periph)
+                await fw.wait_ready(ctx)
+                result["error"] = await fw.write_block(
+                    ctx, 7, [0x4B] * BLOCK, max_polls=60000)
+                ri = await fw.csr_read32(ctx, 0x30)
+                result["rej_resp"] = ri & 0b111
+                result["rej_phase"] = (ri >> 3) & 0b111
+                await fw.wait_ready(ctx)
+                result["recovered"] = True
+            return tb
+
+        def drive_tb(host):
+            async def tb(ctx):
+                drive = _Drive(host.scsi.enumerator)
+                await drive.init_to_ready(ctx)
+                await drive.do_out(ctx, TransferResponse.STALL, [])  # CBW!
+                # --- Reset Recovery ---
+                s = []
+                await drive.do_setup(ctx, s)          # MSC reset (0x21, 0xFF)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)  # status ZLP
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt IN (0x81)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                s = []
+                await drive.do_setup(ctx, s)          # clear halt OUT (0x02)
+                setups.append(list(s))
+                await drive.do_in(ctx, [], TransferResponse.ACK)
+                # --- post-recovery revalidation: TEST UNIT READY ---
+                cbw = []
+                pid = await drive.do_out(ctx, TransferResponse.ACK, cbw)
+                result["tur_pid"] = pid
+                result["tur_opcode"] = cbw[15]
+                await drive.do_in(
+                    ctx, _csw(tag=drive.last_tag), TransferResponse.ACK)
+            return tb
+
+        self._run(fw_tb, drive_tb, deadline_us=80000)
+        self.assertIn("error", result,
+                      "CBW STALL did not report the failed command")
+        self.assertTrue(result["error"])
+        self.assertEqual(result["rej_resp"], TransferResponse.STALL.value)
+        self.assertEqual(result["rej_phase"], 1)
+        self.assertTrue(result.get("recovered"))
+        self.assertEqual(setups[0], [0x21, 0xFF, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(setups[1], [0x02, 0x01, 0, 0, 0x81, 0, 0, 0])
+        self.assertEqual(setups[2], [0x02, 0x01, 0, 0, 0x02, 0, 0, 0])
+        self.assertEqual(result["tur_opcode"], 0x00)
+        self.assertEqual(result["tur_pid"], DataPID.DATA0)
+
     def test_csw_double_stall_escalates_to_reset_recovery(self):
         """If the CSW STALLs again after a clear-halt, reset recovery is
         needed — before round eight the engine failed the command promptly

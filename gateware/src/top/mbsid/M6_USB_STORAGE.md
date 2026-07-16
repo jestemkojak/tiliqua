@@ -2,7 +2,10 @@
 
 Status: **M6a hardware-verified. M6b (write/export) root-caused and fixed in gateware
 simulation (2026-07-14, same day as the incident); the export path is re-enabled in
-firmware for §7b hardware validation, which must run on a disposable drive.** M6a (read)
+firmware and, as of 2026-07-16, hardware-retested with byte-correct exported files and no
+drive damage — export is now permanently enabled, no longer disposable-media-only. A few
+§7b checklist items (stack-paint remeasure, unplug-mid-write, 50x repeat, quirky-drive
+sweep, MIDI round-trip) are still outstanding.** M6a (read)
 passed its full hardware checklist (§7a). See the incident writeup + root cause right
 below and §8's risk table. **Update (2026-07-15): round seven (below) landed a
 handshake-fed watchdog + firmware wall-clock read/write timeouts — simulation/compile
@@ -599,19 +602,18 @@ plan scratch `docs/superpowers/plans/2026-07-16-usb-msc-fs-and-bot-compliance.md
   after the last write, before reporting success
   (`ok && usb_msc.flush().is_ok()` in `main.rs`'s `UsbExport` arm).
 
-**Known limitation carried forward, deliberately not fixed this round:
-command-phase (CBW) bulk-OUT STALL still has no Reset Recovery.** The
-`need_rr` check above (identical in all three `*-DONE` states) only fires
-for a CSW-phase STALL (`reject_phase == 3`) or a bad/`PHASE_ERROR` CSW. A
-STALL on the CBW itself takes the `CBW-WAIT` state's `Default` arm
-(`vendor/guh_msc/msc.py:476-485`), which sets `reject_phase.eq(1)` (CBW)
-and just rejects the command back to `READY` — no halt clear, no reset.
-Since the endpoint stays halted, the next CBW is very likely to STALL too,
-reproducing the "only a bitstream restart recovers it" symptom flagged in
-the prior research doc's quirk table as a still-open gap (NAK-on-CBW is
-fine — same state already retries with the same PID; it's specifically
-STALL-on-CBW that falls through uncaught). Deferred to a future round,
-not urgent for disposable-media validation of this round's fixes.
+**Post-round-eight follow-up: command-phase (CBW) bulk-OUT STALL now runs
+Reset Recovery too.** `CBW-WAIT` still records the transport breadcrumb as
+`reject_phase.eq(1)` (CBW), but each identical `need_rr` check in
+`READ-DONE`/`WRITE-DONE`/`FLUSH-DONE` now treats a rejected STALL in phase 1
+or phase 3 as recovery-required. The existing autonomous sequence performs
+the MSC reset, clears Bulk-IN then Bulk-OUT, resets both toggles, and
+revalidates with TEST UNIT READY before returning to `READY`.
+`test_cbw_stall_escalates_to_reset_recovery` in
+`tests/test_usb_msc_integration.py` pins the exact setup packets, preserved
+phase-1 diagnostic, DATA0 TUR CBW, and successful return to ready. Because a
+CBW STALL happens before the data phase, this closes a wedge/restart gap; it
+does not address a media-corruption path.
 
 #### Build snapshot after round eight (Tasks 1–6, commit `c92d539`, built 2026-07-16)
 
@@ -940,9 +942,13 @@ timing (see `CLAUDE.md`'s status line). **Run on real hardware 2026-07-14 — co
 test drive's GPT + FAT32 boot sector; root-caused the same day (the CSR TX-FIFO flush fired
 on the strobe that started the write — payload-less WRITE(10) CBWs desyncing the drive's
 bulk-only transport) and fixed in gateware (strobe-then-fill + deferred engine start),
-sim-verified.** See the incident writeup + root cause at the top of this document and §8's
-risk table. The export path stays hard-disabled in firmware; §7b's checklist below is the
-remaining gate, and must run on disposable media.
+sim-verified.** **Hardware-retested 2026-07-16: multiple real exports produced byte-correct
+`.SYX` files (header/slot/checksum decoded and verified against the source patch, e.g.
+`EDIT.SYX`/`P000.SYX`/`P090.SYX`), no drive damage — export is now permanently enabled, no
+longer disposable-media-only.** See the incident writeup + root cause at the top of this
+document and §8's risk table. §7b's checklist below still has open items (stack-paint
+remeasure for the write leg — HIGH PRIORITY, unplug-mid-write, 50x repeat, quirky-drive
+sweep, MIDI round-trip) that haven't been run yet.
 
 ### 7b. M6b hardware checklist (record results here once hardware is available)
 
@@ -975,20 +981,19 @@ this checklist passing): **HS support for MSC** (would need 512-byte SIE TX
 packets + PING — the engine is FS-only by design now), **short-packet-
 terminates-transfer on data-IN** (the read path counts bytes only), **no
 GET_MAX_LUN** (`bCBWLUN` hardwired 0, fine for thumb drives), **no 3-strikes
-bus-error retry** (one TIMEOUT/CRC still rejects the whole command), and
-**command-phase (CBW) bulk-OUT STALL has no Reset Recovery** (see the "What
-landed" section's known-limitation note above — a STALL on the CBW itself
-still just rejects to `READY` with the halt in place, so a drive that STALLs
-the very first CBW of a session is not expected to recover without a
-bitstream restart; not exercised by the checklist items below, which all
-start from a working CBW exchange).
+bus-error retry** (one TIMEOUT/CRC still rejects the whole command).
 
 - [ ] **Exported file mounts clean on a PC.** From the `Usb` card, `Export` the live EDIT
   buffer (or a User slot) to the drive. Unplug from Tiliqua, plug into a PC/Linux box, run
   `fsck.vfat -n <device>` — clean, no errors, no lost chains. Confirm the file appears under
   `/MBSID/<name>.SYX` (`EDIT.SYX` for the live buffer, `Pnnn.SYX` for slot `nnn`) with
   plausible size (1036 bytes — 6-byte header + cmd/type/bank/slot + 1024 nibblized data +
-  checksum + `F7`).
+  checksum + `F7`). **Partially done 2026-07-16:** content verified —
+  `EDIT.SYX`/`P000.SYX`/`P090.SYX` read back from `/run/media/pawel/FIT8GB/MBSID/` with
+  correct 1036-byte size, `F0 00 00 7E 4B 00` header, correct slot byte, correct checksum,
+  `F7` terminator, and readable ASCII patch names in the decoded body ("Nee Zelda", "Lead
+  Melodia", "Casio Drums"). `fsck.vfat -n` itself was not run against the volume — do that
+  before checking this item off fully.
 - [ ] **Byte-identical round-trip via MIDI.** Export a patch, note its sound/register image.
   Send the exported `.syx` file back to Tiliqua over **TRS** SysEx (`amidi -s <file>` per the
   user guide's SysEx section) — the resulting engine state (audition) must be indistinguishable
@@ -1031,7 +1036,7 @@ start from a working CBW exchange).
 
 | Risk | Exposure | Mitigation |
 |---|---|---|
-| **Write path corrupts real media** — realized 2026-07-14: a real-hardware M6b `Export` attempt zeroed a test drive's GPT partition table and FAT32 boot sector (both copies). **Root-caused same day**: the CSR TX FIFO's `ResetInserter(start_write)` flushed the just-loaded payload on the strobe that started the write, so every WRITE(10) was payload-less, hanging the drive mid-command and desyncing its bulk-only transport (mostly-zero data committed at arbitrary LBAs) | **Critical — root cause fixed in sim, hardware re-validation pending** | Gateware fixed: strobe-then-fill contract with the engine start deferred until all 128 words are banked (`usb_msc_csr.py`), so a payload-less CBW is structurally impossible; regression tests in `tests/test_usb_msc_csr.py`. `PressResult::UsbExport` re-enabled for §7b validation, which must run on **disposable media only**, stopping at the first failure signal — see the incident writeup above and memory `mbsid-usb-write-test-destroyed-drive` |
+| **Write path corrupts real media** — realized 2026-07-14: a real-hardware M6b `Export` attempt zeroed a test drive's GPT partition table and FAT32 boot sector (both copies). **Root-caused same day**: the CSR TX FIFO's `ResetInserter(start_write)` flushed the just-loaded payload on the strobe that started the write, so every WRITE(10) was payload-less, hanging the drive mid-command and desyncing its bulk-only transport (mostly-zero data committed at arbitrary LBAs) | **Resolved — hardware-retested 2026-07-16** | Gateware fixed: strobe-then-fill contract with the engine start deferred until all 128 words are banked (`usb_msc_csr.py`), so a payload-less CBW is structurally impossible; regression tests in `tests/test_usb_msc_csr.py`. `PressResult::UsbExport` re-enabled and hardware-retested: multiple exports produced byte-correct `.SYX` files (header/slot/checksum verified against the source patch) with no drive damage — export is now permanently enabled. Remaining §7b items (stack-paint remeasure, unplug-mid-write, 50x repeat, quirky-drive sweep) not yet run — see the incident writeup above and memory `mbsid-usb-write-test-destroyed-drive` |
 | Area/Fmax: +USB engine on an 80%-full, 61.76 MHz design | High (project-gating) | Phase 0 probe; Option B fallback; last resort: `with_sysex` and MSC engine made build-time exclusive (two bitstream variants — ugly, avoid) — superseded: M6a measured 91% LUT, 66.41 MHz post-route sync Fmax PASS; M6b (read+write path both included) measured **94% LUT, 64.29 MHz post-route sync Fmax PASS** — LUT climbed as expected with the write leg, still routes with margin over the 60 MHz target |
 | Stack exhaustion: M6a's `Load→Slot` measured **22736/25856 B peak on real hardware (2026-07-14), ~3.1 KB headroom** — nearly 6x the §6f estimate (+2–3 KB over M4's 4016 B) | High (untested M6b adds more on top: `tx_data` fill loop + FAT write-back cache) | Re-run the stack-paint probe (methodology in §7a's now-checked item) against M6b's `Export` path before trusting it on hardware; if headroom is gone, prime suspects are `fatfs`'s own call depth (deeper than `sid_player_sw`'s smaller mainram ever exercised) and/or the `UserPatchStore::save` + FAT path both being live on the stack at once during `Load→Slot` — profile with the same probe at finer granularity (e.g. log call-site tags, not just a periodic scan) if a fix is needed |
 | FAT corruption on unplug during export | Medium | Writes only on explicit user action; flush eagerly; verify-by-readback (`export_patch` re-reads+re-parses+byte-compares before reporting success); document "don't unplug while the menu is unresponsive" — note there is no live `BUSY` row during a write (`CLAUDE.md`'s M6b gotcha: `DriveState::Busy` exists but is never constructed), the frozen screen itself is the busy signal |
@@ -1049,7 +1054,8 @@ start from a working CBW exchange).
   gotcha block (vendored `guh_msc`, write CSR contract, 8.3 filenames, missing live `BUSY`
   indicator); the "no export path" framing in the no-MIDI-TX gotcha updated now that export
   exists. Round eight (2026-07-16): status paragraph + M6b gotcha sub-bullet added (FS
-  forcing, BOT compliance fixes, deferred CBW-STALL Reset Recovery gap).
+  forcing and BOT compliance fixes); the follow-up CBW-STALL Reset Recovery
+  coverage is documented there too.
 - `docs/limitations.md`: **done (round eight).** Added a by-design limitation entry for
   FS-only USB storage (why, and that MIDI-over-USB is unaffected) and the
   flush-after-write durability guarantee.
