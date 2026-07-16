@@ -263,6 +263,18 @@ class ProductionElaborationTest(unittest.TestCase):
         from amaranth.back import rtlil
         rtlil.convert(USBMSCHost(bus=None))
 
+    def test_fullspeed_only_plumbs_to_reset_controller(self):
+        """Round eight: mbsid forces the MSC engine to Full Speed — at FS
+        the 64-byte TX chunking is exactly wMaxPacketSize (legal) and the
+        PING protocol does not exist, removing both critical HS violations
+        (M6_USB_STORAGE.md round eight). This asserts the flag actually
+        reaches the reset controller through the real constructor path,
+        and that the FS engine still elaborates."""
+        from amaranth.back import rtlil
+        host = USBMSCHost(bus=None, fullspeed_only=True)
+        self.assertTrue(host.scsi.enumerator.sie.reset_ctrl.fullspeed_only)
+        rtlil.convert(host)
+
 
 class UsbMscIntegrationTests(unittest.TestCase):
 
