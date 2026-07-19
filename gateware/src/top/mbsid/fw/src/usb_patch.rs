@@ -158,21 +158,22 @@ pub fn export_patch<IO: ReadWriteSeek>(
     total == 1036 && parse_patch_file(&back, &mut dst) && dst == *patch
 }
 
+/// FAT-image test scaffolding shared by usb_patch and bank_import tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod testfs {
     use fatfs::{
-        format_volume, FormatVolumeOptions, FsOptions, IoBase, IoError, Seek, SeekFrom, Write,
+        format_volume, FileSystem, FormatVolumeOptions, FsOptions, IoBase,
+        IoError, Read, Seek, SeekFrom, Write,
     };
     use std::vec::Vec;
 
-    const SECTOR: usize = 512;
-    const BASE_LBA: u32 = 34; // matches the user's GPT stick
+    pub const SECTOR: usize = 512;
+    pub const BASE_LBA: u32 = 34; // matches the user's GPT stick
 
     // --- A minimal in-memory fatfs storage over a mutable byte slice ---------
 
     #[derive(Debug)]
-    struct DiskErr;
+    pub struct DiskErr;
     impl IoError for DiskErr {
         fn is_interrupted(&self) -> bool {
             false
@@ -185,12 +186,12 @@ mod tests {
         }
     }
 
-    struct VecDisk<'a> {
+    pub struct VecDisk<'a> {
         data: &'a mut [u8],
         pos: usize,
     }
     impl<'a> VecDisk<'a> {
-        fn new(data: &'a mut [u8]) -> Self {
+        pub fn new(data: &'a mut [u8]) -> Self {
             Self { data, pos: 0 }
         }
     }
@@ -231,7 +232,7 @@ mod tests {
         }
     }
 
-    fn write_all<W>(file: &mut W, mut bytes: &[u8])
+    pub fn write_all<W>(file: &mut W, mut bytes: &[u8])
     where
         W: Write,
         W::Error: core::fmt::Debug,
@@ -244,7 +245,7 @@ mod tests {
 
     /// Build a GPT-partitioned disk image whose single FAT volume starts at
     /// `BASE_LBA` and contains the given `(name, contents)` files.
-    fn build_gpt_fat_image(files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub fn build_gpt_fat_image(files: &[(&str, &[u8])]) -> Vec<u8> {
         // 1. Format a standalone FAT region and populate it.
         let fat_bytes = 4 * 1024 * 1024; // small enough for FAT12/16, plenty of room
         let mut fat_region = vec![0u8; fat_bytes];
@@ -283,7 +284,7 @@ mod tests {
     }
 
     /// Encode a single-patch dump exactly as sysex_capture's tests do.
-    fn syx_bytes(patch: &[u8; 512]) -> Vec<u8> {
+    pub fn syx_bytes(patch: &[u8; 512]) -> Vec<u8> {
         const HEADER: [u8; 6] = [0xF0, 0x00, 0x00, 0x7E, 0x4B, 0x00];
         let mut out = Vec::new();
         out.extend_from_slice(&HEADER);
@@ -299,13 +300,31 @@ mod tests {
         out
     }
 
-    fn test_patch(seed: u8) -> [u8; 512] {
+    pub fn test_patch(seed: u8) -> [u8; 512] {
         let mut p = [0u8; 512];
         for (i, b) in p.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(31).wrapping_add(seed);
         }
         p
     }
+
+    /// Concatenate MBSID Bank Write dumps into one bank-file byte stream.
+    pub fn bank_bytes(patches: &[(u8, [u8; 512])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (slot, p) in patches {
+            let mut m = [0u8; 1036];
+            crate::usb_patch::encode_syx(p, *slot, &mut m);
+            out.extend_from_slice(&m);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::testfs::*;
+    use fatfs::FsOptions;
 
     #[test]
     fn lists_syx_and_raw512_skips_others() {
