@@ -7,7 +7,7 @@
 //! dump (*.SYX, parsed by SysexCapture::file_mode) or a raw 512-byte
 //! sid_patch_t (exact size match).
 
-use fatfs::{Dir, DefaultTimeProvider, FileSystem, LossyOemCpConverter, Read, ReadWriteSeek, Write};
+use fatfs::{Dir, DefaultTimeProvider, File, FileSystem, LossyOemCpConverter, Read, ReadWriteSeek, Write};
 use crate::sysex_capture::SysexCapture;
 
 pub type FileName = heapless::String<16>;
@@ -156,6 +156,89 @@ pub fn export_patch<IO: ReadWriteSeek>(
     }
     let mut dst = [0u8; 512];
     total == 1036 && parse_patch_file(&back, &mut dst) && dst == *patch
+}
+
+/// Fixed bank-import source file (spec §1): /MBSID/BANK.SYX, root fallback.
+pub const BANK_FILE: &str = "BANK.SYX";
+
+/// Pass-1 result: how many valid messages, and which slots they target.
+pub struct BankSummary {
+    pub count: u8,
+    pub slots: [u8; 16], // bitmap, bit n = slot n present
+}
+
+impl BankSummary {
+    pub fn has(&self, slot: u8) -> bool {
+        self.slots[(slot >> 3) as usize] & (1 << (slot & 7)) != 0
+    }
+}
+
+fn open_bank_file<IO: ReadWriteSeek>(
+    fs: &FileSystem<IO>,
+) -> Option<File<'_, IO, DefaultTimeProvider, LossyOemCpConverter>> {
+    let root = fs.root_dir();
+    if let Ok(d) = root.open_dir("MBSID") {
+        if let Ok(f) = d.open_file(BANK_FILE) {
+            return Some(f);
+        }
+    }
+    root.open_file(BANK_FILE).ok()
+}
+
+/// Stream BANK.SYX through SysexCapture::file_mode in 1 KB chunks, calling
+/// `on_patch(slot, body)` per valid complete message. Returns
+/// `(valid_messages, f0_message_starts)`; the two are equal iff every
+/// F0-framed message in the file parsed valid and complete — SysexCapture
+/// silently skips invalid messages, so callers MUST compare them (spec §1:
+/// abort on any bad message, never shrink the bank). None on: file missing,
+/// read error, >128 messages, EOF mid-message, zero messages, or the
+/// callback returning false.
+fn stream_bank<IO: ReadWriteSeek>(
+    fs: &FileSystem<IO>,
+    mut on_patch: impl FnMut(u8, &[u8; 512]) -> bool,
+) -> Option<(u8, u16)> {
+    let mut file = open_bank_file(fs)?;
+    let mut cap = SysexCapture::file_mode();
+    let (mut count, mut starts) = (0u16, 0u16);
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 { break; }
+        for &b in &buf[..n] {
+            if b == 0xF0 { starts += 1; }
+            if cap.feed(b) {
+                count += 1;
+                if count > 128 { return None; }
+                if !on_patch(cap.slot(), cap.data()) { return None; }
+            }
+        }
+    }
+    if cap.in_message() || count == 0 { return None; }
+    Some((count as u8, starts))
+}
+
+/// Pass 1: validate the whole bank file without touching anything. None on
+/// any structural failure, bad checksum, duplicate slot, or truncation.
+pub fn validate_bank<IO: ReadWriteSeek>(fs: &FileSystem<IO>) -> Option<BankSummary> {
+    let mut slots = [0u8; 16];
+    let (count, starts) = stream_bank(fs, |slot, _| {
+        let (ix, bit) = ((slot >> 3) as usize, 1u8 << (slot & 7));
+        if slots[ix] & bit != 0 { return false; } // duplicate slot
+        slots[ix] |= bit;
+        true
+    })?;
+    if starts != count as u16 { return None; } // an invalid message was skipped
+    Some(BankSummary { count, slots })
+}
+
+/// Pass 2: re-stream, handing each (slot, body) to `f`. Checksums are
+/// inherently re-verified (same parser), so a drive returning different
+/// bytes on the second read fails here instead of importing garbage.
+pub fn for_each_bank_patch<IO: ReadWriteSeek>(
+    fs: &FileSystem<IO>,
+    f: impl FnMut(u8, &[u8; 512]) -> bool,
+) -> bool {
+    matches!(stream_bank(fs, f), Some((count, starts)) if starts == count as u16)
 }
 
 /// FAT-image test scaffolding shared by usb_patch and bank_import tests.
@@ -325,6 +408,7 @@ mod tests {
     use super::*;
     use super::testfs::*;
     use fatfs::FsOptions;
+    use std::vec::Vec;
 
     #[test]
     fn lists_syx_and_raw512_skips_others() {
@@ -454,5 +538,128 @@ mod tests {
         let mut dst = [0u8; 512];
         assert!(load_patch_by_index(&fs, 0, &mut dst));
         assert_eq!(dst, p2); // second export won, file not duplicated
+    }
+
+    fn fs_with_root_file<'a>(
+        img: &'a mut Vec<u8>,
+    ) -> FileSystem<VecDisk<'a>> {
+        let base = BASE_LBA as usize * SECTOR;
+        FileSystem::new(VecDisk::new(&mut img[base..]), FsOptions::new()).unwrap()
+    }
+
+    #[test]
+    fn validate_full_128_bank() {
+        let patches: Vec<(u8, [u8; 512])> =
+            (0..128).map(|i| (i as u8, test_patch(i as u8))).collect();
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bank_bytes(&patches))]);
+        let fs = fs_with_root_file(&mut img);
+        let sum = validate_bank(&fs).expect("full bank must validate");
+        assert_eq!(sum.count, 128);
+        assert!((0..128).all(|s| sum.has(s)));
+    }
+
+    #[test]
+    fn validate_sparse_bank_sets_only_named_slots() {
+        let patches = vec![(3u8, test_patch(3)), (7u8, test_patch(7))];
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bank_bytes(&patches))]);
+        let fs = fs_with_root_file(&mut img);
+        let sum = validate_bank(&fs).unwrap();
+        assert_eq!(sum.count, 2);
+        assert!(sum.has(3) && sum.has(7));
+        assert!(!sum.has(0) && !sum.has(4) && !sum.has(127));
+    }
+
+    #[test]
+    fn validate_accepts_bank_byte_zero() {
+        // Real-world banks (e.g. bank1__v2_vintage_bank.syx) address bank 0.
+        let mut bytes = bank_bytes(&[(5u8, test_patch(5))]);
+        assert_eq!(bytes[8], 0x01);
+        bytes[8] = 0x00; // encode_syx writes bank 1; patch it to Factory
+        // fix the checksum? No — bank/patch bytes are OUTSIDE the checksummed
+        // 1024-nibble body (checksum covers data nibbles only), so no fixup.
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bytes)]);
+        let fs = fs_with_root_file(&mut img);
+        let sum = validate_bank(&fs).expect("bank byte must be ignored");
+        assert_eq!(sum.count, 1);
+        assert!(sum.has(5));
+    }
+
+    #[test]
+    fn validate_rejects_bad_checksum() {
+        let mut bytes = bank_bytes(&[(0u8, test_patch(1)), (1u8, test_patch(2))]);
+        bytes[1034] = (bytes[1034] + 1) & 0x7F; // corrupt first message's checksum
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bytes)]);
+        let fs = fs_with_root_file(&mut img);
+        assert!(validate_bank(&fs).is_none(),
+                "a skipped-invalid message must reject the file, not shrink it");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_slot() {
+        let bytes = bank_bytes(&[(9u8, test_patch(1)), (9u8, test_patch(2))]);
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bytes)]);
+        let fs = fs_with_root_file(&mut img);
+        assert!(validate_bank(&fs).is_none());
+    }
+
+    #[test]
+    fn validate_rejects_truncated_tail() {
+        let mut bytes = bank_bytes(&[(0u8, test_patch(1)), (1u8, test_patch(2))]);
+        bytes.truncate(bytes.len() - 100); // EOF mid-message
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bytes)]);
+        let fs = fs_with_root_file(&mut img);
+        assert!(validate_bank(&fs).is_none());
+    }
+
+    #[test]
+    fn validate_rejects_missing_or_empty() {
+        let mut img = build_gpt_fat_image(&[("OTHER.TXT", b"x")]);
+        let fs = fs_with_root_file(&mut img);
+        assert!(validate_bank(&fs).is_none(), "missing BANK.SYX");
+        drop(fs);
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", b"")]);
+        let fs = fs_with_root_file(&mut img);
+        assert!(validate_bank(&fs).is_none(), "zero messages");
+    }
+
+    #[test]
+    fn mbsid_dir_bank_preferred_over_root() {
+        let mut img = build_gpt_fat_image(
+            &[("BANK.SYX", &bank_bytes(&[(0u8, test_patch(1))]))]);
+        {
+            let base = BASE_LBA as usize * SECTOR;
+            let part = VecDisk::new(&mut img[base..]);
+            let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+            let d = fs.root_dir().create_dir("MBSID").unwrap();
+            let mut f = d.create_file("BANK.SYX").unwrap();
+            write_all(&mut f, &bank_bytes(&[(42u8, test_patch(2))]));
+            f.flush().unwrap();
+        }
+        let fs = fs_with_root_file(&mut img);
+        let sum = validate_bank(&fs).unwrap();
+        assert!(sum.has(42) && !sum.has(0), "/MBSID/BANK.SYX must win");
+    }
+
+    #[test]
+    fn for_each_yields_slots_and_bodies() {
+        let patches = vec![(2u8, test_patch(20)), (5u8, test_patch(50))];
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bank_bytes(&patches))]);
+        let fs = fs_with_root_file(&mut img);
+        let mut got: Vec<(u8, [u8; 512])> = Vec::new();
+        assert!(for_each_bank_patch(&fs, |slot, body| {
+            got.push((slot, *body));
+            true
+        }));
+        assert_eq!(got, patches);
+    }
+
+    #[test]
+    fn for_each_callback_false_aborts() {
+        let patches = vec![(0u8, test_patch(1)), (1u8, test_patch(2))];
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bank_bytes(&patches))]);
+        let fs = fs_with_root_file(&mut img);
+        let mut calls = 0;
+        assert!(!for_each_bank_patch(&fs, |_, _| { calls += 1; false }));
+        assert_eq!(calls, 1);
     }
 }
