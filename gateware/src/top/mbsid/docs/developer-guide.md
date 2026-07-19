@@ -78,10 +78,12 @@ cd gateware/src/top/mbsid/fw
 cargo test --target x86_64-unknown-linux-gnu --lib
 ```
 
-121 tests: regdiff, patch store, SysEx capture, menu state machine, frame
+138 tests: regdiff, patch store, SysEx capture, menu state machine, frame
 diff/painter, param encodings, CV quantizer, USB patch list/load/export
 (`usb_patch`: `encode_syx`/`export_patch` round-trip, FAT-image fixtures),
-the menu's USB card (including the M6b `Export` row), and wall-clock uptime
+the menu's USB card (including the M6b `Export` and `Import` rows),
+whole-bank import (`bank_import`: full/sparse replace, bad-file rejection),
+and wall-clock uptime
 (`uptime`: expiry-at-limit, `u32` wraparound, tick/now roundtrip). The `riscv32`
 FFI is cfg-stubbed on host. Note: you must pass the explicit host
 target — the crate's default target is `riscv32im`.

@@ -11,8 +11,9 @@ guide, limitations, extending) — update the relevant page when a feature lands
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
 Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
-host `cargo test --lib` (121/121, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
-`usb_patch`/FAT-fixture/menu Usb-card coverage, `export_patch`/encode_syx round-trip, `uptime` wall-clock),
+host `cargo test --lib` (138/138, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
+`usb_patch`/FAT-fixture/menu Usb-card coverage, `export_patch`/encode_syx round-trip, `uptime` wall-clock,
+`bank_import` whole-bank replace),
 full bitstream
 build with **both** the M6a read path and the M6b write path (TX FIFO + WRITE(10) engine) included,
 `sync` Fmax 64.46 MHz PASS (60 MHz target; round-five build, all five clocks PASS), 22845/24288 (94%) `TRELLIS_COMB`
@@ -42,6 +43,10 @@ Post-round-eight follow-up coverage now also routes command-phase (CBW)
 bulk-OUT STALLs through the same autonomous Reset Recovery sequence; the
 focused integration regression is sim-verified, with hardware validation
 still pending alongside the rest of round eight.
+Whole-bank USB import (the `Import Bank` menu row, `/MBSID/BANK.SYX`,
+replace semantics across all 128 user slots, pre-validate-then-wipe) is now
+implemented (`fw/src/bank_import.rs`) and host-tested; hardware validation
+is pending, same as the rest of M6.
 
 ## Vendored engine (not in this repo)
 
