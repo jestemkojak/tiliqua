@@ -33,6 +33,7 @@ use tiliqua_fw::mbsid_sys;
 use tiliqua_fw::regdiff::{RegDiff, WriteList};
 use tiliqua_fw::sysex_capture::SysexCapture;
 use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
+use tiliqua_fw::bank_import::{self, ImportOutcome};
 use tiliqua_fw::menu::PressResult;
 use tiliqua_fw::cv::{self, CvSink};
 use tiliqua_fw::{params, settings_store, uptime};
@@ -640,6 +641,28 @@ fn main() -> ! {
                         status = Some(usb_load(&usb_msc, file as usize, Some(slot),
                                                &mut store, &mut patch_buf,
                                                &mut state, &mut user_detail));
+                    }
+                    PressResult::UsbImportBank => {
+                        // Whole-bank replace from /MBSID/BANK.SYX (spec §4).
+                        // Runs synchronously; the frozen menu is the busy
+                        // signal, same contract as export. Import writes
+                        // internal SPI flash only — no drive writes, so no
+                        // usb_msc.flush() needed.
+                        let outcome = with_fat(&usb_msc, |fs| {
+                            bank_import::import_bank(fs, &mut store)
+                        });
+                        let mut s: heapless::String<24> = heapless::String::new();
+                        let _ = match outcome {
+                            None => core::fmt::Write::write_str(
+                                &mut s, "USB mount FAILED"),
+                            Some(ImportOutcome::BadFile) => core::fmt::Write::write_str(
+                                &mut s, "No/bad BANK.SYX"),
+                            Some(ImportOutcome::Failed) => core::fmt::Write::write_str(
+                                &mut s, "Import FAILED"),
+                            Some(ImportOutcome::Imported(n)) => core::fmt::Write::write_fmt(
+                                &mut s, format_args!("Imported {} patches", n)),
+                        };
+                        status = Some(s);
                     }
                     PressResult::UsbExport { source } => {
                         // Re-enabled 2026-07-14 after the drive-corruption
