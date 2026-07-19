@@ -75,6 +75,14 @@ impl<F: NorFlash + ReadNorFlash> UserPatchStore<F> {
         hdr[6..8].copy_from_slice(&payload_checksum(patch).to_le_bytes());
         self.flash.write(a, &hdr)
     }
+
+    /// Erase `slot` so it reads as empty — the replace-semantics wipe for
+    /// bank import (slots the imported file doesn't provide).
+    pub fn erase_slot(&mut self, slot: u8) -> Result<(), F::Error> {
+        assert!(slot < N_SLOTS);
+        let a = self.slot_addr(slot);
+        self.flash.erase(a, a + SLOT_SIZE)
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +233,21 @@ mod tests {
         let f = s.into_inner();
         assert_eq!(&f.mem[SLOT_SIZE as usize..SLOT_SIZE as usize + 4], b"MBUP");
         assert_eq!(&f.mem[..8], &[0xFF; 8]); // slot before base untouched
+    }
+
+    #[test]
+    fn erase_slot_empties_only_that_slot() {
+        let mut s = UserPatchStore::new(MockFlash::new(), 0);
+        s.save(1, &test_patch(1)).unwrap();
+        s.save(2, &test_patch(2)).unwrap();
+        s.erase_slot(1).unwrap();
+        let mut out = [0u8; 512];
+        assert!(!s.load(1, &mut out), "erased slot must read empty");
+        assert!(s.load(2, &mut out), "neighbor slot must survive");
+        assert_eq!(out, test_patch(2));
+        // The whole sector is truly 0xFF, not just an invalidated header.
+        let f = s.into_inner();
+        let a = SLOT_SIZE as usize;
+        assert!(f.mem[a..2 * a].iter().all(|&b| b == 0xFF));
     }
 }
