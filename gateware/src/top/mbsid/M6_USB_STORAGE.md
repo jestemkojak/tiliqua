@@ -1031,6 +1031,9 @@ bus-error retry** (one TIMEOUT/CRC still rejects the whole command).
   (`M4_USER_PATCH_BANKS.md §6f`, 4016/25824 B) or the original +2–3 KB estimate predicted.
   M6b's additional write-path stack usage could plausibly exhaust the remaining ~3.1 KB;
   do not skip this measurement or assume it's fine by extrapolation.
+- [ ] **Bank import:** copy `bank1__v2_vintage_bank.syx` to a drive as `/MBSID/BANK.SYX`,
+  Import Bank, verify User-bank names match the file, spot-load several patches; re-run the
+  stack-paint probe during an import (rides the deep `with_fat` path).
 
 ## 8. Risks
 

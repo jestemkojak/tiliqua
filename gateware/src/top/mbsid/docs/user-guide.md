@@ -149,6 +149,9 @@ plugged device. The Main card's `USB Mode` row switches between them:
    - **Export** — write the live edit buffer or a User slot back to the
      drive as a `.syx` file (see [Exporting patches to a
      drive](#exporting-patches-to-a-drive) below).
+   - **Import** — replace the *entire* User bank in one shot from a
+     `/MBSID/BANK.SYX` file on the drive (see [Importing a whole bank from a
+     drive](#importing-a-whole-bank-from-a-drive) below).
 3. Turn to the **File** row and press to enter it, scroll to the patch you
    want, press again to commit — this **loads the patch into the engine
    immediately** (audition only, same as an incoming SysEx RAM Write — it
@@ -205,6 +208,43 @@ Exported files are byte-compatible with MIOS Studio `.syx`
 patches: they can be re-imported on this device via the `File` row above,
 sent to another MIDIbox SID over MIDI, or opened in the MIDIbox SID
 Editor on a PC.
+
+### Importing a whole bank from a drive
+
+The `Usb` card's **Import** row replaces the *entire* User bank (all 128
+slots) in one operation from a single bank-dump file, instead of loading
+patches one at a time.
+
+1. Copy a bank-dump `.syx` file (e.g. one exported from MIOS Studio, or
+   another MIDIbox SID) onto the drive as **`/MBSID/BANK.SYX`** — this exact
+   8.3 name, in the `MBSID` folder; rename the file on your PC if it's
+   called something else.
+2. With `USB Mode` = `Storage` and the drive plugged in, open the `Usb`
+   card and turn to the **Import** row. Turning it shows `Import Cancel`;
+   turn once more to arm it to `Import REPLACE bank!` (cancel-first, the
+   same confirm dance as the Main card's `Save` row, to guard against an
+   accidental press).
+3. Press while armed to commit. The status line reports one of:
+   - `Imported N patches` — success; `N` is how many of the 128 slots the
+     file actually populated (a sparse dump that only defines some slots is
+     fine — the rest are left empty).
+   - `No/bad BANK.SYX` — the file is missing, or failed to parse/validate
+     (bad checksum, truncated, wrong bank).
+   - `Import FAILED` — the file validated but writing to flash failed.
+   - `USB mount FAILED` — the drive itself couldn't be mounted (same
+     failure mode as browsing/loading).
+4. **Import fully replaces the User bank — every slot not named in the file
+   is cleared, not left alone.** This is a *replace*, not a *merge*: any
+   patches you'd saved individually before importing are gone from slots
+   the import didn't rewrite. There's no undo; if you want to keep your
+   current bank, export the slots you care about first.
+
+Like Export, Import writes/reads run synchronously in the firmware's main
+loop with no live `BUSY` indicator — the menu freezing (unresponsive to the
+encoder) for the duration of the import *is* the busy signal, same as
+described in the Export section above. Don't unplug the drive while the
+menu is frozen. Unlike Export, Import only writes to the device's internal
+flash, never back to the drive.
 
 ### CV Mod card
 
@@ -293,4 +333,6 @@ Practical notes:
 | `Drive` row stuck on `No drive` in Storage mode | Not FAT32/MBR-first-partition, or the drive needs more init time than a cheap flash stick — try a different drive; block size must be 512 bytes |
 | My MIDI keyboard stopped responding after I plugged in a drive | `USB Mode` is `Storage` — a plugged drive and a plugged MIDI device are mutually exclusive on the one USB-C port. Switch `USB Mode` back to `MIDI`, or play over TRS in the meantime (TRS stays live in Storage mode) |
 | `Export FAILED` on the Usb card | Drive removed mid-write, filesystem full, or the drive rejected the SCSI write — nothing is left half-written; try again with the drive freshly re-plugged |
-| Menu froze for a moment during Load or Export | Expected — USB block reads/writes run synchronously in the main loop with no live `BUSY` indicator; it un-freezes when the operation finishes. Don't unplug the drive while it's frozen |
+| `No/bad BANK.SYX` on Import | The file isn't at `/MBSID/BANK.SYX` (check the exact 8.3 name/folder), or it failed to parse (bad checksum, truncated, wrong bank) — nothing was written to the User bank |
+| `Import FAILED` on the Usb card | The bank file validated but the flash write itself failed partway through; retry — Import always fully re-validates before touching flash, so a retry starts clean |
+| Menu froze for a moment during Load, Export, or Import | Expected — USB block reads/writes run synchronously in the main loop with no live `BUSY` indicator; it un-freezes when the operation finishes. Don't unplug the drive while it's frozen |
