@@ -18,6 +18,7 @@ upstream Tiliqua** and lives only here.
 |-----------|-------------|
 | [SID MIDI Synthesizer](gateware/src/top/sid/README.md) | 3-voice SID synth controlled from CV or MIDI (TRS / USB host); polyphony and unison modes |
 | [SID Player](gateware/src/top/sid_player_sw/README.md) | Standalone `.SID` (PSID) C64 music player from USB stick, with oscilloscope display and Eurorack CV modulation |
+| [MBSID](gateware/src/top/mbsid/README.md) | The MIDIbox SID v3 sound engine (Lead / Bassline / Drum / Multi) running on the softcore, driving two SIDs in true stereo |
 
 ## SID MIDI Synthesizer (`sid`)
 
@@ -43,6 +44,30 @@ A standalone player for `.SID` (PSID) C64 music files, browsable from a USB stic
   (`pdm sid_player_sw build --sid-model {6581,8580}`); the tune's declared model is shown in the UI
   so you can flash the build that matches your library.
 
+## MBSID (`mbsid`)
+
+The [MIDIbox SID v3](https://github.com/midibox/mios32) sound engine, ported to run on the
+VexiiRiscv softcore and driving **two** reSID cores (MOS 8580) as a true-stereo,
+multi-timbral MIDI module.
+
+- **All four MBSID engines** — Lead, Bassline, Drum, Multi — selected by the patch itself.
+  Lead/Drum play from a single keyboard on MIDI ch 1; Bassline spans ch 1–2 and Multi
+  spreads 6 mono parts across ch 1–6 (ch 1–3 → left SID, ch 4–6 → right SID).
+- **Standard MBSID `.syx` patches.** A 128-patch factory bank ships in the bitstream, plus a
+  writable 128-slot user bank in flash. Patches arrive via MIDI Program Change, MIDI SysEx
+  upload, or a USB drive.
+- **USB mass storage.** The USB-C host port switches between MIDI and Storage mode: browse
+  and load `.syx` files from a thumb drive, export the live patch or a user slot back to the
+  drive, or import a whole 128-slot bank. TRS MIDI keeps working while in Storage mode.
+- **Menu, CV and on-device editing.** Three encoder-driven cards (Main / CV Mod / Edit): the
+  4 CV inputs assign to knob-matrix, filter/detune/volume parameters, or a pitch+gate CV note
+  machine; the Edit card tweaks the loaded Lead patch live and saves it to a user slot.
+- **Validated against a host oracle** — the register streams of the on-target engine are
+  diffed bit-exact against a PC build of the same C++ core.
+
+The MBSID engine source is **GPL** and is not vendored into this (CERN-OHL-S) repository —
+run `gateware/src/top/mbsid/fetch-mios32.sh` once after cloning to fetch it before building.
+
 # Updates / Community
 
 For updates, subscribe to the [Crowd Supply page](https://www.crowdsupply.com/apfaudio/tiliqua), join the [matrix chatroom](https://matrix.to/#/#apfaudio:matrix.org), or my own [mailing list](https://apf.audio/).
@@ -66,6 +91,7 @@ This project would be nothing without the hard work of many (awesome) open-sourc
 - Some gateware (e.g. I2C state machines) are inherited from the [Glasgow](https://github.com/GlasgowEmbedded/glasgow) project.
 - Audio interface and gateware: my existing [eurorack-pmod](https://github.com/apfaudio/eurorack-pmod) project.
 - SID emulation gateware: [reDIP-SID](https://github.com/daglem/reDIP-SID)
+- MBSID sound engine (GPL, fetched separately): the [MIDIbox / MIOS32](https://github.com/midibox/mios32) project
 - The "mi-plaits-dsp-rs" project: [mi-plaits-dsp](https://github.com/sourcebox/mi-plaits-dsp-rs)
 - The "pico-dirtyJtag" project forms a big chunk of the RP2040 firmware [pico-dirtyJtag](https://github.com/phdussud/pico-dirtyJtag)
 
