@@ -3,7 +3,7 @@
 **Date:** 2026-07-03
 **Branch:** `mbsid-port`
 **Status:** IMPLEMENTED (2026-07-03, commits a645709..97d6b25 plus this docs
-commit) — host tests + oracle green; hardware bring-up pending (§8 checklist).
+commit) — host tests + oracle green; hardware bring-up confirmed (§8 checklist).
 **Scope:** builds on M1–M4 (`M4_USER_PATCH_BANKS.md`). Zero gateware changes,
 zero CSR changes (no `--pac-only`), no upstream C++ edits. Everything is
 firmware (menu/ISR/flash), five thin shim additions, and oracle/driver
@@ -369,22 +369,20 @@ already in the M2/M4 SoC.
   `mbsid_current_patch_raw` — the edited bytes appear at the expected offsets
   (save-captures-edits invariant).
 
-**Hardware checklist (pending, with M2–M4 bring-up):**
-- [ ] CV1→Knob1 audibly modulates a patch with a K1 assignment; does nothing
+**Hardware checklist — confirmed on real hardware, with M2–M4 bring-up:**
+- [x] CV1→Knob1 audibly modulates a patch with a K1 assignment; does nothing
       audible on a patch without one (correct — document in README).
-- [ ] CV→Cutoff sweeps the filter on any Lead patch; releasing the CV leaves
+- [x] CV→Cutoff sweeps the filter on any Lead patch; releasing the CV leaves
       the patch's own cutoff (next patch load restores).
-- [ ] Pitch+Gate from a sequencer tracks V/oct over ≥4 octaves, no stuck
+- [x] Pitch+Gate from a sequencer tracks V/oct over ≥4 octaves, no stuck
       notes on cable pull.
-- [ ] Edit Cutoff/ADSR on-device → audible immediately → Save → power cycle →
+- [x] Edit Cutoff/ADSR on-device → audible immediately → Save → power cycle →
       load User slot → edit persisted.
-- [ ] Settings persist: assign CVs, set MIDI Src=USB, power cycle, verify.
-- [ ] `*` dirty star appears on first edit, clears on save and on load.
-- [ ] Edit card on a non-Lead patch — confirm the encoder cannot corrupt or
-      dirty the loaded patch (host-test-guarded per the M5 review fix; still
-      worth a physical confirmation of encoder/display behavior), including
-      when the non-Lead patch was selected via inbound MIDI Program Change,
-      not just menu navigation.
+- [x] Settings persist: assign CVs, set MIDI Src=USB, power cycle, verify.
+- [x] `*` dirty star appears on first edit, clears on save and on load.
+- [x] Edit card on a non-Lead patch — confirm the encoder cannot corrupt or
+      dirty the loaded patch, including when the non-Lead patch was selected
+      via inbound MIDI Program Change, not just menu navigation.
 
 ---
 

@@ -121,17 +121,19 @@ Measurement gotchas: `llvm-size`'s default summary merges
 leftover allocation, not usage. Real stack usage needs the on-hardware
 paint-and-scan probe (`M4 §6f`).
 
-## 4. Validation status (2026-07-03)
+## 4. Validation status
 
 **Green (host):** oracle 28/28 bit-exact across all four engines +
 differential + 128-patch sweep + SysEx equivalence/rejection; 41/41 host
-unit tests; full bitstream build with timing PASS. M1 (Lead, mono) was
-confirmed on hardware.
+unit tests; full bitstream build with timing PASS.
 
-**Not yet validated on hardware:** stereo playback (M2), patch banks (M3),
-SysEx upload & user-bank save (M4), menu cards / CV modulation / patch
-edit (M5). The checklists live in `M4 §7` and `M5 §8`. Until those are
-walked, treat hardware behavior of these features as untested.
+**Hardware-verified:** M1 (Lead, mono), M2 stereo playback, M3 patch banks,
+M4 SysEx upload & user-bank save, and M5 menu cards / CV modulation / patch
+edit are all confirmed on hardware (checklists in `M4 §7` and `M5 §8`).
+
+**Not yet validated on hardware:** M6's remaining USB write/export checklist
+items (M6a read is hardware-verified; see `M6_USB_STORAGE.md §7b` for what's
+still outstanding on the write/export leg).
 
 Also inherently untestable on the host: static-ctor execution
 (`.init_array` walk), ISR timing, CSR/FIFO plumbing, flash writes, CV
