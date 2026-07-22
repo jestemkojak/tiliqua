@@ -20,9 +20,12 @@ build with **both** the M6a read path and the M6b write path (TX FIFO + WRITE(10
 (`build/mbsid-r5/top.tim`) — post-route Fmax swings several MHz build-to-build on
 placement-seed noise alone (root `CLAUDE.md`), so treat this exact number as a snapshot, not
 a promise; LUT climbed from M6a's 91% as expected with the write leg added, still comfortably
-routable. The one thing NOT yet validated is **playback and the M4 SysEx/user-bank and M6
-USB-drive load/export flows on real hardware** (DESIGN §7 milestones 2–3;
-`M4_USER_PATCH_BANKS.md §7`, `M6_USB_STORAGE.md`'s hardware checklists for both M6a and M6b).
+routable. M2 stereo playback, M3 factory-bank browsing, M4 SysEx/user-bank flows, and M5
+menu/CV/patch-edit flows are all now **hardware-verified** (DESIGN §7 milestones 2–3;
+`M4_USER_PATCH_BANKS.md §7`, `M5_MENU_CARDS_CV_MOD.md §8`). The one thing NOT yet validated
+is **M6b's remaining USB write/export checklist items** — M6a (read) is hardware-verified
+(see below); M6b's write path is fixed and re-tested for basic export, but several
+`M6_USB_STORAGE.md` §7b checklist items are still outstanding (see status line above).
 **Round seven (2026-07-15, landed after the M6b write path above) added a handshake-fed
 engine watchdog + firmware wall-clock read/write timeouts** (`M6_USB_STORAGE.md`'s "Seventh
 round" section) — simulation/compile-verified only, hardware validation still pending. The

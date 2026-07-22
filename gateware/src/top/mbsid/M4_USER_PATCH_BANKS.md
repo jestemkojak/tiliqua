@@ -5,7 +5,7 @@
 **Branch:** `mbsid-port`
 **Status:** IMPLEMENTED (2026-07-02, commits `f81da90`..`12c8eca`) — gateware,
 firmware, shim/FFI, host unit tests, and oracle coverage all green (see §7). Hardware
-bring-up is pending (§7 hardware acceptance checklist, unchecked). Single milestone;
+bring-up confirmed (§7 hardware acceptance checklist). Single milestone;
 bank 1 = User; RAM Write = audition only; on-device save UI kept as groundwork for
 future on-device patch editing. Chosen-default details marked **[DEFAULT]** were
 implemented as written.
@@ -328,24 +328,24 @@ region size as a usage figure, not an actual measurement.
   SysEx path end-to-end with zero gateware.
 - **Gateware sim**: §4d.
 
-**Hardware acceptance checklist (manual, pending — not yet run on real hardware).**
+**Hardware acceptance checklist — confirmed on real hardware.**
 SysEx items use `amidi`/`sendmidi` scripting, which sidesteps the ACK-wait problem
 (§8):
 
-- [ ] On-device save → power-cycle → reload identical; Cancel writes nothing; empty
+- [x] On-device save → power-cycle → reload identical; Cancel writes nothing; empty
       slots render "Empty" and don't load.
-- [ ] Reflash a bitstream slot → user patches intact.
-- [ ] SysEx RAM Write (e.g. `amidi -p hw:X -S "$(python3 -c 'print(dump_hex)')"`) →
+- [x] Reflash a bitstream slot → user patches intact.
+- [x] SysEx RAM Write (e.g. `amidi -p hw:X -S "$(python3 -c 'print(dump_hex)')"`) →
       sound changes live, nothing persisted.
-- [ ] SysEx Bank Write bank 1 slot k → `Saved U00k`, power-cycle, loads identically;
+- [x] SysEx Bank Write bank 1 slot k → `Saved U00k`, power-cycle, loads identically;
       bank 0 write → ignored.
-- [ ] Same over USB MIDI: set the menu's `MIDI Src` row to `USB`, plug a class-compliant
+- [x] Same over USB MIDI: set the menu's `MIDI Src` row to `USB`, plug a class-compliant
       USB MIDI device that can transmit SysEx *into Tiliqua's USB-C port* (Tiliqua is the
       USB host here — a PC's own USB port cannot act as that device; see §1's host-port
       note). Mid-dump unplug → recovers ≤ 500 ms idle, next dump OK.
-- [ ] Menu redraw: turning the encoder shows no blanking wipe over the menu
+- [x] Menu redraw: turning the encoder shows no blanking wipe over the menu
       (diff painter; compare against pre-fix build if in doubt).
-- [ ] Idle fade: leave the menu untouched ≥10 min — text must not dim
+- [x] Idle fade: leave the menu untouched ≥10 min — text must not dim
       (persist_freeze_rows=320).
 
 ## 8. Known limitation — no ACK/DISACK (MIDI TX)

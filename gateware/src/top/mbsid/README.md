@@ -69,8 +69,7 @@ the same channel layout:
 > **Status:** the firmware forwards the real MIDI channel, so **all four engines are
 > reachable** per the channel map above (Lead/Drum on ch 1, Bassline split across
 > ch 1–2, Multi across ch 1–6). All four are validated bit-exact against the host
-> oracle; live hardware playback bring-up is still pending (see `DESIGN.md §7`,
-> milestones 2–3).
+> oracle, and live hardware playback is confirmed.
 
 ---
 

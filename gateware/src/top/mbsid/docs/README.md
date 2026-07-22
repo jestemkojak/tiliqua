@@ -61,10 +61,9 @@ All five milestones are **implemented and validated on the host**: the
 firmware/engine combination is bit-exact against the upstream engine
 (host oracle, 28/28 sequences across all four sound engines), host unit
 tests pass (41/41), and the full bitstream builds with timing closure
-(`sync` 61.76 MHz PASS). M1 (Lead, mono) was confirmed on hardware.
-**Hardware bring-up of M2–M5** (stereo playback, patch banks, SysEx upload,
-menu/CV) **is still pending** — see the hardware checklists in the M4/M5
-specs.
+(`sync` 61.76 MHz PASS). M1–M5 (Lead mono, stereo playback, patch banks,
+SysEx upload, menu/CV) are all confirmed on hardware — see the hardware
+checklists in the M4/M5 specs.
 
 ## Licensing
 
