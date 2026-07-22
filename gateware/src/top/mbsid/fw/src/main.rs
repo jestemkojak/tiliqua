@@ -71,7 +71,7 @@ const SYSEX_TIMEOUT_MS: u16 = 500;
 // MIDI Program Change value = (patch number - 1). 123 = A124 "Crazy Lead".
 // MUST be a Lead-engine slot, or the synth boots with a wrong-sounding
 // non-Lead patch (the 9 non-Lead slots are 15, 32-35, 60, 98, 99, 106).
-const BOOT_PATCH_INDEX: u8 = 123;
+const BOOT_PATCH_INDEX: u8 = 0;
 
 const MENU_X: i32 = 60;
 const MENU_Y: i32 = 80;
