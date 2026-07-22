@@ -23,6 +23,13 @@ through; don't duplicate it in Rust.
 
 ## Data flow (the whole point)
 
+USB-C is one host port, muxed one-at-a-time between a MIDI engine and a USB
+mass-storage engine (`USB Mode` on the Main menu card, M6); TRS MIDI stays
+live either way. The note/CC path below is what's live in `USB Mode=MIDI`;
+`USB Mode=Storage` instead routes the port to the `usb_msc` CSR for `.syx`
+patch import/export (see [Layer 1](#layer-1--gateware-toppy) below) and is
+omitted from this diagram for clarity.
+
 ```
 MIDI in (TRS / USB host)
       │  gateware decode → midi_read CSR FIFO
@@ -62,10 +69,12 @@ strategy the upstream JUCE desktop port uses against a software reSID.
 `MBSIDSoc` subclasses `top/sid`'s `SIDSoc` and changes **almost nothing**:
 
 ```python
-kwargs.setdefault("mainram_size", 0x8000)   # engine .bss + stack need 32 KB
-kwargs.setdefault("with_scope", False)      # LUT budget for the 2nd SID
-kwargs.setdefault("n_sids", 2)              # M2: stereo dual-SID
-kwargs.setdefault("with_sysex", True)       # M4: SysEx sideband CSR
+kwargs.setdefault("mainram_size", 0x8000)          # engine .bss + stack need 32 KB
+kwargs.setdefault("with_scope", False)             # LUT budget for the 2nd SID
+kwargs.setdefault("n_sids", 2)                     # M2: stereo dual-SID
+kwargs.setdefault("with_sysex", True)              # M4: SysEx sideband CSR
+kwargs.setdefault("with_usb_msc", True)            # M6: USB mass-storage host
+kwargs.setdefault("usb_msc_fullspeed_only", True)  # M6 round 8: avoid HS wedges
 ```
 
 Everything of substance lives in `top/sid/top.py` and is reused verbatim:
@@ -90,6 +99,17 @@ Everything of substance lives in `top/sid/top.py` and is reused verbatim:
   `midi_read` "read until 0" idiom.
 - **Timer0** — the 1 kHz ISR heartbeat (and the only usable time source:
   VexiiRiscv here has no `mcycle` CSR; reading it traps).
+- **USB mass-storage (M6)** — one `UTMITranslator` owns the physical ULPI
+  PHY; a `USBMIDIHost` and a `USBMSCHost` are both instantiated against it
+  and each held in reset by a `ResetInserter({"usb": storage_mode})` term
+  (one is always in reset, the other live) — a mode flip re-enumerates
+  whichever engine just came out of reset. Storage mode forces VBUS on
+  unconditionally (a thumb drive needs bus power even with no MIDI host
+  running) and firmware only ever writes the `usb_midi_host` CSR bit when
+  **not** in storage mode, so entering Storage silently falls back to TRS
+  as the live MIDI source. The storage engine exposes a `usb_msc` CSR block
+  at offset `0x1300` (read path + `0x20`/`0x24`/`0x3C` write/flush path,
+  `M6_USB_STORAGE.md`) that firmware drains through `fw/src/usb_msc.rs`.
 
 ## Layer 2 — The vendored C++ engine (`mios32/`, not in the repo)
 
@@ -143,12 +163,16 @@ so there is no mangling guard.
 | `main.rs` | boot, main loop (menu/display/persistence), TIMER0 ISR (MIDI drain → engine, SysEx drain, CV tick, `mbsid_tick` + RegDiff enqueue) |
 | `mbsid_sys.rs` | FFI declarations for the shim (cfg-stubbed on host so unit tests run on x86) |
 | `regdiff.rs` | 32-byte shadow diff → changed-register list (host-pure, unit-tested) |
-| `menu.rs` | hand-rolled 3-card menu state machine (`Card`, `MenuState`, `on_turn`/`on_press`) + drawing |
+| `menu.rs` | menu state machine, 4 cards — Main, CV Mod, Edit, and Usb (M6, only joins the Card row while `USB Mode`=`Storage`) — (`Card`, `MenuState`, `on_turn`/`on_press`) + drawing |
 | `params.rs` | curated Lead parameter table for the Edit card: 32 rows with sub-byte encodings and L/R mirror addresses |
 | `cv.rs` | CV sampling, 8-bit deadband, semitone quantizer (integer hysteresis, 1 V/oct, 0 V = C2), gate thresholds, note release on retarget |
 | `patch_store.rs` | User bank in SPI flash `0xF00000..0xF80000`, 128 × 4 KiB slots; header written *after* payload (torn-write safe) |
 | `sysex_capture.rs` | Rust-side parser of MBSID Bank-Write dumps (bank 1 only) feeding `patch_store` |
-| `settings_store.rs` | 16-byte persisted record (magic `"MBS5"`, MIDI Src + 4 CV targets + checksum) in the option-storage flash window; debounced ~2 s; corrupt record → defaults |
+| `settings_store.rs` | 16-byte persisted record (magic `"MBS5"`, MIDI Src + USB Mode + 4 CV targets + checksum) in the option-storage flash window; debounced ~2 s; corrupt record → defaults |
+| `usb_msc.rs` | `usb_msc` CSR driver (M6): `read_block`/`write_block`/`flush`, wall-clock read/write timeout polling (`uptime.rs`) |
+| `usb_patch.rs` | `export_patch`/`load_patch` — `.syx` file I/O for the Usb menu card (8.3 filenames: `EDIT.SYX`, `P{:03}.SYX`); export self-verifies by re-reading and byte-comparing the write |
+| `bank_import.rs` | whole-bank import from `/MBSID/BANK.SYX`: pre-validate-then-wipe replace across all 128 User slots |
+| `fat.rs`, `partition.rs` | FAT/GPT parsing glue for `usb_msc.rs`'s block device (mount-per-op, no held `FileSystem` across loop iterations) |
 
 Key ISR/main-loop rules:
 
@@ -209,3 +233,5 @@ checklists in the M-specs exist for.
 | CV targets are engine parameters, never raw SID registers | the engine owns the register image; raw pokes would fight the diff loop | `M5 §1` |
 | Edit card mirrors voice/filter writes L↔R | preserve factory Lead stereo invariant | `fw/src/params.rs` header |
 | Scope gateware stripped (`with_scope=False`) | LUT budget for the second reSID on the 25F | `M2 §6` |
+| MSC engine forced to Full Speed (`usb_msc_fullspeed_only`) | HS bulk-OUT mandates 512 B packets + PING, which the SIE didn't implement — both were root causes of real-drive write wedges; FS's ~1 MB/s is ample for 512 B patch files | `M6_USB_STORAGE.md` "Eighth round" |
+| USB-C forced to MIDI ↔ storage mutual exclusion, never simultaneous | one physical port, one `UTMITranslator`; simplest correct mux is "exactly one engine out of reset" | `M6_USB_STORAGE.md §2` |

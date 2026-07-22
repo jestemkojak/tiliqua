@@ -40,6 +40,15 @@ bank ships in the bitstream.
    > Tiliqua, that's the separate debug-USB serial console, not MIDI.) See
    > `docs/limitations.md` for details.
 
+   > **The same USB-C port can host a USB drive instead, for patch storage.**
+   > Flip `USB Mode` on the Main menu card from `MIDI` to `Storage` and plug in
+   > a thumb drive to browse/load `.syx` patches, export a patch to a file, or
+   > import a whole 128-slot User bank — a MIDI device and a drive are mutually
+   > exclusive on this one port, and TRS keeps working as the live MIDI source
+   > the whole time you're in Storage mode. See
+   > [`docs/user-guide.md`](docs/user-guide.md#usb-mode-loading-patches-from-a-drive)
+   > for the full walkthrough.
+
 ---
 
 ## Sound engines & MIDI channels
@@ -106,8 +115,14 @@ full scale.
 
 ## How it works
 
+USB-C is one host port shared, one-at-a-time, between MIDI and storage
+(`USB Mode` on the Main menu card selects which). The diagram below is the
+`USB Mode=MIDI` path; in `USB Mode=Storage` the port instead feeds a
+separate `usb_msc` CSR for `.syx` patch import/export via the Usb menu
+card (not shown here — see `docs/architecture.md`).
+
 ```
-   MIDI in (TRS / USB host)
+ MIDI in (TRS / USB host)
           │
           ▼
  ┌─────────────────────────────────────────┐
@@ -169,13 +184,15 @@ full scale.
 ## Menu cards
 
 The on-screen menu (encoder-driven) is three cards, selected from a Card row
-at the top of every card:
+at the top of every card, plus a fourth (**Usb**) that joins the Card row
+only while `USB Mode` is set to `Storage`:
 
 | Card | Purpose |
 |------|---------|
-| **Main** | patch bank/program browse + load, MIDI Src (TRS/USB), Save (as user patch) |
+| **Main** | patch bank/program browse + load, MIDI Src (TRS/USB), USB Mode (MIDI/Storage), Save (as user patch) |
 | **CV Mod** | assign each of the 4 CV inputs to a modulation target |
 | **Edit** | live-edit the loaded Lead patch's parameters, then Save |
+| **Usb** *(Storage mode only)* | browse a plugged drive's `.syx` files, load one to a User slot, export the current/a slot's patch, or import a whole 128-slot bank |
 
 Turning the encoder on the Card row cycles Main → CV Mod → Edit → Main.
 

@@ -36,9 +36,9 @@ class MBSIDSoc(SIDSoc):
     """
 
     bitstream_help = BitstreamHelp(
-        brief="MBSID Lead: dual SID stereo synth, MIDI in.",
+        brief="MIDIbox SID v3 port with patch import/exportl.",
         io_left=['CV1 mod', 'CV2 mod', 'CV3 mod', 'CV4 mod', 'L out', 'R out', 'L+R mix', 'L+R mix'],
-        io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
+        io_right=['navigate menu', 'MIDI host/storage', 'video out', '', '', 'TRS MIDI in']
     )
 
     def __init__(self, **kwargs):

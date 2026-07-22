@@ -86,10 +86,12 @@ Two banks of 128 patches each:
 
 ## The menu
 
-The on-screen menu is three **cards**. The top row of every card is the
-Card selector — turning the encoder on it cycles **Main → CV Mod → Edit →
-Main**. Elsewhere: turn to move between rows, press to enter/adjust a row,
-turn to change the value, press again to commit.
+The on-screen menu is three **cards** — **Main → CV Mod → Edit → Main** —
+plus a fourth, **Usb**, that only joins the Card-row cycle while `USB Mode`
+(Main card) is set to `Storage`; switching back to `MIDI` drops it from the
+cycle again. The top row of every card is the Card selector. Elsewhere: turn
+to move between rows, press to enter/adjust a row, turn to change the value,
+press again to commit.
 
 ### Main card
 
