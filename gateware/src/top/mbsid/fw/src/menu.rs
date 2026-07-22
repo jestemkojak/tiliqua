@@ -484,7 +484,7 @@ pub fn build_frame(st: &MenuState, name: &str,
     // Row 0 on every card: Card selector.
     let marker = row_marker(st, ROW_CARD);
     line.clear();
-    let _ = write!(line, "{} Card     {}", marker, st.card.label());
+    let _ = write!(line, "{} Menu     {}", marker, st.card.label());
     f.push(pos_x, pos_y + ROW_DY, st.focus == ROW_CARD, &line);
 
     match st.card {
