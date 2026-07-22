@@ -74,7 +74,7 @@ success — durability is not left to a later unplug/idle flush.
 ### GPL boundary
 The vendored engine is GPL; the repo is CERN-OHL-S. Hence `mios32/` is
 gitignored and fetched per-clone, and a *distributed* firmware/bitstream
-that links it is GPL. The zetaSID Cortex-M binary is proprietary and is
+that links it is GPL. The reference hardware's Cortex-M binary is proprietary and is
 never touched or disassembled. <a name="licensing"></a>
 
 ### Single-context SoC constraints

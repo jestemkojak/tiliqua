@@ -3,7 +3,7 @@
 **Date:** 2026-06-27
 **Status:** Design draft (`mbsid-port`). M1 (Lead, mono, MIDI-played) is complete and
 confirmed on hardware; this is the follow-up.
-**Scope:** restore the full zetaSID/MBSID stereo voice architecture — **two SIDs, 6
+**Scope:** restore the full MBSID stereo voice architecture — **two SIDs, 6
 oscillators (3 L + 3 R), two filters** — by un-discarding the engine's R register image and
 driving a second gateware reSID with it. Design only: interfaces + acceptance tests so the
 implementation is mechanical.
@@ -17,8 +17,8 @@ register image (oscillators 1–3 + Filter 0); the **R** image (oscillators 4–
 *computed every tick but discarded*. That is a fidelity reduction, not a simplification of the
 engine — the MBSID Lead engine **always** produces both 32-byte register images.
 
-zetaSID/MBSID v2 is a **dual-SID stereo** design: oscillators split 3 Left + 3 Right with two
-independent filters (`zsid/MBSID_ON_TILIQUA.md`). Many Lead patches use all 6 oscillators
+MBSID v2 is a **dual-SID stereo** design: oscillators split 3 Left + 3 Right with two
+independent filters. Many Lead patches use all 6 oscillators
 and/or both filters (stereo detune/spread, L/R-panned layers, cross-filtered voices). Running
 them on one SID silently drops half the voice architecture. **M2 makes playback true to the
 patch design** by giving the R image its own SID.

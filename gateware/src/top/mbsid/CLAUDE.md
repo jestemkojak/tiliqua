@@ -67,7 +67,7 @@ constructors don't auto-run on target. `fw/init_array.x` (wired in `build.rs`) e
 
 Runs the **MBSID Lead** sound engine (mios32 `midibox_sid_v3` C++ core) on the VexiiRiscv
 softcore, FFI'd from the firmware Rust, driving **two** gateware reSIDs (L/R stereo) played
-live over MIDI. The C++ engine is the mandatory middle layer: zetaSID `.syx` patches are MBSID v2
+live over MIDI. The C++ engine is the mandatory middle layer: MBSID v2 `.syx` patches are
 voice descriptions with **zero** SID-register data — only the engine turns a patch into the
 per-tick `sid_regs_t` register image. See `DESIGN.md §1–2`.
 
@@ -162,8 +162,8 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   actually get applied on target. The host oracle CANNOT catch this (host libc runs ctors).
 - **All engine state lives in `.bss`** via one `mbsid_shim.cpp` (the only C++ we author) owning
   a single `MbSid` + `MbSidClock` + two static `sid_regs_t`. No allocator. Shim ABI is in
-  `DESIGN.md §4`; the 512-byte patch buffer is exactly what `zsid/zetasid_syx.py` emits (same
-  `sid_patch_t` layout — no re-encoding).
+  `DESIGN.md §4`; the 512-byte patch buffer is exactly what the reference MBSID v2 `.syx`
+  encoder emits (same `sid_patch_t` layout — no re-encoding).
 - **Oracle validation is the keystone, runnable entirely on PC before any FPGA work.** Build
   the same `.cpp` + `mbsid_shim.cpp` for x86, run an identical `(patch, note-sequence)` through
   both it and the instrumented JUCE port, diff the **L and R** register streams — must be
@@ -189,8 +189,8 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **`MbSidClock` AUTO mode stays in MIDI-slave mode (WT frozen) until ~4095ms**, then falls back to its internal BPM master clock — same threshold as the Drum SIGSEGV above, but it affects *any* oracle test that needs the WT to actually step (e.g. Multi WT→filter modulation). Stock sequences like `seq_multi.txt` end at ~1200ms and never reach this window, so WT-dependent asserts silently no-op — extend the sequence past ~4.1s locally in the test (don't edit the shared `.txt` file; see `run_oracle.sh`'s A107 block for the pattern) and use a discriminating check (helper disabled → must still FAIL) to rule out false positives from the clock switch itself.
 - **Multi engine: repeating one note on a fixed MIDI channel can alternate L/R in blocks of 3 — by upstream design, not a Tiliqua bug.** Root cause is `MbSidVoiceQueue`/`MbSidSeMulti::voiceGet` (`MbSidSeMulti.cpp:476-491`): when an instrument's `voice_asg` patch param is 0 ("all voices"), every note-on round-robins through all 6 physical oscillators via a least-recently-used queue (voices 0-2 = Left SID, 3-5 = Right, same `physVoice = voice % 3` split as Lead). Retriggering the same note repeatedly therefore cycles 0→1→2→3→4→5→0→…, i.e. 3 notes on L then 3 on R, forever. Reproduced bit-exact on the host oracle (no gateware/shim involved) — confirmed with `pc 60 / ch 0 / on 60 100 / off 60` repeated 6× in a `host_oracle` sequence, gate-on lands on L(v0,v1,v2) then R(v0,v1,v2). Lead is unaffected — it always gates all 6 voices (both SIDs) simultaneously (`MbSidSeLead.cpp:391,428`), no `VoiceQueue` involved. Fix, if ever wanted, is patch-side (`voice_asg` = left-only/right-only instead of all), not firmware.
 - **GPL.** Linking the MBSID C++ into the firmware makes the distributed bitstream firmware
-  GPL (fine for personal/open use). The zetaSID Cortex-M binary is proprietary — never touched
-  or disassembled.
+  GPL (fine for personal/open use). The reference hardware's Cortex-M binary is proprietary —
+  never touched or disassembled.
 - **M4 SysEx path (full design in `M4_USER_PATCH_BANKS.md`):** gateware sideband
   (`forward_sysex` on `MidiDecodeUSB`/`MidiSysexFilter`, opt-in, `top/sid` unaffected)
   → `sysex_read` CSR at offset **`0x24`** on `SIDPeripheral`, a **valid-bit read**

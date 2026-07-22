@@ -14,12 +14,12 @@ implementation is mechanical. It does not change any existing tiliqua `top`.
 Rust, driving **one** reSID (mono), played live over MIDI, and validated **bit-exact**
 against a host oracle built from the same engine source.
 
-**Why this is needed.** The zetaSID `.syx` patches are MBSID v2 voice descriptions
+**Why this is needed.** MBSID v2 `.syx` patches are voice descriptions
 (6 oscillators, 2 filters, 6 LFOs, multi-stage envelopes, mod matrix, wave sequencers).
 They contain **zero SID-register data**. A bare reSID core emulates only the dumb
 6581/8580. The MBSID firmware engine is the mandatory middle layer that interprets a
-patch and writes the SID registers every control tick. zetaSID is "MBSID v2 based"; the
-portable implementation of that engine is the **C++** `midibox_sid_v3/core` family
+patch and writes the SID registers every control tick. The portable implementation of
+that engine is the **C++** `midibox_sid_v3/core` family
 (MBSID V3 is the C++ rewrite that contains the V2 engine). It already has a JUCE desktop
 port that runs the engine against reSID — the same data flow Tiliqua's `sid` top uses.
 
@@ -103,8 +103,8 @@ const uint8_t  *mbsid_regs_l(void);                     // 32-byte image (used b
 const uint8_t  *mbsid_regs_r(void);                     // 32-byte image (computed, unused in M1)
 ```
 
-The 512-byte patch buffer is exactly what this repo's sibling tool `zetasid_syx.py`
-emits — same `sid_patch_t` layout. No re-encoding needed.
+The 512-byte patch buffer is exactly the reference MBSID v2 `.syx` encoder's layout —
+same `sid_patch_t` layout. No re-encoding needed.
 
 ---
 
@@ -138,9 +138,9 @@ the host (same `.cpp` + `mbsid_shim.cpp`, x86) and diff the two register streams
 must be **byte-identical**. This converts "did ~8k lines of C++ port correctly?" into a
 mechanical regression test, runnable entirely on PC before any FPGA work.
 
-- Validate on **≥3 Lead patches** from `zsid/extracted_patches/` plus `B005 - Avril
-  TranceGate.syx` (a known-good Lead patch).
-- The wasm zetaSID emulator (driven by the CDP harness in `zsid/tools/`) is an **optional
+- Validate on **≥3 Lead patches** from a known corpus of extracted MBSID Lead patches plus
+  `B005 - Avril TranceGate.syx` (a known-good Lead patch).
+- A wasm reference-engine emulator (driven by an external CDP test harness) is an **optional
   secondary cross-check**, not required for M1.
 - Because M1 keeps only the L image, the diff compares the **L register stream** of shim
   vs oracle.
@@ -171,21 +171,20 @@ mechanical regression test, runnable entirely on PC before any FPGA work.
 - **SoC RAM.** Engine state (patch + per-voice/LFO/env/mod/WT runtime) is a few KB atop
   the UI/framebuffer set; bump `mainram_size` if it overflows.
 - **Licensing.** MBSID is **GPL**; linking the C++ into the bitstream firmware makes that
-  firmware GPL on distribution (fine for personal/open use). The zetaSID Cortex-M firmware
-  (`sid_015b.zta`) is proprietary and is **not** touched or disassembled.
+  firmware GPL on distribution (fine for personal/open use). The reference hardware's
+  Cortex-M firmware is proprietary and is **not** touched or disassembled.
 
 ---
 
 ## 9. Reference pointers
 
-- Engine source (vendored, reference): `zsid/mios32/apps/synthesizers/midibox_sid_v3/core/`
+- Engine source (vendored, reference): `mios32/apps/synthesizers/midibox_sid_v3/core/`
   and `juce/Source/PluginProcessor.cpp` (the oracle harness model).
 - `sid_regs_t` / `SID_REGS_NUM`: `mios32/modules/sid/sid.h`.
 - Existing register-write path & SoC facts: `gateware/src/top/sid/top.py`
   (`SIDPeripheral`), `gateware/src/top/sid/fw/src/main.rs`.
-- Patch decode/encode + extracted patches: `zsid/zetasid_syx.py`,
-  `zsid/extracted_patches/`.
-- Feasibility background: `zsid/MBSID_ON_TILIQUA.md`.
+- Patch decode/encode reference: the MBSID v2 `.syx` format (512-byte `sid_patch_t`
+  layout, see §4).
 
 ---
 

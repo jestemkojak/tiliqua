@@ -6,7 +6,7 @@ are owned by the design specs ([`../DESIGN.md`](../DESIGN.md) and the
 
 ## The core idea
 
-zetaSID/MBSID `.syx` patches are **voice descriptions** — 6 oscillators,
+MBSID `.syx` patches are **voice descriptions** — 6 oscillators,
 2 filters, 6 LFOs, multi-stage envelopes, a mod matrix, wavetable
 sequencers — and contain **zero SID register data**. A bare SID (or reSID)
 emulation is just the dumb chip. The mandatory middle layer is the MBSID
@@ -126,8 +126,8 @@ allocator. The ABI (spec: `DESIGN.md §4`, extended in M3–M5):
 - MIDI: `mbsid_note_on/off`, `mbsid_pitch_bend`, `mbsid_cc`,
   `mbsid_aftertouch` (all take the real MIDI channel as first arg),
   `mbsid_sysex_byte`
-- patches: `mbsid_load_patch` (512-byte `sid_patch_t`, same layout
-  `zetasid_syx.py` emits), `mbsid_program_change` (engine `bankLoad`),
+- patches: `mbsid_load_patch` (512-byte `sid_patch_t`, the reference MBSID v2 `.syx`
+  layout), `mbsid_program_change` (engine `bankLoad`),
   patch-body peek/poke + `mbsid_sysex_param` for the Edit card
 - control: `mbsid_knob_set`, `mbsid_par_set` (CV modulation entry points)
 - output: `mbsid_tick`, `mbsid_regs_l()`, `mbsid_regs_r()` (32-byte images)

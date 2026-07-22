@@ -8,7 +8,7 @@ whoever builds your firmware.
 ## What it is
 
 A stereo **dual-SID synthesizer module**: the classic MIDIbox SID v2/v3
-sound engine (the same engine family behind zetaSID) running against two
+sound engine (the MBSID v2 engine family) running against two
 emulated MOS 8580 SID chips. You play it over MIDI; patches describe
 oscillators, filters, LFOs, envelopes, arpeggiators and wavetables — the
 engine turns them into SID register writes 1000 times a second.
@@ -134,7 +134,7 @@ plugged device. The Main card's `USB Mode` row switches between them:
   directory itself is scanned as a fallback, so a drive with `.syx` files
   just dropped at the top level also works.
 - Any file whose SysEx body parses as an MBSID v2 single-patch dump is
-  accepted (the same format zetaSID/MIOS Studio use), plus bare 512-byte
+  accepted (the same format MIOS Studio uses), plus bare 512-byte
   raw patch files (exact size match, no SysEx wrapper).
 
 ### Browsing and loading
@@ -204,7 +204,7 @@ interrupt, not the main loop).
 
 Filenames are plain 8.3 (`EDIT.SYX`, `P042.SYX`) — there is no long
 filename support, matching `sid_player_sw`'s drive-access conventions.
-Exported files are byte-compatible with zetaSID/MIOS Studio `.syx`
+Exported files are byte-compatible with MIOS Studio `.syx`
 patches: they can be re-imported on this device via the `File` row above,
 sent to another MIDIbox SID over MIDI, or opened in the MIDIbox SID
 Editor on a PC.

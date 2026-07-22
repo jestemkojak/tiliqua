@@ -655,7 +655,7 @@ Goals:
 - **M6a (read):** browse `*.syx` patch files on a FAT-formatted USB drive from the menu,
   load one into the engine (audition) and optionally commit it to an M4 user-bank slot.
 - **M6b (write):** export the currently-loaded/edited patch, or any user-bank slot, as a
-  standard MBSID v2 SysEx dump file on the drive — interchangeable with zetaSID/MIOS Studio
+  standard MBSID v2 SysEx dump file on the drive — interchangeable with MIOS Studio
   tooling and re-sendable over MIDI from a PC.
 - Keep `top/sid` and `top/sid_player_sw` unaffected (same opt-in pattern as M4's
   `forward_sysex`).
@@ -704,7 +704,7 @@ Non-goals:
   stubbed to error), `sid_scan.rs` (root-dir extension scan + load-by-index, host-tested
   against an in-memory FAT image). All directly reusable with the extension changed to
   `.SYX`.
-- **A `.syx` patch file is exactly the byte stream `SysexCapture` already parses.** zetaSID
+- **A `.syx` patch file is exactly the byte stream `SysexCapture` already parses.** Reference
   patch files are MBSID v2 SysEx dumps (`F0 00 00 7E 4B 00 …`, cmd 0x02, 1024 nibblized
   bytes = the same 512-byte `sid_patch_t` the whole port runs on). File import can feed file
   bytes through the existing parser (relaxed to accept any bank/type for file mode, §6c);
@@ -804,7 +804,7 @@ Vendor `guh/engines/msc.py` → `src/vendor/guh_msc/msc.py` (BSD-3 header kept) 
 - Directory: `/MBSID/` on the first FAT partition (created on first export if absent; import
   also falls back to scanning the root dir so hand-copied files Just Work).
 - File format: **standard MBSID v2 single-patch SysEx dump** (`F0 00 00 7E 4B <dev> 02 …
-  F7`, 1024 nibblized data bytes + 7-bit checksum) — byte-compatible with zetaSID patch
+  F7`, 1024 nibblized data bytes + 7-bit checksum) — byte-compatible with reference MBSID
   `.syx` files, MIOS Studio, and our own `sysex_capture.rs` framing. A file exported by
   Tiliqua can be re-imported, sent to real MBSID hardware, or pushed back over TRS MIDI by
   any PC tool, unchanged.
@@ -839,8 +839,8 @@ Vendor `guh/engines/msc.py` → `src/vendor/guh_msc/msc.py` (BSD-3 header kept) 
 Add a constructor/flag `SysexCapture::file_mode()` that relaxes the accept condition to any
 cmd-0x02 patch dump (ignore bank/type/patch-number match; still enforce header, nibble
 count, checksum, F7). The ISR/live path keeps today's strict bank-1 rule. Host tests: strict
-mode rejects what it rejects today; file mode accepts a factory-bank dump and a zetaSID file
-fixture; both reject a corrupted checksum.
+mode rejects what it rejects today; file mode accepts a factory-bank dump and a reference
+`.syx` file fixture; both reject a corrupted checksum.
 
 ### 6d. Menu (`menu.rs`) — USB card
 
@@ -877,8 +877,8 @@ ULPI mux (Option A). Judge LUT% + post-route sync Fmax over 2 seeds (read the *s
 `Max frequency` line in `top.tim`). Decides Option A vs B before any real work.
 
 **M6a — load (read-only).** Gateware §4a + firmware §6 minus export. Host tests: fat/scan/
-parser suites (all runnable on PC, fixtures = zetaSID `.syx` + generated FAT images, same
-harness as `sid_scan.rs`) — part of the **118/118 green** host suite, see `CLAUDE.md`.
+parser suites (all runnable on PC, fixtures = reference `.syx` files + generated FAT images,
+same harness as `sid_scan.rs`) — part of the **118/118 green** host suite, see `CLAUDE.md`.
 Gateware built and passing timing — see `CLAUDE.md`'s status line for the current post-route
 sync Fmax. **Not yet run on real hardware.**
 
