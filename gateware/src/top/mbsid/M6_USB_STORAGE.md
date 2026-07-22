@@ -3,9 +3,10 @@
 Status: **M6a hardware-verified. M6b (write/export) root-caused and fixed in gateware
 simulation (2026-07-14, same day as the incident); the export path is re-enabled in
 firmware and, as of 2026-07-16, hardware-retested with byte-correct exported files and no
-drive damage — export is now permanently enabled, no longer disposable-media-only. A few
-§7b checklist items (stack-paint remeasure, unplug-mid-write, 50x repeat, quirky-drive
-sweep, MIDI round-trip) are still outstanding.** M6a (read)
+drive damage — export is now permanently enabled, no longer disposable-media-only. The
+write-leg stack-paint remeasure is now done (2026-07-22, §7b/§8). A few §7b checklist items
+(unplug-mid-write, 50x repeat, quirky-drive sweep, MIDI round-trip) are still outstanding.**
+M6a (read)
 passed its full hardware checklist (§7a). See the incident writeup + root cause right
 below and §8's risk table. **Update (2026-07-15): round seven (below) landed a
 handshake-fed watchdog + firmware wall-clock read/write timeouts — simulation/compile
@@ -1022,15 +1023,18 @@ bus-error retry** (one TIMEOUT/CRC still rejects the whole command).
   non-max-size packet on some USB implementations — a drive that's picky about this should
   surface as a write error (visible `Export FAILED` status), not silent corruption; confirm
   which behavior actually occurs on the quirkier of the two drives.
-- [ ] **Stack-paint re-measure — HIGH PRIORITY, do this before trusting M6b on hardware.**
-  Same methodology as §7a's stack-paint item (now measured; see there for the probe
-  technique), but exercise the deepest M6b path instead: menu navigation into `Usb`, an
-  `Export` of a User slot (the write leg adds the `tx_data` fill loop + FAT write-back cache
-  on top of whatever the read leg already uses). §7a's `Load→Slot` alone already measured
-  **22736/25856 B (~3.1 KB headroom)** — far tighter than the pre-M6 baseline
-  (`M4_USER_PATCH_BANKS.md §6f`, 4016/25824 B) or the original +2–3 KB estimate predicted.
-  M6b's additional write-path stack usage could plausibly exhaust the remaining ~3.1 KB;
-  do not skip this measurement or assume it's fine by extrapolation.
+- [x] **Stack-paint re-measure — done 2026-07-22.** Same probe/methodology as §7a's
+  stack-paint item, exercising the combined worst-case M6b path in one boot session: menu
+  navigation → `Load→Slot` (import) → `Export` of a User slot. **Result: 23312/25852 B peak,
+  ~2540 B (~9.8%) headroom.** The import alone reached 23296 B; the subsequent export added
+  only ~16 B on top — so M6b's write leg (`tx_data` fill loop + FAT write-back cache) is
+  *not* the large additional stack cost the original +2–3 KB estimate implied when
+  extrapolated from §7a's `Load→Slot`-alone reading (22736/25856 B, ~3.1 KB headroom).
+  Headroom is thinner than any single-path measurement (combining import + export costs more
+  than either alone), but no crash/corruption occurred at this margin — a companion export
+  ran cleanly (`ok=1`, zero reject/error/NYET) in the same test. Treat ~2.5 KB as the current
+  safety margin for this combined path; any future code added to the `Usb` card's deepest
+  route should be checked against it before landing.
 - [ ] **Bank import:** copy `bank1__v2_vintage_bank.syx` to a drive as `/MBSID/BANK.SYX`,
   Import Bank, verify User-bank names match the file, spot-load several patches; re-run the
   stack-paint probe during an import (rides the deep `with_fat` path).
@@ -1039,9 +1043,9 @@ bus-error retry** (one TIMEOUT/CRC still rejects the whole command).
 
 | Risk | Exposure | Mitigation |
 |---|---|---|
-| **Write path corrupts real media** — realized 2026-07-14: a real-hardware M6b `Export` attempt zeroed a test drive's GPT partition table and FAT32 boot sector (both copies). **Root-caused same day**: the CSR TX FIFO's `ResetInserter(start_write)` flushed the just-loaded payload on the strobe that started the write, so every WRITE(10) was payload-less, hanging the drive mid-command and desyncing its bulk-only transport (mostly-zero data committed at arbitrary LBAs) | **Resolved — hardware-retested 2026-07-16** | Gateware fixed: strobe-then-fill contract with the engine start deferred until all 128 words are banked (`usb_msc_csr.py`), so a payload-less CBW is structurally impossible; regression tests in `tests/test_usb_msc_csr.py`. `PressResult::UsbExport` re-enabled and hardware-retested: multiple exports produced byte-correct `.SYX` files (header/slot/checksum verified against the source patch) with no drive damage — export is now permanently enabled. Remaining §7b items (stack-paint remeasure, unplug-mid-write, 50x repeat, quirky-drive sweep) not yet run — see the incident writeup above and memory `mbsid-usb-write-test-destroyed-drive` |
+| **Write path corrupts real media** — realized 2026-07-14: a real-hardware M6b `Export` attempt zeroed a test drive's GPT partition table and FAT32 boot sector (both copies). **Root-caused same day**: the CSR TX FIFO's `ResetInserter(start_write)` flushed the just-loaded payload on the strobe that started the write, so every WRITE(10) was payload-less, hanging the drive mid-command and desyncing its bulk-only transport (mostly-zero data committed at arbitrary LBAs) | **Resolved — hardware-retested 2026-07-16** | Gateware fixed: strobe-then-fill contract with the engine start deferred until all 128 words are banked (`usb_msc_csr.py`), so a payload-less CBW is structurally impossible; regression tests in `tests/test_usb_msc_csr.py`. `PressResult::UsbExport` re-enabled and hardware-retested: multiple exports produced byte-correct `.SYX` files (header/slot/checksum verified against the source patch) with no drive damage — export is now permanently enabled. Remaining §7b items (unplug-mid-write, 50x repeat, quirky-drive sweep) not yet run; stack-paint remeasure now done (see below) — see the incident writeup above and memory `mbsid-usb-write-test-destroyed-drive` |
 | Area/Fmax: +USB engine on an 80%-full, 61.76 MHz design | High (project-gating) | Phase 0 probe; Option B fallback; last resort: `with_sysex` and MSC engine made build-time exclusive (two bitstream variants — ugly, avoid) — superseded: M6a measured 91% LUT, 66.41 MHz post-route sync Fmax PASS; M6b (read+write path both included) measured **94% LUT, 64.29 MHz post-route sync Fmax PASS** — LUT climbed as expected with the write leg, still routes with margin over the 60 MHz target |
-| Stack exhaustion: M6a's `Load→Slot` measured **22736/25856 B peak on real hardware (2026-07-14), ~3.1 KB headroom** — nearly 6x the §6f estimate (+2–3 KB over M4's 4016 B) | High (untested M6b adds more on top: `tx_data` fill loop + FAT write-back cache) | Re-run the stack-paint probe (methodology in §7a's now-checked item) against M6b's `Export` path before trusting it on hardware; if headroom is gone, prime suspects are `fatfs`'s own call depth (deeper than `sid_player_sw`'s smaller mainram ever exercised) and/or the `UserPatchStore::save` + FAT path both being live on the stack at once during `Load→Slot` — profile with the same probe at finer granularity (e.g. log call-site tags, not just a periodic scan) if a fix is needed |
+| Stack exhaustion: combined worst-case path (`Load→Slot` import + `Export` in one session) measured **23312/25852 B peak on real hardware (2026-07-22), ~2540 B (~9.8%) headroom** — tighter than either path alone (§7a's `Load→Slot`-only 22736/25856 B, ~3.1 KB), since the write leg adds a modest ~16 B on top of the import path's own peak | Resolved for now — headroom is thin but positive, no crash/corruption observed at this margin | No fix needed today; before adding more code to the `Usb` card's deepest route (import+export combined), re-run the stack-paint probe (methodology in §7a) against the new path and check it against the ~2.5 KB margin — if it's ever exhausted, prime suspects are `fatfs`'s own call depth and/or `UserPatchStore::save` + the FAT write-back cache both being live on the stack at once |
 | FAT corruption on unplug during export | Medium | Writes only on explicit user action; flush eagerly; verify-by-readback (`export_patch` re-reads+re-parses+byte-compares before reporting success); document "don't unplug while the menu is unresponsive" — note there is no live `BUSY` row during a write (`CLAUDE.md`'s M6b gotcha: `DriveState::Busy` exists but is never constructed), the frozen screen itself is the busy signal |
 | Quirky drives (slow spin-up, non-512 blocks) | Medium | `block_size()==512` guard already in driver (reject others visibly); `guh` 10 s init watchdog handles slow SSDs; test a cheap flash stick + an SSD enclosure |
 | `guh` fork drift | Low | Vendor only `engines/msc.py`; `usbh/*` internals stay upstream-pinned; offer write support upstream as a PR |
