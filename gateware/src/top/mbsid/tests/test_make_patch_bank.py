@@ -1,6 +1,10 @@
+import contextlib
+import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import make_patch_bank as bank
 
@@ -133,6 +137,83 @@ class BankAssemblyTests(unittest.TestCase):
             result = bank.build_bank([missing])
             self.assertEqual((result.included, result.skipped), (0, 1))
             self.assertIn("cannot read", result.warnings[0])
+
+
+class CliTests(unittest.TestCase):
+    def run_main(self, argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = bank.main(argv)
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_default_output_and_summary(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "patch1.syx"
+            source.write_bytes(bank.encode_bank_patch(patch_bytes(1), 88))
+            previous = Path.cwd()
+            os.chdir(root)
+            try:
+                status, stdout, stderr = self.run_main([str(root)])
+            finally:
+                os.chdir(previous)
+
+            self.assertEqual(status, 0)
+            self.assertEqual(stderr, "")
+            self.assertTrue((root / "BANK.SYX").is_file())
+            self.assertIn("1 patch", stdout)
+            self.assertIn("0 skipped", stdout)
+
+    def test_custom_output_preserves_embedded_slots_and_warns(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source"
+            source.mkdir()
+            (source / "p1.syx").write_bytes(bank.encode_bank_patch(patch_bytes(1), 12))
+            (source / "p2.syx").write_bytes(bank.encode_bank_patch(patch_bytes(2), 12))
+            output = root / "custom.syx"
+
+            status, stdout, stderr = self.run_main([
+                str(source), "-o", str(output), "--preserve-patch-numbers"
+            ])
+
+            self.assertEqual(status, 0)
+            self.assertIn("duplicate slot 12", stderr)
+            self.assertIn("1 skipped", stdout)
+            self.assertEqual(bank.decode_patch_message(output.read_bytes())[1], 12)
+
+    def test_missing_directory_is_fatal(self):
+        status, _, stderr = self.run_main(["does-not-exist"])
+        self.assertEqual(status, 2)
+        self.assertIn("not a directory", stderr)
+
+    def test_zero_valid_patches_does_not_replace_output(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "bad.syx").write_bytes(b"bad")
+            output = root / "existing.syx"
+            output.write_bytes(b"keep me")
+
+            status, _, stderr = self.run_main([str(root), "-o", str(output)])
+
+            self.assertEqual(status, 1)
+            self.assertIn("no valid patches", stderr)
+            self.assertEqual(output.read_bytes(), b"keep me")
+
+    def test_atomic_write_failure_is_fatal_and_leaves_destination(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "patch.syx"
+            source.write_bytes(bank.encode_bank_patch(patch_bytes(1), 0))
+            output = root / "bank.syx"
+            output.write_bytes(b"old")
+            with mock.patch.object(bank.os, "replace", side_effect=OSError("replace failed")):
+                status, _, stderr = self.run_main([str(root), "-o", str(output)])
+            self.assertEqual(status, 1)
+            self.assertIn("cannot write", stderr)
+            self.assertEqual(output.read_bytes(), b"old")
+            self.assertEqual(list(root.glob(".bank.syx.*")), [])
 
 
 if __name__ == "__main__":

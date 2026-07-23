@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import argparse
+import os
 import re
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,3 +119,74 @@ def build_bank(
         skipped=len(warnings),
         warnings=tuple(warnings),
     )
+
+
+def atomic_write(output: Path, data: bytes) -> None:
+    output = output.resolve()
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build an MBSID BANK.SYX from single-patch .syx files."
+    )
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("-o", "--output", type=Path, default=Path("BANK.SYX"))
+    parser.add_argument(
+        "--preserve-patch-numbers",
+        action="store_true",
+        help="use each input message's embedded patch number",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not args.directory.is_dir():
+        print(f"error: not a directory: {args.directory}", file=sys.stderr)
+        return 2
+    try:
+        files = discover_syx_files(args.directory, args.output)
+    except OSError as error:
+        print(f"error: cannot read directory {args.directory}: {error}", file=sys.stderr)
+        return 2
+
+    result = build_bank(files, args.preserve_patch_numbers)
+    for warning in result.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    if result.included == 0:
+        print("error: no valid patches; output not written", file=sys.stderr)
+        return 1
+
+    try:
+        atomic_write(args.output, result.data)
+    except OSError as error:
+        print(f"error: cannot write {args.output}: {error}", file=sys.stderr)
+        return 1
+
+    noun = "patch" if result.included == 1 else "patches"
+    print(
+        f"Wrote {args.output}: {result.included} {noun}, "
+        f"{result.skipped} skipped"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
