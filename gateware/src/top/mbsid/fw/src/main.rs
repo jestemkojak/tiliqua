@@ -1,21 +1,21 @@
-// main.rs — MBSID-on-Tiliqua M2 dual-SID firmware (Tasks 5–6).
-//
-// A 1 kHz Timer0 ISR is the whole engine. Each 1 ms tick it:
-//   1. drains the SIDPeripheral MIDI-in CSR FIFO and feeds events to the MBSID
-//      engine (note on/off, pitch bend, CC);
-//   2. ticks the engine (`mbsid_tick`) at the 1 kHz control rate the host oracle
-//      validated against;
-//   3. diffs the L and R register images vs their 32-byte shadows and streams
-//      only the changed `(data<<5)|addr` words to SIDPeripheral (L) and
-//      SIDPeripheral_R (R) respectively (φ2 = 1 MHz reSID each).
-//
-// Derived from `top/sid/fw/src/main.rs` but stripped to the bone: NO menu/opts UI,
-// NO CV modulation, NO per-note SID voice allocation (the engine owns voices),
-// NO display/scope. All real-time work is in the ISR (the VexiiRiscv has no
-// usable mcycle CSR; Timer0 is the only clock — see repo CLAUDE.md).
-
 #![no_std]
 #![no_main]
+
+//! MBSID-on-Tiliqua dual-SID firmware binary.
+//!
+//! A 1 kHz Timer0 ISR is the whole engine. Each 1 ms tick it:
+//!   1. drains the SIDPeripheral MIDI-in CSR FIFO and feeds events to the
+//!      MBSID engine (note on/off, pitch bend, CC);
+//!   2. ticks the engine (`mbsid_tick`) at the 1 kHz control rate the host
+//!      oracle validated against;
+//!   3. diffs the L and R register images vs their 32-byte shadows and
+//!      streams only the changed `(data<<5)|addr` words to SIDPeripheral (L)
+//!      and SIDPeripheral_R (R) respectively (φ2 = 1 MHz reSID each).
+//!
+//! The main loop owns everything else: the menu ([`tiliqua_fw::menu`]), USB
+//! mass storage, flash persistence, and the display. All real-time work is
+//! in the ISR (the VexiiRiscv has no usable mcycle CSR; Timer0 is the only
+//! clock — see repo CLAUDE.md).
 
 use core::cell::RefCell;
 use critical_section::Mutex;
