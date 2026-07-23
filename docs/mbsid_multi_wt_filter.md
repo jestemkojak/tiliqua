@@ -41,8 +41,10 @@ modulation plumbing unfinished; it only manifests as a bug for patches that depe
 
 ## 3. Decision — fix in our firmware/shim, not the vendored engine
 
-The vendored `mios32/` tree is **GPL, gitignored, and re-cloned at a pinned commit by
-`fetch-mios32.sh`**. A raw edit there is invisible to a fresh clone / CI and would require adding
+The vendored `mios32/` tree is licensed "for personal non-commercial use only; all other
+rights reserved" (not GPL — see the mbsid `CLAUDE.md`'s 2026-07-23 correction), gitignored,
+and re-cloned at a pinned commit by `fetch-mios32.sh`. A raw edit there is invisible to a
+fresh clone / CI and would require adding
 a patch-apply mechanism. Per the project preference to avoid modifying the upstream C++ engine
 (stated explicitly on the sibling Lead-retrigger issue), we fix this **entirely in code we own**.
 
@@ -65,7 +67,7 @@ parameter routing rather than inventing new logic.
 
 A 3-line edit to `MbSidSeMulti.cpp` (`+wtAssignLeftRight` extraction and a `parSetWT` override) is
 *more* faithful (runs at the engine's own call site, no timing lag, oracle stays green
-automatically). It was rejected only because it touches the vendored GPL tree and needs a
+automatically). It was rejected only because it touches the vendored tree and needs a
 patch-apply mechanism in `fetch-mios32.sh`. If the project later adopts a vendor-patch workflow,
 this is the cleaner home for the fix.
 

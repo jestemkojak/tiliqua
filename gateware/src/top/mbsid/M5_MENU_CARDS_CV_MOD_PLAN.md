@@ -11,7 +11,8 @@
 ## Global Constraints
 
 - Repo root for all paths below: `gateware/src/top/mbsid/` unless the path starts with `gateware/`.
-- Never edit vendored code under `mios32/` (GPL, gitignored, pinned).
+- Never edit vendored code under `mios32/` (personal non-commercial use only, not GPL;
+  gitignored, pinned).
 - Shim ABI rule: any change to `mbsid_shim.h` signatures updates the Rust FFI (`fw/src/mbsid_sys.rs`) **and both oracle drivers** in the same commit. (This milestone only *adds* entry points.)
 - No f32 math in the Timer0 ISR path; all CV mapping is integer.
 - No new 512-byte buffers in firmware (mainram budget); new tables are `const` (flash).

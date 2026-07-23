@@ -258,7 +258,8 @@ M2 must validate the **R** path before hardware:
   deferred unless needed.
 - **Codec L/R mapping.** Confirm `pmod0.i_cal.payload[0]`/`[1]` map to the intended physical
   L/R output jacks during bring-up (milestone 2 scope check).
-- **GPL** unchanged from M1 (engine linked into firmware → GPL on distribution).
+- **Licensing** unchanged from M1: the vendored engine is "personal non-commercial use only;
+  all other rights reserved," not GPL (see the mbsid `CLAUDE.md`'s 2026-07-23 correction).
 
 ---
 

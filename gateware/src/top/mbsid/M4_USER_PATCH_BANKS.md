@@ -58,7 +58,9 @@ All refs are `mios32/apps/synthesizers/midibox_sid_v3/core/`.
    Dispatch: `cmdPatchWrite` (`:229`) → `MbSidEnvironment::sysexSetPatch` (`:253`).
 2. **`bankSave()` is a stub** returning `-2` (`MbSidEnvironment.cpp:96`) — no upstream
    persistence exists. It is a **non-virtual** method defined inside a vendored `.cpp`:
-   it cannot be overridden, shadowed, or link-replaced without editing GPL vendored code.
+   it cannot be overridden, shadowed, or link-replaced without editing the vendored code
+   (licensed "personal non-commercial use only," not GPL — see the mbsid `CLAUDE.md`'s
+   2026-07-23 correction).
    **Therefore Bank Write persistence must be captured outside the engine** — in firmware
    Rust, which owns the raw byte stream anyway.
 3. **The engine silently "succeeds" on Bank Write**: `sysexSetPatch(toBank=true)` calls

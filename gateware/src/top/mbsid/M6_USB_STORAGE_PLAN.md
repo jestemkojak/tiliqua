@@ -27,7 +27,7 @@ engine (BSD-3), Rust `no_std` firmware (`fw/`), `fatfs` 0.4 (git, no_std), host 
   (spec §1 goal). Every new CSR register/port is behind a constructor flag that defaults off.
 - Never edit files under `gateware/.venv/` (pinned pip `guh`). Write support = vendor
   `guh/engines/msc.py` into `src/vendor/guh_msc/` (BSD-3 header kept), per spec §2/§4b.
-- Never edit vendored `mios32/` C++ (GPL, pinned).
+- Never edit vendored `mios32/` C++ (personal non-commercial use only, not GPL; pinned).
 - **Any `SIDPeripheral`/new-peripheral CSR change requires `pdm mbsid build --pac-only`
   before `--fw-only`** (root CLAUDE.md). The PAC is gitignored/regenerated; CSR changes
   never show in `git status`.

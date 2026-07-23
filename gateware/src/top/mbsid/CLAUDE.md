@@ -53,7 +53,10 @@ is pending, same as the rest of M6.
 
 ## Vendored engine (not in this repo)
 
-The `mios32/` C++ engine tree is **GPL and gitignored** (kept out of the CERN-OHL-S repo).
+The `mios32/` C++ engine tree is licensed **"for personal non-commercial use only; all other
+rights reserved"** (Thorsten Klose / midibox.org — verified per-file in the vendored source,
+e.g. `MbSid.cpp`; NOT GPL, despite older notes in this repo claiming otherwise) and is
+gitignored (kept out of the CERN-OHL-S repo).
 A fresh clone has no `mios32/`, so `pdm mbsid build` fails in `fw/build.rs`. Run
 **`./fetch-mios32.sh`** once after cloning — it blobless-clones `github.com/midibox/mios32`
 (`--filter=blob:none`) and checks out the pinned commit
@@ -191,8 +194,14 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
 - **Drum engine SIGSEGV at t≈4182ms (MASTER clock mode):** `MbSidWtDrum::tick()` dereferences a sentinel pointer `(MbSidDrum*)1` roughly 4.18s after loading a Drum patch with no external MIDI clock. The oracle sequences end before this window; on hardware, use an external MIDI clock or trigger reload before 4s. See `.scratch/mbsid-drum-sigsegv/issue.md`.
 - **`MbSidClock` AUTO mode stays in MIDI-slave mode (WT frozen) until ~4095ms**, then falls back to its internal BPM master clock — same threshold as the Drum SIGSEGV above, but it affects *any* oracle test that needs the WT to actually step (e.g. Multi WT→filter modulation). Stock sequences like `seq_multi.txt` end at ~1200ms and never reach this window, so WT-dependent asserts silently no-op — extend the sequence past ~4.1s locally in the test (don't edit the shared `.txt` file; see `run_oracle.sh`'s A107 block for the pattern) and use a discriminating check (helper disabled → must still FAIL) to rule out false positives from the clock switch itself.
 - **Multi engine: repeating one note on a fixed MIDI channel can alternate L/R in blocks of 3 — by upstream design, not a Tiliqua bug.** Root cause is `MbSidVoiceQueue`/`MbSidSeMulti::voiceGet` (`MbSidSeMulti.cpp:476-491`): when an instrument's `voice_asg` patch param is 0 ("all voices"), every note-on round-robins through all 6 physical oscillators via a least-recently-used queue (voices 0-2 = Left SID, 3-5 = Right, same `physVoice = voice % 3` split as Lead). Retriggering the same note repeatedly therefore cycles 0→1→2→3→4→5→0→…, i.e. 3 notes on L then 3 on R, forever. Reproduced bit-exact on the host oracle (no gateware/shim involved) — confirmed with `pc 60 / ch 0 / on 60 100 / off 60` repeated 6× in a `host_oracle` sequence, gate-on lands on L(v0,v1,v2) then R(v0,v1,v2). Lead is unaffected — it always gates all 6 voices (both SIDs) simultaneously (`MbSidSeLead.cpp:391,428`), no `VoiceQueue` involved. Fix, if ever wanted, is patch-side (`voice_asg` = left-only/right-only instead of all), not firmware.
-- **GPL.** Linking the MBSID C++ into the firmware makes the distributed bitstream firmware
-  GPL (fine for personal/open use).
+- **Licensing correction (2026-07-23): NOT GPL.** Prior notes in this file and in
+  `DESIGN.md`/`README.md`/the M2/M4/M5/M6 docs claimed the vendored MBSID engine was GPL —
+  that was wrong. Every file under `mios32/apps/synthesizers/midibox_sid_v3/core/` and the
+  `mios32/modules/{sid,notestack}` sources it pulls in carries "Licensed for personal
+  non-commercial use only. All other rights reserved." (Copyright Thorsten Klose /
+  midibox.org); `jsw_rand.c` is Public Domain. No file in the tree we compile references the
+  GPL. The implications for redistributing the linked bitstream firmware under this license
+  text have not been reviewed — treat as unresolved, not as "fine for personal/open use."
 - **M4 SysEx path (full design in `M4_USER_PATCH_BANKS.md`):** gateware sideband
   (`forward_sysex` on `MidiDecodeUSB`/`MidiSysexFilter`, opt-in, `top/sid` unaffected)
   → `sysex_read` CSR at offset **`0x24`** on `SIDPeripheral`, a **valid-bit read**

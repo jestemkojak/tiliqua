@@ -65,8 +65,10 @@ multi-timbral MIDI module.
 - **Validated against a host oracle** — the register streams of the on-target engine are
   diffed bit-exact against a PC build of the same C++ core.
 
-The MBSID engine source is **GPL** and is not vendored into this (CERN-OHL-S) repository —
-run `gateware/src/top/mbsid/fetch-mios32.sh` once after cloning to fetch it before building.
+The MBSID engine source (upstream MIOS32/`midibox_sid_v3`) is licensed "for personal
+non-commercial use only; all other rights reserved" and is not vendored into this
+(CERN-OHL-S) repository — run `gateware/src/top/mbsid/fetch-mios32.sh` once after cloning to
+fetch it before building.
 
 # Updates / Community
 
@@ -91,7 +93,8 @@ This project would be nothing without the hard work of many (awesome) open-sourc
 - Some gateware (e.g. I2C state machines) are inherited from the [Glasgow](https://github.com/GlasgowEmbedded/glasgow) project.
 - Audio interface and gateware: my existing [eurorack-pmod](https://github.com/apfaudio/eurorack-pmod) project.
 - SID emulation gateware: [reDIP-SID](https://github.com/daglem/reDIP-SID)
-- MBSID sound engine (GPL, fetched separately): the [MIDIbox / MIOS32](https://github.com/midibox/mios32) project
+- MBSID sound engine (personal non-commercial use only, fetched separately): the
+  [MIDIbox / MIOS32](https://github.com/midibox/mios32) project
 - The "mi-plaits-dsp-rs" project: [mi-plaits-dsp](https://github.com/sourcebox/mi-plaits-dsp-rs)
 - The "pico-dirtyJtag" project forms a big chunk of the RP2040 firmware [pico-dirtyJtag](https://github.com/phdussud/pico-dirtyJtag)
 

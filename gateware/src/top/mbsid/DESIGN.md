@@ -65,7 +65,9 @@ stereo (both images → two SIDs) is the M2/stereo follow-up.
 
 ## 3. Engine subset to vendor (the FFI target)
 
-Vendor from `mios32/apps/synthesizers/midibox_sid_v3/core/` (upstream, GPL):
+Vendor from `mios32/apps/synthesizers/midibox_sid_v3/core/` (upstream; per-file headers say
+"Licensed for personal non-commercial use only. All other rights reserved" — NOT GPL, see the
+mbsid `CLAUDE.md`'s 2026-07-23 licensing correction):
 
 - **Top / Lead:** `MbSid.cpp`, `MbSidEnvironment.cpp`, `MbSidSe.cpp`, `MbSidSeLead.cpp`,
   `MbSidPatch.cpp`, `MbSidTables.cpp`, `MbSidSysEx.cpp` (only for `sysexSetPatch`).
@@ -170,8 +172,10 @@ mechanical regression test, runnable entirely on PC before any FPGA work.
   to `tick()` and mirror it in the ISR.
 - **SoC RAM.** Engine state (patch + per-voice/LFO/env/mod/WT runtime) is a few KB atop
   the UI/framebuffer set; bump `mainram_size` if it overflows.
-- **Licensing.** MBSID is **GPL**; linking the C++ into the bitstream firmware makes that
-  firmware GPL on distribution (fine for personal/open use).
+- **Licensing.** MBSID is licensed "for personal non-commercial use only; all other rights
+  reserved" (per-file headers in the vendored source) — NOT GPL. See the mbsid `CLAUDE.md`'s
+  2026-07-23 licensing correction; the implications for the linked bitstream firmware are
+  unreviewed, not "fine for personal/open use" as previously assumed here.
 
 ---
 

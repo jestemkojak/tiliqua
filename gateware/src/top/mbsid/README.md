@@ -11,7 +11,8 @@ bank ships in the bitstream.
 
 ## Quick start
 
-1. **Fetch the engine** (GPL, not in the repo — one-time step after cloning):
+1. **Fetch the engine** (personal non-commercial use only; not in the repo — one-time step
+   after cloning):
 
    ```sh
    cd gateware/src/top/mbsid
@@ -176,8 +177,8 @@ card (not shown here — see `docs/architecture.md`).
 - **Static constructors** don't auto-run on riscv-rt; `mbsid_run_static_ctors()`
   (called from `mbsid_init()`) walks `.init_array` explicitly — do not remove it
   or the engine boots uninitialised.
-- The vendored engine tree is **GPL** and gitignored; run `./fetch-mios32.sh`
-  after cloning.
+- The vendored engine tree is licensed "for personal non-commercial use only; all other
+  rights reserved" and gitignored; run `./fetch-mios32.sh` after cloning.
 
 ---
 
@@ -261,6 +262,6 @@ that gets saved.
 | `fw/` | RISC-V firmware (engine FFI, MIDI drain, RegDiff, patch menu) |
 | `fw/csrc/` | `mbsid_shim.cpp` + `mios32_shim/` facade headers |
 | `host_oracle/` | x86 oracle: bit-exact diff of shim vs JUCE engine |
-| `fetch-mios32.sh` | One-time vendor checkout (GPL, gitignored) |
+| `fetch-mios32.sh` | One-time vendor checkout (personal non-commercial use only; gitignored) |
 | `DESIGN.md` | Authoritative spec (interfaces, milestones, acceptance) |
 | `CLAUDE.md` | Developer reference and gotchas |
