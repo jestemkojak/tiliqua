@@ -525,10 +525,11 @@ impl UsbMsc {
 }
 
 impl crate::fat::BlockIo for &UsbMsc {
-    fn read_block(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), ()> {
-        UsbMsc::read_block(self, lba, buf).map_err(|_| ())
+    type Error = MscError;
+    fn read_block(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), MscError> {
+        UsbMsc::read_block(self, lba, buf)
     }
-    fn write_block(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), ()> {
-        UsbMsc::write_block(self, lba, buf).map_err(|_| ())
+    fn write_block(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), MscError> {
+        UsbMsc::write_block(self, lba, buf)
     }
 }

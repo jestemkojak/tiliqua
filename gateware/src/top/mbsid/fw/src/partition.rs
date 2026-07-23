@@ -44,9 +44,9 @@ fn looks_like_fat_bpb(blk: &[u8; 512]) -> bool {
 /// `read_block(lba, &mut buf)` must fill `buf` with the 512-byte sector at
 /// `lba`. Any read failure or unrecognised layout falls back to LBA 0 (the
 /// superfloppy assumption), preserving the old behaviour as a safe default.
-pub fn first_partition_lba<F>(mut read_block: F) -> u32
+pub fn first_partition_lba<F, E>(mut read_block: F) -> u32
 where
-    F: FnMut(u32, &mut [u8; 512]) -> Result<(), ()>,
+    F: FnMut(u32, &mut [u8; 512]) -> Result<(), E>,
 {
     let mut blk = [0u8; 512];
     if read_block(0, &mut blk).is_err() {
