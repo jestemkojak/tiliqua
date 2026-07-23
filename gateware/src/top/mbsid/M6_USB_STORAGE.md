@@ -885,6 +885,11 @@ sync Fmax. **Not yet run on real hardware.**
 
 ### 7a. M6a hardware checklist (record results here once hardware is available)
 
+> **2026-07-23:** the probe is now behind the `stack-probe` cargo feature
+> (`fw/Cargo.toml`, default off), not compiled into the shipping firmware.
+> Enable it by editing `default = []` to `default = ["stack-probe"]` and
+> rebuilding with `pdm mbsid build --fw-only`.
+
 Plain checklist, not something executable in this environment — no hardware is available
 here. Walk this in order on a real Tiliqua r5 with a USB-C-to-A adapter and a FAT32 thumb
 drive containing a few `.syx` files under `/MBSID/`:
@@ -929,10 +934,10 @@ drive containing a few `.syx` files under `/MBSID/`:
   headroom**, far tighter than the §6f estimate (+2–3 KB over M4's 4016 B baseline, i.e.
   ~6–7 KB expected) predicted. This is the M6a read-only path; **M6b's export leg (tx_data
   fill loop + FAT write-back cache) has not been measured and will add on top of this** —
-  see the flagged risk in §8 and the now-higher-priority stack-paint item in §7b. The probe
-  is deliberately still present in `fw/src/main.rs` (marked `TEMPORARY`, two blocks — search
-  "end TEMPORARY") to re-use for that §7b measurement; remove both blocks once §7b's number
-  is recorded.
+  see the flagged risk in §8 and the now-higher-priority stack-paint item in §7b. As of
+  2026-07-23 the probe is behind the `stack-probe` cargo feature (default off, see the
+  note at the top of this section) rather than unconditionally compiled in; re-enable it
+  to re-run this measurement.
 
 **M6b — export (write).** Gateware §4b (vendored `guh` MSC engine with SCSI WRITE(10) +
 bulk-OUT `DATA-TX`, `USBMSCPeripheral(with_write=True)`'s `tx_data`/`start_write` CSR pair,
@@ -952,6 +957,14 @@ remeasure for the write leg — HIGH PRIORITY, unplug-mid-write, 50x repeat, qui
 sweep, MIDI round-trip) that haven't been run yet.
 
 ### 7b. M6b hardware checklist (record results here once hardware is available)
+
+> **2026-07-23:** the UART trace and the latched first/last failure snapshots
+> are now behind the `usb-diag` cargo feature (`fw/Cargo.toml`, default off).
+> The outstanding checklist items below are all still runnable — build with
+> `default = ["usb-diag"]` and the `rej=`/`ny=`/`lph=`/`pth=` output format is
+> byte-identical to the round five–seven runs recorded above. `MscDiag`'s two
+> 8-tuple `Cell`s became the named `ReadFailure`/`RejectSnapshot` structs in
+> the same change; field order in the printed lines is unchanged.
 
 Plain checklist, not something executable in this environment — no hardware is available
 here. Walk this in order on a real Tiliqua r5 with a USB-C-to-A adapter and a writable

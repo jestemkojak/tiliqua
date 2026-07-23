@@ -16,7 +16,7 @@ host `cargo test --lib` (138/138, incl. `patch_store`/`sysex_capture`/menu Save-
 `bank_import` whole-bank replace),
 full bitstream
 build with **both** the M6a read path and the M6b write path (TX FIFO + WRITE(10) engine) included,
-`sync` Fmax 64.46 MHz PASS (60 MHz target; round-five build, all five clocks PASS), 22845/24288 (94%) `TRELLIS_COMB`
+`sync` Fmax 65.41 MHz PASS (60 MHz target; round-five build, all five clocks PASS), 23122/24288 (95%) `TRELLIS_COMB`
 (`build/mbsid-r5/top.tim`) — post-route Fmax swings several MHz build-to-build on
 placement-seed noise alone (root `CLAUDE.md`), so treat this exact number as a snapshot, not
 a promise; LUT climbed from M6a's 91% as expected with the write leg added, still comfortably
@@ -274,8 +274,9 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
     probe** (mbsid has no logger/UI wiring at all, unlike `sid_player_sw`'s
     `handlers::logger_init` — the probe talked to `Serial0`/UART0 directly: paint the
     stack region with `0xAA` at boot, scan for the high-water mark every 64 main-loop
-    iterations, log new peaks at 115200 baud; still present in `fw/src/main.rs`, marked
-    `TEMPORARY`, pending the M6b re-measurement below — see `M6_USB_STORAGE.md §7a`).
+    iterations, log new peaks at 115200 baud; now behind the `stack-probe` cargo
+    feature (default off) rather than unconditionally compiled in; enable it per the
+    Build & test section to re-measure — see `M6_USB_STORAGE.md §7a`).
     Triggered by a `Usb` card `Load→Slot` — nearly 6x the
     +2–3 KB (over M4's 4016 B baseline) the plan estimated. **M6b's export path (the
     `tx_data` fill loop + FAT write-back cache) has not yet been measured and stacks on
@@ -487,6 +488,18 @@ Timer0 ISR ─► mbsid_tick(speed_factor) ─► sid_regs_t L image ──► R
   `[tool.pdm.scripts]`). `--fw-only` relinks firmware fast (reuses the bitstream; ends with an
   expected `missing top.bit` after the ELF is built). Flashable archive lands at
   `build/mbsid-r5/*.tar.gz`.
+- **Bring-up diagnostics are cargo features, both default-OFF** (`fw/Cargo.toml`
+  `[features]`): `usb-diag` (UART0 trace of MSC status transitions, per-stage
+  export progress, and the latched first/last read+write failure snapshots —
+  `M6_USB_STORAGE.md` §7b) and `stack-probe` (boot-time 0xAA stack painting +
+  a high-water scan every 64 main-loop iterations — §7a). The build driver
+  (`src/tiliqua/tiliqua_soc.py:533`) runs a bare `cargo build --release` with
+  no `--features` flag and is **shared by all 17 bitstreams — do not modify
+  it**. To turn one on for a session, edit `default = []` in `fw/Cargo.toml`
+  to `default = ["usb-diag"]`, run `pdm mbsid build --fw-only`, and revert
+  before committing. Host-only checks can pass `--features` directly.
+  When `usb-diag` is off, `MscDiag` is a zero-field struct and the failure
+  sites' CSR reads are compiled out entirely — not merely skipped at runtime.
 - Host firmware tests: `cd fw && cargo test --target x86_64-unknown-linux-gnu --lib` (the
   `riscv32` FFI is cfg-stubbed on host; `regdiff` is host-pure).
 - **Oracle (the keystone):** `host_oracle/run_oracle.sh` — builds the engine + shim for x86 and
