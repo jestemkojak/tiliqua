@@ -1,0 +1,5 @@
+# Revisions to skip in `git blame`. Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# style(mbsid-fw): apply rustfmt (format-only, no behaviour change)
+14aa5342b41035cab569a8b0b0512b614f9f2c77
