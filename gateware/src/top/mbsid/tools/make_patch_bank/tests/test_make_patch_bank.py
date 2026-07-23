@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import make_patch_bank as bank
+from tools.make_patch_bank import make_patch_bank as bank
 
 
 def patch_bytes(seed: int) -> bytes:

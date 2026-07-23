@@ -221,7 +221,7 @@ To build a bank from a directory of individual patch dumps, run this from
 `gateware/src/top/mbsid`:
 
 ```console
-python3 make_patch_bank.py path/to/patches
+python3 tools/make_patch_bank/make_patch_bank.py path/to/patches
 ```
 
 Files are naturally sorted by name (`patch2.syx` before `patch10.syx`) and

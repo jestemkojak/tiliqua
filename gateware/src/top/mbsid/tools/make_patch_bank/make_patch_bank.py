@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build an MBSID BANK.SYX from a directory of single-patch SysEx files."""
+"""Build an MBSID BANK.SYX from a directory of single-patch SysEx files.
+
+The module is both directly executable and importable for testing.
+"""
 
 from __future__ import annotations
 
