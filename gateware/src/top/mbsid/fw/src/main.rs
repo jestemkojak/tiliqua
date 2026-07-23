@@ -233,6 +233,155 @@ fn sync_usb_state(usb: &mut Usb, state: &mut MenuState) -> (bool, bool) {
     (drive_present, dirty)
 }
 
+/// Dispatch an encoder turn. Returns `true` if a patch load is needed.
+fn handle_turn(
+    r: TurnResult,
+    state: &mut MenuState,
+    app: &Mutex<RefCell<App>>,
+    settings_dirty_at: &mut Option<u32>,
+) -> bool {
+    match r {
+        TurnResult::Load => return true,
+        TurnResult::Param { ix, value } => {
+            let d = &params::LEAD_PARAMS[ix as usize];
+            let ops = params::write_ops(d, value, |a| mbsid_sys::patch_byte(a));
+            critical_section::with(|_cs| {
+                for (a, v) in ops.iter() {
+                    mbsid_sys::sysex_param(*a, *v);
+                }
+            });
+            state.edited = true;
+        }
+        TurnResult::SettingsChanged => {
+            critical_section::with(|cs| {
+                let mut a = app.borrow_ref_mut(cs);
+                let App { cv, .. } = &mut *a;
+                cv.set_targets(state.cv_targets, &mut EngineSink);
+            });
+            *settings_dirty_at = Some(uptime::now_ms());
+        }
+        TurnResult::None => {}
+    }
+    false
+}
+
+/// Dispatch an encoder press. Returns the new status text, if any.
+/// `PressResult::Cancel` clears the status and is handled by the caller,
+/// which owns the `Status`.
+fn handle_press(
+    r: PressResult,
+    state: &mut MenuState,
+    storage: &mut Storage,
+    usb: &mut Usb,
+    ser: &mut impl core::fmt::Write,
+) -> Option<heapless::String<24>> {
+    match r {
+        PressResult::Toggled | PressResult::Cancel => None,
+        PressResult::Commit(slot) => {
+            // On-device "save as": copy the live patch out under the ISR
+            // guard, then write flash OUTSIDE it (slow).
+            critical_section::with(|_cs| {
+                mbsid_sys::current_patch_raw(&mut storage.patch_buf);
+            });
+            let ok = storage.store.save(slot, &storage.patch_buf).is_ok();
+            if ok {
+                state.edited = false;
+            }
+            Some(status::saved(ok, slot))
+        }
+        PressResult::UsbLoad(ix) => Some(usb_load(
+            &usb.msc,
+            ix as usize,
+            None,
+            &mut storage.store,
+            &mut storage.patch_buf,
+            state,
+            &mut storage.user_detail,
+        )),
+        PressResult::UsbLoadToSlot { file, slot } => Some(usb_load(
+            &usb.msc,
+            file as usize,
+            Some(slot),
+            &mut storage.store,
+            &mut storage.patch_buf,
+            state,
+            &mut storage.user_detail,
+        )),
+        PressResult::UsbImportBank => {
+            // Whole-bank replace from /MBSID/BANK.SYX (spec §4). Runs
+            // synchronously; the frozen menu is the busy signal, same
+            // contract as export. Import writes internal SPI flash only —
+            // no drive writes, so no usb.msc.flush() needed.
+            let outcome = with_fat(&usb.msc, |fs| {
+                bank_import::import_bank(fs, &mut storage.store)
+            });
+            Some(status::imported(outcome))
+        }
+        PressResult::UsbExport { source } => {
+            // Re-enabled 2026-07-14 after the drive-corruption incident was
+            // root-caused and fixed (payload-less WRITE(10) from the CSR
+            // TX-FIFO flush-on-strobe; now strobe-then-fill + deferred
+            // engine start, see M6_USB_STORAGE.md's incident writeup).
+            // Hardware re-tested 2026-07-16: multiple exports produced
+            // byte-correct .SYX files (header/slot/checksum all verified
+            // against the source patch) with no drive damage — permanently
+            // enabled.
+            let (slot, got) = match source {
+                menu::ExportSource::Edit => {
+                    critical_section::with(|_cs| {
+                        mbsid_sys::current_patch_raw(&mut storage.patch_buf);
+                    });
+                    (0u8, true)
+                }
+                menu::ExportSource::Slot(n) => (n, storage.store.load(n, &mut storage.patch_buf)),
+            };
+            let fname = menu::export_name(source);
+            let snap0 = diag::export_begin(ser, &usb.msc, &fname, got);
+            let mounted = core::cell::Cell::new(false);
+            let ok = got
+                && with_fat(&usb.msc, |fs| {
+                    mounted.set(true);
+                    usb_patch::export_patch(fs, &fname, &storage.patch_buf, slot)
+                })
+                .unwrap_or(false);
+            // Commit the drive's volatile cache before reporting success —
+            // the verify read may have been served from cache (round eight
+            // durability fix).
+            let ok = ok && usb.msc.flush().is_ok();
+            diag::export_result(ser, &usb.msc, ok, mounted.get(), &snap0);
+            usb.listed = false; // new file: refresh the list
+            Some(status::exported(ok, &fname))
+        }
+    }
+}
+
+/// Load the patch the menu currently points at, from either an engine ROM
+/// bank or the flash user bank.
+///
+/// `state.lead_loaded` is deliberately NOT touched here — it is resynced
+/// unconditionally at the top of the next loop iteration, which is the only
+/// place that also covers async MIDI Program Change.
+fn do_load(state: &mut MenuState, storage: &mut Storage) {
+    if state.is_user_bank() {
+        if storage.store.load(state.program, &mut storage.patch_buf) {
+            critical_section::with(|_cs| {
+                mbsid_sys::load_patch(&storage.patch_buf);
+            });
+            storage.user_detail = Some(params::patch_detail_bytes(&storage.patch_buf));
+            state.refresh_params(|a| mbsid_sys::patch_byte(a));
+            state.edited = false;
+        } else {
+            storage.user_detail = None; // empty slot: engine untouched
+        }
+    } else {
+        critical_section::with(|_cs| {
+            mbsid_sys::bank_load(state.bank, state.program);
+        });
+        state.refresh_params(|a| mbsid_sys::patch_byte(a));
+        state.edited = false;
+    }
+}
+
 /// CvSink implementation over the engine FFI. Only used inside
 /// critical_section (ISR body, or main-loop blocks under `cs`).
 struct EngineSink;
@@ -593,129 +742,22 @@ fn main() -> ! {
 
             let mut need_load = false;
             if ticks != 0 {
-                match state.on_turn(ticks) {
-                    TurnResult::Load => {
-                        need_load = true;
-                    }
-                    TurnResult::Param { ix, value } => {
-                        let d = &params::LEAD_PARAMS[ix as usize];
-                        let ops = params::write_ops(d, value, |a| mbsid_sys::patch_byte(a));
-                        critical_section::with(|_cs| {
-                            for (a, v) in ops.iter() {
-                                mbsid_sys::sysex_param(*a, *v);
-                            }
-                        });
-                        state.edited = true;
-                    }
-                    TurnResult::SettingsChanged => {
-                        critical_section::with(|cs| {
-                            let mut a = app.borrow_ref_mut(cs);
-                            let App { cv, .. } = &mut *a;
-                            cv.set_targets(state.cv_targets, &mut EngineSink);
-                        });
-                        settings_dirty_at = Some(uptime::now_ms());
-                    }
-                    TurnResult::None => {}
-                }
+                // `on_turn` is called first and its result passed in, rather
+                // than calling it inside handle_turn, so `state` is not
+                // borrowed across both calls.
+                let turn = state.on_turn(ticks);
+                need_load = handle_turn(turn, &mut state, &app, &mut settings_dirty_at);
                 dirty = true;
             }
             if pressed {
                 match state.on_press() {
-                    PressResult::Toggled => {}
-                    PressResult::Cancel => {
-                        status.clear();
-                    }
-                    PressResult::Commit(slot) => {
-                        // On-device "save as": copy the live patch out under
-                        // the ISR guard, then write flash OUTSIDE it (slow).
-                        critical_section::with(|_cs| {
-                            mbsid_sys::current_patch_raw(&mut storage.patch_buf);
-                        });
-                        let ok = storage.store.save(slot, &storage.patch_buf).is_ok();
-                        if ok {
-                            state.edited = false;
+                    PressResult::Cancel => status.clear(),
+                    r => {
+                        if let Some(text) =
+                            handle_press(r, &mut state, &mut storage, &mut usb, &mut diag_serial)
+                        {
+                            status.set(text, uptime::now_ms());
                         }
-                        status.set(status::saved(ok, slot), uptime::now_ms());
-                    }
-                    PressResult::UsbLoad(ix) => {
-                        status.set(
-                            usb_load(
-                                &usb.msc,
-                                ix as usize,
-                                None,
-                                &mut storage.store,
-                                &mut storage.patch_buf,
-                                &mut state,
-                                &mut storage.user_detail,
-                            ),
-                            uptime::now_ms(),
-                        );
-                    }
-                    PressResult::UsbLoadToSlot { file, slot } => {
-                        status.set(
-                            usb_load(
-                                &usb.msc,
-                                file as usize,
-                                Some(slot),
-                                &mut storage.store,
-                                &mut storage.patch_buf,
-                                &mut state,
-                                &mut storage.user_detail,
-                            ),
-                            uptime::now_ms(),
-                        );
-                    }
-                    PressResult::UsbImportBank => {
-                        // Whole-bank replace from /MBSID/BANK.SYX (spec §4).
-                        // Runs synchronously; the frozen menu is the busy
-                        // signal, same contract as export. Import writes
-                        // internal SPI flash only — no drive writes, so no
-                        // usb_msc.flush() needed.
-                        let outcome = with_fat(&usb.msc, |fs| {
-                            bank_import::import_bank(fs, &mut storage.store)
-                        });
-                        status.set(status::imported(outcome), uptime::now_ms());
-                    }
-                    PressResult::UsbExport { source } => {
-                        // Re-enabled 2026-07-14 after the drive-corruption
-                        // incident was root-caused and fixed (payload-less
-                        // WRITE(10) from the CSR TX-FIFO flush-on-strobe; now
-                        // strobe-then-fill + deferred engine start, see
-                        // M6_USB_STORAGE.md's incident writeup). Hardware
-                        // re-tested 2026-07-16: multiple exports produced
-                        // byte-correct .SYX files (header/slot/checksum all
-                        // verified against the source patch) with no drive
-                        // damage — permanently enabled. §7b's stack-paint
-                        // remeasure for this write leg is still outstanding;
-                        // see M6_USB_STORAGE.md §7b/§8.
-                        let (slot, got) = match source {
-                            menu::ExportSource::Edit => {
-                                critical_section::with(|_cs| {
-                                    mbsid_sys::current_patch_raw(&mut storage.patch_buf);
-                                });
-                                (0u8, true)
-                            }
-                            menu::ExportSource::Slot(n) => {
-                                (n, storage.store.load(n, &mut storage.patch_buf))
-                            }
-                        };
-                        let fname = menu::export_name(source);
-                        // Stage-level export trace, usb-diag only.
-                        let snap0 = diag::export_begin(&mut diag_serial, &usb.msc, &fname, got);
-                        let mounted = core::cell::Cell::new(false);
-                        let ok = got
-                            && with_fat(&usb.msc, |fs| {
-                                mounted.set(true);
-                                usb_patch::export_patch(fs, &fname, &storage.patch_buf, slot)
-                            })
-                            .unwrap_or(false);
-                        // Commit the drive's volatile cache before reporting
-                        // success — the verify read may have been served
-                        // from cache (round eight durability fix).
-                        let ok = ok && usb.msc.flush().is_ok();
-                        diag::export_result(&mut diag_serial, &usb.msc, ok, mounted.get(), &snap0);
-                        status.set(status::exported(ok, &fname), uptime::now_ms());
-                        usb.listed = false; // new file: refresh the list
                     }
                 }
                 dirty = true;
@@ -732,28 +774,7 @@ fn main() -> ! {
             }
 
             if need_load {
-                if state.is_user_bank() {
-                    if storage.store.load(state.program, &mut storage.patch_buf) {
-                        critical_section::with(|_cs| {
-                            mbsid_sys::load_patch(&storage.patch_buf);
-                        });
-                        storage.user_detail = Some(params::patch_detail_bytes(&storage.patch_buf));
-                        state.refresh_params(|a| mbsid_sys::patch_byte(a));
-                        state.edited = false;
-                        // lead_loaded/state.lead_loaded resynced unconditionally
-                        // at the top of the next loop iteration.
-                    } else {
-                        storage.user_detail = None; // empty slot: engine untouched
-                    }
-                } else {
-                    critical_section::with(|_cs| {
-                        mbsid_sys::bank_load(state.bank, state.program);
-                    });
-                    state.refresh_params(|a| mbsid_sys::patch_byte(a));
-                    state.edited = false;
-                    // lead_loaded/state.lead_loaded resynced unconditionally
-                    // at the top of the next loop iteration.
-                }
+                do_load(&mut state, &mut storage);
             }
 
             // Persist settings ~2s after the last change (flash wear; §6d).
