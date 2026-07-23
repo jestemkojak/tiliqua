@@ -2,6 +2,9 @@
 
 pub mod bank_import;
 pub mod cv;
+// pac-dependent (reads usb_msc): embedded only.
+#[cfg(not(test))]
+pub mod diag;
 pub mod fat;
 pub mod frame;
 pub mod mbsid_sys;

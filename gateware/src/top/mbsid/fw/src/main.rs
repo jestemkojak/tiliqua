@@ -31,6 +31,7 @@ use tiliqua_pac as pac;
 
 use tiliqua_fw::bank_import;
 use tiliqua_fw::cv::{self, CvSink};
+use tiliqua_fw::diag;
 use tiliqua_fw::fat::{FileSystem, FsOptions, MscStorage};
 use tiliqua_fw::mbsid_sys;
 use tiliqua_fw::menu::PressResult;
@@ -352,33 +353,12 @@ fn main() -> ! {
 
     // Bring-up diagnostics over UART0. mbsid has no logger/UI wiring (unlike
     // sid_player_sw's `handlers::logger_init`), so this talks to Serial0
-    // directly. Shared by the `stack-probe` and `usb-diag` features; built
-    // only when at least one of them is on.
-    #[cfg(any(feature = "stack-probe", feature = "usb-diag"))]
+    // directly. Inert unless `usb-diag`/`stack-probe` is on.
     let mut diag_serial = Serial0::new(peripherals.UART0);
 
-    // Stack high-water measurement (M6_USB_STORAGE.md §7a): paint the region
-    // between the end of .bss and the current stack pointer with a sentinel
-    // byte; the main loop scans for the high-water mark and logs new peaks.
-    #[cfg(feature = "stack-probe")]
-    {
-        unsafe {
-            extern "C" {
-                static _eheap: u8;
-                static _stack_start: u8;
-            }
-            let low = &_eheap as *const u8 as usize;
-            let sp: usize;
-            core::arch::asm!("mv {0}, sp", out(reg) sp);
-            // Leave a safety margin below the live call frame so we don't
-            // clobber locals `main()` has already pushed getting here.
-            let paint_until = sp.saturating_sub(256);
-            if paint_until > low {
-                core::ptr::write_bytes(low as *mut u8, 0xAA, paint_until - low);
-            }
-        }
-        core::fmt::Write::write_str(&mut diag_serial, "\r\nstack-paint probe armed\r\n").ok();
-    }
+    // Stack high-water measurement (M6_USB_STORAGE.md §7a). No-op unless the
+    // `stack-probe` feature is on.
+    diag::stack_paint(&mut diag_serial);
 
     // Engine bring-up + boot patch (unchanged).
     mbsid_sys::init();
@@ -474,14 +454,11 @@ fn main() -> ! {
 
     handler!(timer0 = || timer0_handler(&app));
 
-    // stack-probe state (see the paint block at the top of main()).
-    #[cfg(feature = "stack-probe")]
+    // Bring-up diagnostic state. Inert unless the corresponding cargo
+    // feature is on (see diag.rs).
     let mut stack_probe_max: usize = 0;
-    #[cfg(feature = "stack-probe")]
     let mut stack_probe_ctr: u32 = 0;
-    // Last-seen MSC status, for the usb-diag transition log.
-    #[cfg(feature = "usb-diag")]
-    let mut usb_diag_last: (bool, bool, u16) = (false, false, 0);
+    let mut usb_diag_last = diag::UsbStatusSnap::default();
 
     irq::scope(|s| {
         s.register(Interrupt::TIMER0, timer0);
@@ -489,37 +466,7 @@ fn main() -> ! {
 
         let mut dirty = true; // draw once on startup
         loop {
-            // Scan every 64 iterations (a full-region byte scan every
-            // iteration would be wasteful for a menu-driven loop) and log
-            // only when the high-water mark grows.
-            #[cfg(feature = "stack-probe")]
-            {
-                stack_probe_ctr = stack_probe_ctr.wrapping_add(1);
-                if stack_probe_ctr.is_multiple_of(64) {
-                    unsafe {
-                        extern "C" {
-                            static _eheap: u8;
-                            static _stack_start: u8;
-                        }
-                        let low = &_eheap as *const u8 as usize;
-                        let high = &_stack_start as *const u8 as usize;
-                        let mut addr = low;
-                        while addr < high && *(addr as *const u8) == 0xAA {
-                            addr += 1;
-                        }
-                        let used = high - addr;
-                        if used > stack_probe_max {
-                            stack_probe_max = used;
-                            let mut msg: heapless::String<48> = heapless::String::new();
-                            let _ = core::fmt::Write::write_fmt(
-                                &mut msg,
-                                format_args!("stack peak: {} / {} B\r\n", used, high - low),
-                            );
-                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
-                        }
-                    }
-                }
-            }
+            diag::stack_scan(&mut diag_serial, &mut stack_probe_max, &mut stack_probe_ctr);
 
             encoder.update();
             let ticks = encoder.poke_ticks();
@@ -571,30 +518,7 @@ fn main() -> ! {
             // `connected()` is the persistent enumeration flag instead.
             let drive_present =
                 state.usb_storage && usb_msc.connected() && usb_msc.block_size() == 512;
-            // Log MSC status transitions over UART0. A watchdog reset /
-            // re-enumeration cycle shows up here as conn/rdy flapping;
-            // steady state should print once and go quiet (constant
-            // drive-LED blinking otherwise unexplained).
-            #[cfg(feature = "usb-diag")]
-            {
-                let snap = (usb_msc.connected(), usb_msc.ready(), usb_msc.block_size());
-                if snap != usb_diag_last {
-                    usb_diag_last = snap;
-                    let mut msg: heapless::String<80> = heapless::String::new();
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut msg,
-                        format_args!(
-                            "usb: conn={} rdy={} bs={} spd={} t={}ms\r\n",
-                            snap.0 as u8,
-                            snap.1 as u8,
-                            snap.2,
-                            usb_msc.speed(),
-                            uptime::now_ms()
-                        ),
-                    );
-                    core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
-                }
-            }
+            diag::usb_status(&mut diag_serial, &usb_msc, &mut usb_diag_last);
             // Idle keepalive: the MSC engine's watchdog (vendor msc.py) is
             // handshake-fed since round seven — any ACK/NAK/NYET holds it
             // cleared — but an IDLE bus produces no handshakes at all (SOFs
@@ -740,35 +664,7 @@ fn main() -> ! {
                         };
                         let fname = menu::export_name(source);
                         // Stage-level export trace, usb-diag only.
-                        #[cfg(feature = "usb-diag")]
-                        let snap0 = {
-                            let d = &usb_msc.diag;
-                            d.begin(); // capture FIRST failure of this attempt
-                            let snap0 = (
-                                d.rd.get(),
-                                d.rd_err.get(),
-                                d.wr.get(),
-                                d.wr_ok.get(),
-                                d.wr_notready.get(),
-                                d.wr_resp_err.get(),
-                                d.wr_timeout.get(),
-                                d.wr_conn_lost.get(),
-                            );
-                            let mut msg: heapless::String<96> = heapless::String::new();
-                            let _ = core::fmt::Write::write_fmt(
-                                &mut msg,
-                                format_args!(
-                                    "export: begin {} got={} rdy={} conn={} bs={}\r\n",
-                                    fname,
-                                    got as u8,
-                                    usb_msc.ready() as u8,
-                                    usb_msc.connected() as u8,
-                                    usb_msc.block_size()
-                                ),
-                            );
-                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
-                            snap0
-                        };
+                        let snap0 = diag::export_begin(&mut diag_serial, &usb_msc, &fname, got);
                         let mounted = core::cell::Cell::new(false);
                         let ok = got
                             && with_fat(&usb_msc, |fs| {
@@ -780,108 +676,7 @@ fn main() -> ! {
                         // success — the verify read may have been served
                         // from cache (round eight durability fix).
                         let ok = ok && usb_msc.flush().is_ok();
-                        #[cfg(feature = "usb-diag")]
-                        {
-                            let d = &usb_msc.diag;
-                            {
-                                let mut msg: heapless::String<320> = heapless::String::new();
-                                let _ = core::fmt::Write::write_fmt(
-                                    &mut msg,
-                                    format_args!(
-                                        "export: ok={} mount={} d_rd={} d_rderr={} d_wr={} \
-                                         d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} d_wrconn={} \
-                                         spins={} wms={}\r\n",
-                                        ok as u8,
-                                        mounted.get() as u8,
-                                        d.rd.get().wrapping_sub(snap0.0),
-                                        d.rd_err.get().wrapping_sub(snap0.1),
-                                        d.wr.get().wrapping_sub(snap0.2),
-                                        d.wr_ok.get().wrapping_sub(snap0.3),
-                                        d.wr_notready.get().wrapping_sub(snap0.4),
-                                        d.wr_resp_err.get().wrapping_sub(snap0.5),
-                                        d.wr_timeout.get().wrapping_sub(snap0.6),
-                                        d.wr_conn_lost.get().wrapping_sub(snap0.7),
-                                        d.wr_spins_last.get(),
-                                        d.wr_ms_last.get()
-                                    ),
-                                );
-                                let (cs, cr) = d.wr_csw.get();
-                                let (rr, rp, rt, rn, rl) = d.wr_reject.get();
-                                let (fcs, fcr) = d.wr_csw_first.get();
-                                let (frr, frp, frt, frn, frl) = d.wr_reject_first.get();
-                                let (sv, sk, sa, sq) = usb_msc.sense_info();
-                                let _ = core::fmt::Write::write_fmt(
-                                    &mut msg,
-                                    format_args!(
-                                        "export: first csw={}/{} rej={}/{}/{} ny={} lph={} \
-                                         last csw={}/{} rej={}/{}/{} ny={} lph={}\r\n\
-                                         export: sense valid={} key={:x} asc={:02x} ascq={:02x}\r\n",
-                                        fcs,
-                                        fcr,
-                                        frr,
-                                        frp,
-                                        frt,
-                                        frn,
-                                        frl,
-                                        cs,
-                                        cr,
-                                        rr,
-                                        rp,
-                                        rt,
-                                        rn,
-                                        rl,
-                                        sv as u8,
-                                        sk,
-                                        sa,
-                                        sq
-                                    ),
-                                );
-                                core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
-                            }
-                            {
-                                // Round-six read-failure diag: reason 1=notready
-                                // 2=resp_err 3=deadline 4=conn_lost, at word w of
-                                // lba, after sp spins; rej/ny/lph = reject_info
-                                // CSR snapshot at the failure.
-                                let f1 = d.rd_fail_first.get();
-                                let f2 = d.rd_fail.get();
-                                let path1 = d.rd_path_first.get();
-                                let path2 = d.rd_path.get();
-                                let ms1 = d.rd_ms_first.get();
-                                let ms2 = d.rd_ms.get();
-                                let mut msg: heapless::String<256> = heapless::String::new();
-                                let _ = core::fmt::Write::write_fmt(
-                                    &mut msg,
-                                    format_args!(
-                                        "export: rd1 rsn={} w={} lba={} sp={} ms={} \
-                                         rej={}/{} ny={} lph={} pth={:08x}\r\n\
-                                         export: rdL rsn={} w={} lba={} sp={} ms={} \
-                                         rej={}/{} ny={} lph={} pth={:08x}\r\n",
-                                        f1.reason,
-                                        f1.word,
-                                        f1.lba,
-                                        f1.spins,
-                                        ms1,
-                                        f1.reject.response,
-                                        f1.reject.phase,
-                                        f1.reject.nyets,
-                                        f1.reject.last_phase,
-                                        path1,
-                                        f2.reason,
-                                        f2.word,
-                                        f2.lba,
-                                        f2.spins,
-                                        ms2,
-                                        f2.reject.response,
-                                        f2.reject.phase,
-                                        f2.reject.nyets,
-                                        f2.reject.last_phase,
-                                        path2
-                                    ),
-                                );
-                                core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
-                            }
-                        }
+                        diag::export_result(&mut diag_serial, &usb_msc, ok, mounted.get(), &snap0);
                         status.set(status::exported(ok, &fname), uptime::now_ms());
                         usb_listed = false; // new file: refresh the list
                     }
