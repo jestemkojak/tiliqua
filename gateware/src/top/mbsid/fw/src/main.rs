@@ -159,6 +159,15 @@ struct Usb {
     keepalive_at: u32,
 }
 
+/// Display, its diff-painter, and the encoder — everything the UI touches
+/// each frame. `Persist0` is deliberately not here: it is configured once at
+/// init and never read again.
+struct Ui {
+    display: DMAFramebuffer0,
+    painter: menu::Painter,
+    encoder: Encoder0,
+}
+
 /// Derive USB state from live hardware, every iteration (M5 lesson).
 /// Returns `(drive_present, dirty)`.
 ///
@@ -380,6 +389,136 @@ fn do_load(state: &mut MenuState, storage: &mut Storage) {
         state.refresh_params(|a| mbsid_sys::patch_byte(a));
         state.edited = false;
     }
+}
+
+/// Repaint the menu. Also applies the menu's MIDI-source and USB-mode
+/// selections to the gateware: both are unconditional/idempotent CSR writes,
+/// cheap enough to run every redraw, no change-tracking needed (mirrors
+/// top/sid's identical call).
+fn render(
+    ui: &mut Ui,
+    sid: &pac::SID_PERIPH,
+    state: &MenuState,
+    storage: &mut Storage,
+    usb: &Usb,
+    status: &Status,
+    drive_present: bool,
+) {
+    sid.usb_midi_host().write(|w| unsafe {
+        w.host()
+            .bit(state.midi_src == menu::MidiSource::Usb && !state.usb_storage)
+    });
+    usb.msc.set_mode(state.usb_storage);
+
+    let mut namebuf = [0u8; 17];
+    let name_ok;
+    if state.is_user_bank() {
+        let mut n16 = [0u8; 16];
+        name_ok = storage.store.name(state.program, &mut n16);
+        namebuf[..16].copy_from_slice(&n16);
+        namebuf[16] = 0;
+        if !name_ok {
+            namebuf[0] = 0;
+        }
+    } else {
+        mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
+        name_ok = true;
+    }
+    let name = if name_ok {
+        menu::name_from_cstr(&namebuf)
+    } else {
+        "Empty"
+    };
+
+    // Fetch engine type + voice flags. USER bank uses the last successfully
+    // loaded slot's cached detail (the shim's ROM-bank cache can't answer for
+    // user slots); ROM banks read directly (read-only, no ISR guard needed).
+    // None => show "---" rather than a stale/default Lead/Mono label.
+    let detail = if state.is_user_bank() {
+        storage.user_detail
+    } else {
+        mbsid_sys::bank_patch_info(state.bank, state.program)
+    }
+    .map(|(eng, vfl)| menu::patch_detail(eng, vfl));
+
+    // Save-row preview: name of the slot under the cursor.
+    let mut savebuf = [0u8; 16];
+    let save_name: Option<&str> = if state.save_cursor >= 0
+        && storage.store.name(state.save_cursor as u8, &mut savebuf)
+    {
+        core::str::from_utf8(&savebuf).ok()
+    } else {
+        None
+    };
+
+    // Usb card detail: drive/file/slot names, built only while the card is
+    // focused (borrows usb.files/slotbuf).
+    let mut slotbuf = [0u8; 16];
+    let usb_info = if state.card == menu::Card::Usb {
+        let slot_name: Option<&str> = if state.usb_slot >= 0
+            && storage.store.name(state.usb_slot as u8, &mut slotbuf)
+        {
+            core::str::from_utf8(&slotbuf).ok()
+        } else {
+            None
+        };
+        Some(UsbInfo {
+            drive: if drive_present {
+                DriveState::Ready
+            } else {
+                DriveState::NoDrive
+            },
+            file_name: if state.usb_file >= 0 {
+                usb.files.get(state.usb_file as usize).map(|n| n.as_str())
+            } else {
+                None
+            },
+            file_count: state.usb_file_count,
+            slot_name,
+        })
+    } else {
+        None
+    };
+
+    // Diff-paint: blitter-only, erases stale glyphs by re-blitting old text
+    // at intensity 0 — no rectangle fill, no visible wipe (see menu::Painter).
+    let frame = menu::build_frame(
+        state,
+        name,
+        detail,
+        save_name,
+        status.as_deref(),
+        state.lead_loaded,
+        usb_info.as_ref(),
+        MENU_X,
+        MENU_Y,
+    );
+    ui.painter.paint(&mut ui.display, frame, MENU_HUE).ok();
+}
+
+/// Persist menu settings ~2 s after the last change (flash wear; M5 §6d).
+/// Skipped entirely if nothing actually changed.
+fn persist_settings(
+    state: &MenuState,
+    storage: &mut Storage,
+    window_start: u32,
+    last_saved: &mut settings_store::Settings,
+    dirty_at: &mut Option<u32>,
+) {
+    let Some(t0) = *dirty_at else { return };
+    if !uptime::deadline_expired(t0, uptime::now_ms(), 2000) {
+        return;
+    }
+    let s = settings_store::Settings {
+        midi_src: (state.midi_src == menu::MidiSource::Usb) as u8,
+        cv_targets: state.cv_targets.map(|t| t.to_u8()),
+        usb_mode: state.usb_storage as u8,
+    };
+    if s != *last_saved {
+        let _ = settings_store::save(storage.store.flash_mut(), window_start, &s);
+        *last_saved = s;
+    }
+    *dirty_at = None;
 }
 
 /// CvSink implementation over the engine FFI. Only used inside
@@ -607,7 +746,6 @@ fn main() -> ! {
     // Engine bring-up + boot patch (unchanged).
     mbsid_sys::init();
     mbsid_sys::program_change(BOOT_PATCH_INDEX);
-    let mut lead_loaded = mbsid_sys::current_engine() == 0;
 
     let mut i2cdev1 = I2c1::new(peripherals.I2C1);
     let mut pmod = EurorackPmod0::new(peripherals.PMOD0_PERIPH);
@@ -639,7 +777,11 @@ fn main() -> ! {
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
     persist.set_persistence(MENU_PERSIST);
 
-    let mut encoder = Encoder0::new(peripherals.ENCODER0);
+    let mut ui = Ui {
+        display,
+        painter: menu::Painter::new(),
+        encoder: Encoder0::new(peripherals.ENCODER0),
+    };
 
     let spiflash = SPIFlash0::new(peripherals.SPIFLASH_CTRL, SPIFLASH_BASE, SPIFLASH_SZ_BYTES);
     let mut storage = Storage {
@@ -651,8 +793,7 @@ fn main() -> ! {
 
     // Total banks = engine ROM banks + the flash User bank (always last).
     let mut state = MenuState::new(mbsid_sys::bank_count() + 1, 0, BOOT_PATCH_INDEX);
-    let mut painter = menu::Painter::new();
-    state.lead_loaded = lead_loaded;
+    state.lead_loaded = mbsid_sys::current_engine() == 0;
     state.refresh_params(|a| mbsid_sys::patch_byte(a));
 
     // Load persisted settings (MIDI source, CV target assignments) from the
@@ -712,9 +853,9 @@ fn main() -> ! {
         loop {
             diag::stack_scan(&mut diag_serial, &mut stack_probe_max, &mut stack_probe_ctr);
 
-            encoder.update();
-            let ticks = encoder.poke_ticks();
-            let pressed = encoder.poke_btn();
+            ui.encoder.update();
+            let ticks = ui.encoder.poke_ticks();
+            let pressed = ui.encoder.poke_btn();
 
             // Resync unconditionally every iteration: an inbound MIDI Program
             // Change (timer0_handler, async w.r.t. menu navigation) can swap
@@ -722,16 +863,9 @@ fn main() -> ! {
             // below. Without this, `state.lead_loaded` can go stale between
             // two `on_turn` calls and PatchEdit's row_count()/on_turn would
             // treat a non-Lead patch as Lead, re-opening the byte-offset
-            // corruption the prior fix closed. Cheap point-read of engine
-            // .bss (same acceptable-staleness idiom as patch_byte/
-            // current_engine elsewhere in this crate).
-            lead_loaded = mbsid_sys::current_engine() == 0;
-            state.lead_loaded = lead_loaded;
+            // corruption the prior fix closed.
+            state.lead_loaded = mbsid_sys::current_engine() == 0;
 
-            // Auto-clear a stale status message after status::TTL_MS so e.g.
-            // "Loaded -> U00x" doesn't linger across unrelated navigation
-            // (it used to only clear on Cancel). Checked every iteration,
-            // same resync-every-loop shape as lead_loaded above.
             if status.expire(uptime::now_ms()) {
                 dirty = true;
             }
@@ -742,9 +876,6 @@ fn main() -> ! {
 
             let mut need_load = false;
             if ticks != 0 {
-                // `on_turn` is called first and its result passed in, rather
-                // than calling it inside handle_turn, so `state` is not
-                // borrowed across both calls.
                 let turn = state.on_turn(ticks);
                 need_load = handle_turn(turn, &mut state, &app, &mut settings_dirty_at);
                 dirty = true;
@@ -777,118 +908,26 @@ fn main() -> ! {
                 do_load(&mut state, &mut storage);
             }
 
-            // Persist settings ~2s after the last change (flash wear; §6d).
-            if let (Some(t0), Some(ref w)) = (settings_dirty_at, opt_window.as_ref()) {
-                if uptime::now_ms().wrapping_sub(t0) >= 2000 {
-                    let s = settings_store::Settings {
-                        midi_src: (state.midi_src == menu::MidiSource::Usb) as u8,
-                        cv_targets: state.cv_targets.map(|t| t.to_u8()),
-                        usb_mode: state.usb_storage as u8,
-                    };
-                    if s != last_saved {
-                        let _ = settings_store::save(storage.store.flash_mut(), w.start, &s);
-                        last_saved = s;
-                    }
-                    settings_dirty_at = None;
-                }
+            if let Some(ref w) = opt_window {
+                persist_settings(
+                    &state,
+                    &mut storage,
+                    w.start,
+                    &mut last_saved,
+                    &mut settings_dirty_at,
+                );
             }
 
             if dirty {
-                // Apply the menu's MIDI source selection. Unconditional/
-                // idempotent (mirrors top/sid's identical call) — cheap
-                // enough to run every redraw, no change-tracking needed.
-                sid.usb_midi_host().write(|w| unsafe {
-                    w.host()
-                        .bit(state.midi_src == menu::MidiSource::Usb && !state.usb_storage)
-                });
-                usb.msc.set_mode(state.usb_storage);
-
-                let mut namebuf = [0u8; 17];
-                let name_ok;
-                if state.is_user_bank() {
-                    let mut n16 = [0u8; 16];
-                    name_ok = storage.store.name(state.program, &mut n16);
-                    namebuf[..16].copy_from_slice(&n16);
-                    namebuf[16] = 0;
-                    if !name_ok {
-                        namebuf[0] = 0;
-                    }
-                } else {
-                    mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
-                    name_ok = true;
-                }
-                let name = if name_ok {
-                    menu::name_from_cstr(&namebuf)
-                } else {
-                    "Empty"
-                };
-
-                // Fetch engine type + voice flags. USER bank uses the last
-                // successfully loaded slot's cached detail (the shim's ROM-
-                // bank cache can't answer for user slots); ROM banks read
-                // directly (read-only, no ISR guard needed). None => show
-                // "---" rather than a stale/default Lead/Mono label.
-                let detail = if state.is_user_bank() {
-                    storage.user_detail
-                } else {
-                    mbsid_sys::bank_patch_info(state.bank, state.program)
-                }
-                .map(|(eng, vfl)| menu::patch_detail(eng, vfl));
-
-                // Save-row preview: name of the slot under the cursor.
-                let mut savebuf = [0u8; 16];
-                let save_name: Option<&str> = if state.save_cursor >= 0
-                    && storage.store.name(state.save_cursor as u8, &mut savebuf)
-                {
-                    core::str::from_utf8(&savebuf).ok()
-                } else {
-                    None
-                };
-
-                // Usb card detail: drive/file/slot names, built only while
-                // the card is focused (borrows usb_files/slotbuf).
-                let mut slotbuf = [0u8; 16];
-                let usb_info = if state.card == menu::Card::Usb {
-                    let slot_name: Option<&str> = if state.usb_slot >= 0
-                        && storage.store.name(state.usb_slot as u8, &mut slotbuf)
-                    {
-                        core::str::from_utf8(&slotbuf).ok()
-                    } else {
-                        None
-                    };
-                    Some(UsbInfo {
-                        drive: if drive_present {
-                            DriveState::Ready
-                        } else {
-                            DriveState::NoDrive
-                        },
-                        file_name: if state.usb_file >= 0 {
-                            usb.files.get(state.usb_file as usize).map(|n| n.as_str())
-                        } else {
-                            None
-                        },
-                        file_count: state.usb_file_count,
-                        slot_name,
-                    })
-                } else {
-                    None
-                };
-
-                // Diff-paint: blitter-only, erases stale glyphs by re-blitting
-                // old text at intensity 0 — no rectangle fill, no visible wipe
-                // (see menu::Painter).
-                let frame = menu::build_frame(
+                render(
+                    &mut ui,
+                    &sid,
                     &state,
-                    name,
-                    detail,
-                    save_name,
-                    status.as_deref(),
-                    lead_loaded,
-                    usb_info.as_ref(),
-                    MENU_X,
-                    MENU_Y,
+                    &mut storage,
+                    &usb,
+                    &status,
+                    drive_present,
                 );
-                painter.paint(&mut display, frame, MENU_HUE).ok();
                 dirty = false;
             }
         }
