@@ -20,6 +20,16 @@ pub fn payload_checksum(data: &[u8; 512]) -> u16 {
     data.iter().fold(0u16, |a, &b| a.wrapping_add(b as u16))
 }
 
+/// Why a `save`/`erase_slot` failed. `SlotOutOfRange` replaces the former
+/// `assert!(slot < N_SLOTS)` — an out-of-range slot used to panic (and, under
+/// `panic-halt` on riscv32, silently brick the synth); it now returns an error
+/// the caller can surface. `Flash(E)` wraps the underlying NOR driver error.
+#[derive(Debug)]
+pub enum SaveError<E> {
+    SlotOutOfRange,
+    Flash(E),
+}
+
 pub struct UserPatchStore<F> {
     flash: F,
     base: u32,
@@ -83,27 +93,33 @@ impl<F: NorFlash + ReadNorFlash> UserPatchStore<F> {
             .is_ok()
     }
 
-    pub fn save(&mut self, slot: u8, patch: &[u8; 512]) -> Result<(), F::Error> {
-        assert!(slot < N_SLOTS);
+    pub fn save(&mut self, slot: u8, patch: &[u8; 512]) -> Result<(), SaveError<F::Error>> {
+        if slot >= N_SLOTS {
+            return Err(SaveError::SlotOutOfRange);
+        }
         let a = self.slot_addr(slot);
-        self.flash.erase(a, a + SLOT_SIZE)?;
+        self.flash.erase(a, a + SLOT_SIZE).map_err(SaveError::Flash)?;
         // Payload first; header LAST — the header is the commit point, so an
         // interrupted save can never validate.
-        self.flash.write(a + HEADER_LEN, patch)?;
+        self.flash
+            .write(a + HEADER_LEN, patch)
+            .map_err(SaveError::Flash)?;
         let mut hdr = [0u8; HEADER_LEN as usize];
         hdr[0..4].copy_from_slice(&MAGIC);
         hdr[4] = VERSION;
         hdr[5] = 0;
         hdr[6..8].copy_from_slice(&payload_checksum(patch).to_le_bytes());
-        self.flash.write(a, &hdr)
+        self.flash.write(a, &hdr).map_err(SaveError::Flash)
     }
 
     /// Erase `slot` so it reads as empty — the replace-semantics wipe for
     /// bank import (slots the imported file doesn't provide).
-    pub fn erase_slot(&mut self, slot: u8) -> Result<(), F::Error> {
-        assert!(slot < N_SLOTS);
+    pub fn erase_slot(&mut self, slot: u8) -> Result<(), SaveError<F::Error>> {
+        if slot >= N_SLOTS {
+            return Err(SaveError::SlotOutOfRange);
+        }
         let a = self.slot_addr(slot);
-        self.flash.erase(a, a + SLOT_SIZE)
+        self.flash.erase(a, a + SLOT_SIZE).map_err(SaveError::Flash)
     }
 }
 
@@ -287,5 +303,22 @@ mod tests {
         let f = s.into_inner();
         let a = SLOT_SIZE as usize;
         assert!(f.mem[a..2 * a].iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn save_out_of_range_returns_error_not_panic() {
+        let mut s = UserPatchStore::new(MockFlash::new(), 0);
+        assert!(matches!(
+            s.save(N_SLOTS, &test_patch(1)),
+            Err(SaveError::SlotOutOfRange)
+        ));
+        assert!(matches!(
+            s.save(200, &test_patch(1)),
+            Err(SaveError::SlotOutOfRange)
+        ));
+        assert!(matches!(
+            s.erase_slot(N_SLOTS),
+            Err(SaveError::SlotOutOfRange)
+        ));
     }
 }
