@@ -78,7 +78,7 @@ cd gateware/src/top/mbsid/fw
 cargo test --target x86_64-unknown-linux-gnu --lib
 ```
 
-138 tests: regdiff, patch store, SysEx capture, menu state machine, frame
+155 tests: regdiff, patch store, SysEx capture, menu state machine, frame
 diff/painter, param encodings, CV quantizer, USB patch list/load/export
 (`usb_patch`: `encode_syx`/`export_patch` round-trip, FAT-image fixtures),
 the menu's USB card (including the M6b `Export` and `Import` rows),
