@@ -168,6 +168,24 @@ pub enum MscError {
     WriteError,
 }
 
+impl MscError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MscError::NotReady => "not ready",
+            MscError::ReadError => "read error",
+            MscError::WriteError => "write error",
+        }
+    }
+}
+
+impl core::fmt::Display for MscError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::error::Error for MscError {}
+
 impl UsbMsc {
     pub fn new(regs: pac::USB_MSC) -> Self {
         Self {
