@@ -1129,7 +1129,7 @@ mod tests {
         assert!(fr.items[0].text.starts_with("MBSID"));
         assert!(fr.items[0].bright);                    // title always bright
         assert!(fr.items[1].bright);                    // Card row focused (default)
-        assert!(fr.items[1].text.contains("> Card"));   // nav marker on focus
+        assert!(fr.items[1].text.contains("> Menu"));   // nav marker on focus
         assert!(!fr.items[2].bright);                   // Bank unfocused -> dim
         assert!(fr.items[3].text.contains("Program  005  TestPatch"));
         assert!(!fr.items[7].bright);                   // detail row always dim
