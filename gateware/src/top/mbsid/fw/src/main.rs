@@ -503,7 +503,8 @@ fn main() -> ! {
     let mut stack_probe_max: usize = 0;
     #[cfg(feature = "stack-probe")]
     let mut stack_probe_ctr: u32 = 0;
-    // TEMPORARY M6b diag: last-seen MSC status for transition logging.
+    // Last-seen MSC status, for the usb-diag transition log.
+    #[cfg(feature = "usb-diag")]
     let mut usb_diag_last: (bool, bool, u16) = (false, false, 0);
 
     irq::scope(|s| {
@@ -596,10 +597,11 @@ fn main() -> ! {
             // `connected()` is the persistent enumeration flag instead.
             let drive_present =
                 state.usb_storage && usb_msc.connected() && usb_msc.block_size() == 512;
-            // --- TEMPORARY M6b diag: log MSC status transitions over UART0.
-            // A watchdog reset / re-enumeration cycle shows up here as
-            // conn/rdy flapping; steady state should print once and go quiet
-            // (constant drive-LED blinking otherwise unexplained).
+            // Log MSC status transitions over UART0. A watchdog reset /
+            // re-enumeration cycle shows up here as conn/rdy flapping;
+            // steady state should print once and go quiet (constant
+            // drive-LED blinking otherwise unexplained).
+            #[cfg(feature = "usb-diag")]
             {
                 let snap = (usb_msc.connected(), usb_msc.ready(), usb_msc.block_size());
                 if snap != usb_diag_last {
@@ -619,7 +621,6 @@ fn main() -> ! {
                     core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
                 }
             }
-            // --- end TEMPORARY --------------------------------------------
             // Idle keepalive: the MSC engine's watchdog (vendor msc.py) is
             // handshake-fed since round seven — any ACK/NAK/NYET holds it
             // cleared — but an IDLE bus produces no handshakes at all (SOFs
@@ -786,20 +787,21 @@ fn main() -> ! {
                                 format_args!("P{:03}.SYX", n),
                             ),
                         };
-                        // --- TEMPORARY M6b diag: stage-level export trace ---
-                        let d = &usb_msc.diag;
-                        d.begin(); // capture FIRST failure of this attempt
-                        let snap0 = (
-                            d.rd.get(),
-                            d.rd_err.get(),
-                            d.wr.get(),
-                            d.wr_ok.get(),
-                            d.wr_notready.get(),
-                            d.wr_resp_err.get(),
-                            d.wr_timeout.get(),
-                            d.wr_conn_lost.get(),
-                        );
-                        {
+                        // Stage-level export trace, usb-diag only.
+                        #[cfg(feature = "usb-diag")]
+                        let snap0 = {
+                            let d = &usb_msc.diag;
+                            d.begin(); // capture FIRST failure of this attempt
+                            let snap0 = (
+                                d.rd.get(),
+                                d.rd_err.get(),
+                                d.wr.get(),
+                                d.wr_ok.get(),
+                                d.wr_notready.get(),
+                                d.wr_resp_err.get(),
+                                d.wr_timeout.get(),
+                                d.wr_conn_lost.get(),
+                            );
                             let mut msg: heapless::String<96> = heapless::String::new();
                             let _ = core::fmt::Write::write_fmt(
                                 &mut msg,
@@ -813,7 +815,8 @@ fn main() -> ! {
                                 ),
                             );
                             core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
-                        }
+                            snap0
+                        };
                         let mounted = core::cell::Cell::new(false);
                         let ok = got
                             && with_fat(&usb_msc, |fs| {
@@ -825,105 +828,108 @@ fn main() -> ! {
                         // success — the verify read may have been served
                         // from cache (round eight durability fix).
                         let ok = ok && usb_msc.flush().is_ok();
+                        #[cfg(feature = "usb-diag")]
                         {
-                            let mut msg: heapless::String<320> = heapless::String::new();
-                            let _ = core::fmt::Write::write_fmt(
-                                &mut msg,
-                                format_args!(
-                                    "export: ok={} mount={} d_rd={} d_rderr={} d_wr={} \
-                                     d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} d_wrconn={} \
-                                     spins={} wms={}\r\n",
-                                    ok as u8,
-                                    mounted.get() as u8,
-                                    d.rd.get().wrapping_sub(snap0.0),
-                                    d.rd_err.get().wrapping_sub(snap0.1),
-                                    d.wr.get().wrapping_sub(snap0.2),
-                                    d.wr_ok.get().wrapping_sub(snap0.3),
-                                    d.wr_notready.get().wrapping_sub(snap0.4),
-                                    d.wr_resp_err.get().wrapping_sub(snap0.5),
-                                    d.wr_timeout.get().wrapping_sub(snap0.6),
-                                    d.wr_conn_lost.get().wrapping_sub(snap0.7),
-                                    d.wr_spins_last.get(),
-                                    d.wr_ms_last.get()
-                                ),
-                            );
-                            let (cs, cr) = d.wr_csw.get();
-                            let (rr, rp, rt, rn, rl) = d.wr_reject.get();
-                            let (fcs, fcr) = d.wr_csw_first.get();
-                            let (frr, frp, frt, frn, frl) = d.wr_reject_first.get();
-                            let (sv, sk, sa, sq) = usb_msc.sense_info();
-                            let _ = core::fmt::Write::write_fmt(
-                                &mut msg,
-                                format_args!(
-                                    "export: first csw={}/{} rej={}/{}/{} ny={} lph={} \
-                                     last csw={}/{} rej={}/{}/{} ny={} lph={}\r\n\
-                                     export: sense valid={} key={:x} asc={:02x} ascq={:02x}\r\n",
-                                    fcs,
-                                    fcr,
-                                    frr,
-                                    frp,
-                                    frt,
-                                    frn,
-                                    frl,
-                                    cs,
-                                    cr,
-                                    rr,
-                                    rp,
-                                    rt,
-                                    rn,
-                                    rl,
-                                    sv as u8,
-                                    sk,
-                                    sa,
-                                    sq
-                                ),
-                            );
-                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
+                            let d = &usb_msc.diag;
+                            {
+                                let mut msg: heapless::String<320> = heapless::String::new();
+                                let _ = core::fmt::Write::write_fmt(
+                                    &mut msg,
+                                    format_args!(
+                                        "export: ok={} mount={} d_rd={} d_rderr={} d_wr={} \
+                                         d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} d_wrconn={} \
+                                         spins={} wms={}\r\n",
+                                        ok as u8,
+                                        mounted.get() as u8,
+                                        d.rd.get().wrapping_sub(snap0.0),
+                                        d.rd_err.get().wrapping_sub(snap0.1),
+                                        d.wr.get().wrapping_sub(snap0.2),
+                                        d.wr_ok.get().wrapping_sub(snap0.3),
+                                        d.wr_notready.get().wrapping_sub(snap0.4),
+                                        d.wr_resp_err.get().wrapping_sub(snap0.5),
+                                        d.wr_timeout.get().wrapping_sub(snap0.6),
+                                        d.wr_conn_lost.get().wrapping_sub(snap0.7),
+                                        d.wr_spins_last.get(),
+                                        d.wr_ms_last.get()
+                                    ),
+                                );
+                                let (cs, cr) = d.wr_csw.get();
+                                let (rr, rp, rt, rn, rl) = d.wr_reject.get();
+                                let (fcs, fcr) = d.wr_csw_first.get();
+                                let (frr, frp, frt, frn, frl) = d.wr_reject_first.get();
+                                let (sv, sk, sa, sq) = usb_msc.sense_info();
+                                let _ = core::fmt::Write::write_fmt(
+                                    &mut msg,
+                                    format_args!(
+                                        "export: first csw={}/{} rej={}/{}/{} ny={} lph={} \
+                                         last csw={}/{} rej={}/{}/{} ny={} lph={}\r\n\
+                                         export: sense valid={} key={:x} asc={:02x} ascq={:02x}\r\n",
+                                        fcs,
+                                        fcr,
+                                        frr,
+                                        frp,
+                                        frt,
+                                        frn,
+                                        frl,
+                                        cs,
+                                        cr,
+                                        rr,
+                                        rp,
+                                        rt,
+                                        rn,
+                                        rl,
+                                        sv as u8,
+                                        sk,
+                                        sa,
+                                        sq
+                                    ),
+                                );
+                                core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
+                            }
+                            {
+                                // Round-six read-failure diag: reason 1=notready
+                                // 2=resp_err 3=deadline 4=conn_lost, at word w of
+                                // lba, after sp spins; rej/ny/lph = reject_info
+                                // CSR snapshot at the failure.
+                                let f1 = d.rd_fail_first.get();
+                                let f2 = d.rd_fail.get();
+                                let path1 = d.rd_path_first.get();
+                                let path2 = d.rd_path.get();
+                                let ms1 = d.rd_ms_first.get();
+                                let ms2 = d.rd_ms.get();
+                                let mut msg: heapless::String<256> = heapless::String::new();
+                                let _ = core::fmt::Write::write_fmt(
+                                    &mut msg,
+                                    format_args!(
+                                        "export: rd1 rsn={} w={} lba={} sp={} ms={} \
+                                         rej={}/{} ny={} lph={} pth={:08x}\r\n\
+                                         export: rdL rsn={} w={} lba={} sp={} ms={} \
+                                         rej={}/{} ny={} lph={} pth={:08x}\r\n",
+                                        f1.reason,
+                                        f1.word,
+                                        f1.lba,
+                                        f1.spins,
+                                        ms1,
+                                        f1.reject.response,
+                                        f1.reject.phase,
+                                        f1.reject.nyets,
+                                        f1.reject.last_phase,
+                                        path1,
+                                        f2.reason,
+                                        f2.word,
+                                        f2.lba,
+                                        f2.spins,
+                                        ms2,
+                                        f2.reject.response,
+                                        f2.reject.phase,
+                                        f2.reject.nyets,
+                                        f2.reject.last_phase,
+                                        path2
+                                    ),
+                                );
+                                core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
+                            }
                         }
-                        {
-                            // Round-six read-failure diag: reason 1=notready
-                            // 2=resp_err 3=deadline 4=conn_lost, at word w of
-                            // lba, after sp spins; rej/ny/lph = reject_info
-                            // CSR snapshot at the failure.
-                            let (r1, w1, l1, s1, rr1, rp1, n1, p1) = d.rd_fail_first.get();
-                            let (r2, w2, l2, s2, rr2, rp2, n2, p2) = d.rd_fail.get();
-                            let path1 = d.rd_path_first.get();
-                            let path2 = d.rd_path.get();
-                            let ms1 = d.rd_ms_first.get();
-                            let ms2 = d.rd_ms.get();
-                            let mut msg: heapless::String<256> = heapless::String::new();
-                            let _ = core::fmt::Write::write_fmt(
-                                &mut msg,
-                                format_args!(
-                                    "export: rd1 rsn={} w={} lba={} sp={} ms={} \
-                                     rej={}/{} ny={} lph={} pth={:08x}\r\n\
-                                     export: rdL rsn={} w={} lba={} sp={} ms={} \
-                                     rej={}/{} ny={} lph={} pth={:08x}\r\n",
-                                    r1,
-                                    w1,
-                                    l1,
-                                    s1,
-                                    ms1,
-                                    rr1,
-                                    rp1,
-                                    n1,
-                                    p1,
-                                    path1,
-                                    r2,
-                                    w2,
-                                    l2,
-                                    s2,
-                                    ms2,
-                                    rr2,
-                                    rp2,
-                                    n2,
-                                    p2,
-                                    path2
-                                ),
-                            );
-                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
-                        }
-                        // --- end TEMPORARY ----------------------------------
                         let mut s: heapless::String<24> = heapless::String::new();
                         let _ = if ok {
                             core::fmt::Write::write_fmt(&mut s, format_args!("Exported {}", fname))

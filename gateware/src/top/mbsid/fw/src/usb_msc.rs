@@ -1,10 +1,42 @@
 //! USBMSCPeripheral CSR driver: block reads from a USB mass-storage device.
 use tiliqua_pac as pac;
 
+/// Snapshot of the `reject_info` CSR at a failure site.
+/// `response`: 3=STALL, 4=TIMEOUT, 5=CRC_ERROR.
+/// `phase`: 1=CBW, 2=DATA-TX, 3=CSW, 4=DATA-RX, 5=CTRL (clear-halt recovery).
+/// `nyets`: NYET handshakes seen during the command (HS flow control).
+/// `last_phase`: last live engine phase — on a watchdogged wedge (response and
+/// phase both 0) this is the phase the engine was STUCK in.
+/// All four survive the engine's watchdog reset (latched CSR-side, see
+/// `usb_msc_csr.py` RejectInfo).
+#[cfg(feature = "usb-diag")]
+#[derive(Clone, Copy, Default)]
+pub struct RejectSnapshot {
+    pub response: u8,
+    pub phase: u8,
+    pub nyets: u8,
+    pub last_phase: u8,
+}
+
+/// A failed `read_block`, latched for the UART trace.
+/// `reason`: 1=not-ready at entry, 2=resp.error, 3=deadline timeout,
+/// 4=`connected` lost mid-read (engine watchdog fired / drive yanked).
+/// `word`: 0..127, the 32-bit word index the failure hit at.
+#[cfg(feature = "usb-diag")]
+#[derive(Clone, Copy, Default)]
+pub struct ReadFailure {
+    pub reason: u8,
+    pub word: u8,
+    pub lba: u32,
+    pub spins: u32,
+    pub reject: RejectSnapshot,
+}
+
 /// TEMPORARY (M6b §7b bring-up): per-call outcome counters, read by main.rs's
 /// UART0 diagnostic prints to localize where an export dies without adding
 /// any USB traffic. Cell is fine: only the main loop touches UsbMsc.
 /// Remove together with the main.rs diag prints once §7b passes.
+#[cfg(feature = "usb-diag")]
 #[derive(Default)]
 pub struct MscDiag {
     pub rd: core::cell::Cell<u32>,
@@ -52,10 +84,8 @@ pub struct MscDiag {
     ///  deterministically on hardware while the same sequence passes in
     ///  sim — these cells discriminate drive-busy (3 with high spins) from
     ///  engine-level rejection (2, with the reject snapshot saying where).
-    #[allow(clippy::type_complexity)] // replaced by ReadFailure in Task 4
-    pub rd_fail_first: core::cell::Cell<(u8, u8, u32, u32, u8, u8, u8, u8)>,
-    #[allow(clippy::type_complexity)] // replaced by ReadFailure in Task 4
-    pub rd_fail: core::cell::Cell<(u8, u8, u32, u32, u8, u8, u8, u8)>,
+    pub rd_fail_first: core::cell::Cell<ReadFailure>,
+    pub rd_fail: core::cell::Cell<ReadFailure>,
     /// Packed read_path_info CSR captured with rd_fail_first/rd_fail.
     /// [9:0]=engine bytes, [19:10]=peripheral bytes,
     /// [27:20]=peripheral words, [28]=stream mode,
@@ -73,6 +103,7 @@ pub struct MscDiag {
     pub wr_ms_last: core::cell::Cell<u32>,
 }
 
+#[cfg(feature = "usb-diag")]
 impl MscDiag {
     /// Reset the first-failure capture (call at the start of an operation
     /// whose failures you want to attribute, e.g. one export attempt).
@@ -81,8 +112,8 @@ impl MscDiag {
         self.wr_csw_first.set((0, 0));
         self.wr_reject_first.set((0, 0, 0, 0, 0));
         self.rd_first_set.set(false);
-        self.rd_fail_first.set((0, 0, 0, 0, 0, 0, 0, 0));
-        self.rd_fail.set((0, 0, 0, 0, 0, 0, 0, 0));
+        self.rd_fail_first.set(ReadFailure::default());
+        self.rd_fail.set(ReadFailure::default());
         self.rd_path_first.set(0);
         self.rd_path.set(0);
         self.rd_ms_first.set(0);
@@ -90,7 +121,7 @@ impl MscDiag {
         self.wr_ms_last.set(0);
     }
 
-    fn record_rd_failure(&self, v: (u8, u8, u32, u32, u8, u8, u8, u8), path: u32, ms: u32) {
+    fn record_rd_failure(&self, v: ReadFailure, path: u32, ms: u32) {
         self.rd_fail.set(v);
         self.rd_path.set(path);
         self.rd_ms.set(ms);
@@ -113,6 +144,18 @@ impl MscDiag {
     }
 }
 
+/// Feature-off twin: same name and same `Default` + `begin()` surface, zero
+/// fields, zero cost. Everything that *reads* diagnostics lives behind
+/// `#[cfg(feature = "usb-diag")]` in main.rs, so no getters are needed here.
+#[cfg(not(feature = "usb-diag"))]
+#[derive(Default)]
+pub struct MscDiag;
+
+#[cfg(not(feature = "usb-diag"))]
+impl MscDiag {
+    pub fn begin(&self) {}
+}
+
 pub struct UsbMsc {
     regs: pac::USB_MSC,
     pub diag: MscDiag,
@@ -129,7 +172,7 @@ impl UsbMsc {
     pub fn new(regs: pac::USB_MSC) -> Self {
         Self {
             regs,
-            diag: MscDiag::default(),
+            diag: Default::default(),
         }
     }
 
@@ -162,6 +205,7 @@ impl UsbMsc {
     /// non-backpressuring byte packer) silently corrupts any other sector size.
     /// TEMPORARY round-six diag: reject_info CSR snapshot (response, phase,
     /// nyets, last_phase) captured at a read-failure site.
+    #[cfg(feature = "usb-diag")]
     fn reject_snapshot(&self) -> (u8, u8, u8, u8) {
         let ri = self.regs.reject_info().read();
         (
@@ -172,6 +216,7 @@ impl UsbMsc {
         )
     }
 
+    #[cfg(feature = "usb-diag")]
     fn read_path_snapshot(&self) -> u32 {
         let p = self.regs.read_path_info().read();
         u32::from(p.engine_bytes().bits())
@@ -181,14 +226,95 @@ impl UsbMsc {
             | (u32::from(p.data_len_512().bit_is_set()) << 29)
     }
 
+    /// Latch a read failure for the UART trace. `t0 == 0` means "no elapsed
+    /// time to report" (the not-ready-at-entry site, which fails before the
+    /// clock starts).
+    #[cfg(feature = "usb-diag")]
+    fn diag_read_failure(&self, reason: u8, word: u8, lba: u32, spins: u32, t0: u32) {
+        self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
+        let (response, phase, nyets, last_phase) = self.reject_snapshot();
+        let path = self.read_path_snapshot();
+        let ms = if t0 == 0 {
+            0
+        } else {
+            crate::uptime::now_ms().wrapping_sub(t0)
+        };
+        self.diag.record_rd_failure(
+            ReadFailure {
+                reason,
+                word,
+                lba,
+                spins,
+                reject: RejectSnapshot {
+                    response,
+                    phase,
+                    nyets,
+                    last_phase,
+                },
+            },
+            path,
+            ms,
+        );
+    }
+
+    #[cfg(not(feature = "usb-diag"))]
+    #[inline(always)]
+    fn diag_read_failure(&self, _reason: u8, _word: u8, _lba: u32, _spins: u32, _t0: u32) {}
+
+    /// Latch a write failure. `kind`: 0=resp.error, 1=nonzero CSW residue,
+    /// 2=`connected` lost mid-write, 3=wall-clock timeout.
+    #[cfg(feature = "usb-diag")]
+    fn diag_write_failure(&self, kind: u8, spins: u32, t0: u32) {
+        self.diag.wr_spins_last.set(spins);
+        self.diag
+            .wr_ms_last
+            .set(crate::uptime::now_ms().wrapping_sub(t0));
+        match kind {
+            2 => self
+                .diag
+                .wr_conn_lost
+                .set(self.diag.wr_conn_lost.get().wrapping_add(1)),
+            3 => self
+                .diag
+                .wr_timeout
+                .set(self.diag.wr_timeout.get().wrapping_add(1)),
+            _ => self
+                .diag
+                .wr_resp_err
+                .set(self.diag.wr_resp_err.get().wrapping_add(1)),
+        }
+        let csw = (
+            self.regs.csw_status().read().value().bits(),
+            self.regs.csw_residue().read().value().bits(),
+        );
+        // A residue failure is host-side bookkeeping, not an engine reject:
+        // report the residue with an all-zero reject snapshot, exactly as the
+        // pre-refactor code did.
+        let reject = if kind == 1 {
+            (0, 0, 0, 0, 0)
+        } else {
+            let ri = self.regs.reject_info().read();
+            (
+                ri.response().bits(),
+                ri.phase().bits(),
+                ri.txdone().bits(),
+                ri.nyets().bits(),
+                ri.last_phase().bits(),
+            )
+        };
+        let csw = if kind == 1 { (0, csw.1) } else { csw };
+        self.diag.record_failure(csw, reject);
+    }
+
+    #[cfg(not(feature = "usb-diag"))]
+    #[inline(always)]
+    fn diag_write_failure(&self, _kind: u8, _spins: u32, _t0: u32) {}
+
     pub fn read_block(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), MscError> {
-        self.diag.rd.set(self.diag.rd.get().wrapping_add(1)); // TEMPORARY diag
+        #[cfg(feature = "usb-diag")]
+        self.diag.rd.set(self.diag.rd.get().wrapping_add(1));
         if !self.ready() {
-            self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
-            let (rr, rp, ny, lp) = self.reject_snapshot();
-            let path = self.read_path_snapshot();
-            self.diag
-                .record_rd_failure((1, 0, lba, 0, rr, rp, ny, lp), path, 0);
+            self.diag_read_failure(1, 0, lba, 0, 0);
             return Err(MscError::NotReady);
         }
         self.regs.lba().write(|w| unsafe { w.value().bits(lba) });
@@ -210,12 +336,7 @@ impl UsbMsc {
                     break;
                 }
                 if self.regs.resp().read().error().bit_is_set() {
-                    self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
-                    let (rr, rp, ny, lp) = self.reject_snapshot();
-                    let path = self.read_path_snapshot();
-                    let ms = crate::uptime::now_ms().wrapping_sub(t0);
-                    self.diag
-                        .record_rd_failure((2, i as u8, lba, spins, rr, rp, ny, lp), path, ms);
+                    self.diag_read_failure(2, i as u8, lba, spins, t0);
                     return Err(MscError::ReadError);
                 }
                 spins = spins.wrapping_add(1);
@@ -226,27 +347,12 @@ impl UsbMsc {
                         // rsn=4: the engine lost the drive mid-command
                         // (watchdog fired or the drive was yanked) —
                         // resp.done can never come; fail fast.
-                        self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
-                        let (rr, rp, ny, lp) = self.reject_snapshot();
-                        let path = self.read_path_snapshot();
-                        let ms = crate::uptime::now_ms().wrapping_sub(t0);
-                        self.diag.record_rd_failure(
-                            (4, i as u8, lba, spins, rr, rp, ny, lp),
-                            path,
-                            ms,
-                        );
+                        self.diag_read_failure(4, i as u8, lba, spins, t0);
                         return Err(MscError::ReadError);
                     }
                     let now = crate::uptime::now_ms();
                     if crate::uptime::deadline_expired(t0, now, READ_TIMEOUT_MS) {
-                        self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
-                        let (rr, rp, ny, lp) = self.reject_snapshot();
-                        let path = self.read_path_snapshot();
-                        self.diag.record_rd_failure(
-                            (3, i as u8, lba, spins, rr, rp, ny, lp),
-                            path,
-                            now.wrapping_sub(t0),
-                        );
+                        self.diag_read_failure(3, i as u8, lba, spins, t0);
                         return Err(MscError::ReadError);
                     }
                 }
@@ -289,14 +395,16 @@ impl UsbMsc {
     /// enabled; see `M6_USB_STORAGE.md` §7b/§8 for the still-outstanding
     /// stack-paint remeasure of this write leg.
     pub fn write_block(&self, lba: u32, buf: &[u8; 512]) -> Result<(), MscError> {
-        self.diag.wr.set(self.diag.wr.get().wrapping_add(1)); // TEMPORARY diag
-                                                              // Bounded ready-wait instead of an instant NotReady: after a failed
-                                                              // write the engine stays busy for a few ms running its automatic
-                                                              // REQUEST SENSE; an immediate retry must wait that out, not fail.
+        #[cfg(feature = "usb-diag")]
+        self.diag.wr.set(self.diag.wr.get().wrapping_add(1));
+        // Bounded ready-wait instead of an instant NotReady: after a failed
+        // write the engine stays busy for a few ms running its automatic
+        // REQUEST SENSE; an immediate retry must wait that out, not fail.
         const READY_WAIT_MS: u32 = 1_000;
         let t0r = crate::uptime::now_ms();
         while !self.ready() {
             if crate::uptime::deadline_expired(t0r, crate::uptime::now_ms(), READY_WAIT_MS) {
+                #[cfg(feature = "usb-diag")]
                 self.diag
                     .wr_notready
                     .set(self.diag.wr_notready.get().wrapping_add(1));
@@ -321,28 +429,8 @@ impl UsbMsc {
         loop {
             let r = self.regs.resp().read();
             if r.done().bit_is_set() {
-                self.diag.wr_spins_last.set(spins); // TEMPORARY diag
-                self.diag
-                    .wr_ms_last
-                    .set(crate::uptime::now_ms().wrapping_sub(t0));
                 return if r.error().bit_is_set() {
-                    self.diag
-                        .wr_resp_err
-                        .set(self.diag.wr_resp_err.get().wrapping_add(1));
-                    let ri = self.regs.reject_info().read();
-                    self.diag.record_failure(
-                        (
-                            self.regs.csw_status().read().value().bits(),
-                            self.regs.csw_residue().read().value().bits(),
-                        ),
-                        (
-                            ri.response().bits(),
-                            ri.phase().bits(),
-                            ri.txdone().bits(),
-                            ri.nyets().bits(),
-                            ri.last_phase().bits(),
-                        ),
-                    );
+                    self.diag_write_failure(0, spins, t0);
                     Err(MscError::WriteError)
                 } else {
                     // BOT: PASSED + residue != 0 means the device silently
@@ -350,13 +438,17 @@ impl UsbMsc {
                     // on media is NOT what we sent. Round-eight fix.
                     let residue = self.regs.csw_residue().read().value().bits();
                     if residue != 0 {
-                        self.diag
-                            .wr_resp_err
-                            .set(self.diag.wr_resp_err.get().wrapping_add(1));
-                        self.diag.record_failure((0, residue), (0, 0, 0, 0, 0));
+                        self.diag_write_failure(1, spins, t0);
                         Err(MscError::WriteError)
                     } else {
-                        self.diag.wr_ok.set(self.diag.wr_ok.get().wrapping_add(1));
+                        #[cfg(feature = "usb-diag")]
+                        {
+                            self.diag.wr_spins_last.set(spins);
+                            self.diag
+                                .wr_ms_last
+                                .set(crate::uptime::now_ms().wrapping_sub(t0));
+                            self.diag.wr_ok.set(self.diag.wr_ok.get().wrapping_add(1));
+                        }
                         Ok(())
                     }
                 };
@@ -366,34 +458,10 @@ impl UsbMsc {
                 let now = crate::uptime::now_ms();
                 let conn_lost = !self.connected();
                 if conn_lost || crate::uptime::deadline_expired(t0, now, WRITE_TIMEOUT_MS) {
-                    self.diag.wr_spins_last.set(spins); // TEMPORARY diag
-                    self.diag.wr_ms_last.set(now.wrapping_sub(t0));
                     // Distinguish "drive gone mid-write" from a genuine
                     // wall-clock timeout, same fail-fast-on-lost-connection
                     // ordering as read_block's rsn=4 check.
-                    if conn_lost {
-                        self.diag
-                            .wr_conn_lost
-                            .set(self.diag.wr_conn_lost.get().wrapping_add(1));
-                    } else {
-                        self.diag
-                            .wr_timeout
-                            .set(self.diag.wr_timeout.get().wrapping_add(1));
-                    }
-                    let ri = self.regs.reject_info().read();
-                    self.diag.record_failure(
-                        (
-                            self.regs.csw_status().read().value().bits(),
-                            self.regs.csw_residue().read().value().bits(),
-                        ),
-                        (
-                            ri.response().bits(),
-                            ri.phase().bits(),
-                            ri.txdone().bits(),
-                            ri.nyets().bits(),
-                            ri.last_phase().bits(),
-                        ),
-                    );
+                    self.diag_write_failure(if conn_lost { 2 } else { 3 }, spins, t0);
                     return Err(MscError::WriteError);
                 }
             }
