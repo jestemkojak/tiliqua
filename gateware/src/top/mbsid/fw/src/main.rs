@@ -138,6 +138,101 @@ impl App {
     }
 }
 
+/// Patch persistence: the flash-backed user bank, the single shared 512 B
+/// scratch buffer every save/load path reuses (keeping peak stack flat —
+/// mainram budget, CLAUDE.md), and the engine/vflags of the last
+/// successfully loaded USER patch (the ROM-bank cache in the shim can't
+/// answer for user slots).
+struct Storage {
+    store: UserPatchStore<SPIFlash0>,
+    patch_buf: [u8; 512],
+    user_detail: Option<(u8, u8)>,
+}
+
+/// USB mass storage: the CSR driver plus the cached directory listing.
+/// `listed` guards the (relatively expensive) directory scan; `keepalive_at`
+/// paces the idle LBA-0 probe.
+struct Usb {
+    msc: tiliqua_fw::usb_msc::UsbMsc,
+    files: usb_patch::FileList,
+    listed: bool,
+    keepalive_at: u32,
+}
+
+/// Derive USB state from live hardware, every iteration (M5 lesson).
+/// Returns `(drive_present, dirty)`.
+///
+/// Deriving `Card::Usb`'s validity only from menu navigation events would
+/// let a stale file list survive an unplug until the user next turned the
+/// encoder — same shape as the M5 `lead_loaded` bug.
+fn sync_usb_state(usb: &mut Usb, state: &mut MenuState) -> (bool, bool) {
+    let mut dirty = false;
+
+    // Leaving Storage mode (or losing the drive) collapses the Usb card and
+    // invalidates the cached file list. `state.card` is reassigned directly
+    // here (not via `Card::step`) because this is an unconditional collapse,
+    // not a navigation event — but it lands on the same value `step` would
+    // clamp to on the very next Card turn once `usb_storage` is false (see
+    // `Card::step`'s doc comment), so there is no window where
+    // `state.card == Usb` survives with `usb_storage == false`.
+    if !state.usb_storage && state.card == menu::Card::Usb {
+        state.card = menu::Card::Main;
+        state.focus = menu::ROW_CARD;
+        dirty = true;
+    }
+
+    // `connected()`, NOT `ready()`: `ready()` is `~busy`, so it is
+    // legitimately 0 for the duration of ANY in-flight command, including
+    // the idle keepalive's own read below (read_block() returns as soon as
+    // the 512 data bytes are drained, before the engine's CSW/READY
+    // housekeeping finishes — so a real, if brief, ready=0 window follows
+    // every read, keepalive included). Using `ready()` here raced the
+    // keepalive against its own presence check and periodically
+    // collapsed+rebuilt the Usb file list (visible flicker) even with
+    // nothing unplugged. `connected()` is the persistent enumeration flag.
+    let drive_present = state.usb_storage && usb.msc.connected() && usb.msc.block_size() == 512;
+
+    // Idle keepalive: the MSC engine's watchdog (vendor msc.py) is
+    // handshake-fed since round seven — any ACK/NAK/NYET holds it cleared —
+    // but an IDLE bus produces no handshakes at all (SOFs don't touch the
+    // SIE response), so a quiet READY drive would still be reset every 10 s
+    // without probe traffic. The keepalive is ALSO what turns an unplug into
+    // evidence: a yanked drive answers the probe with silence (TIMEOUT), the
+    // watchdog runs out, `ready` drops. Do not remove it in either direction.
+    if drive_present {
+        const MSC_KEEPALIVE_MS: u32 = 2000;
+        let now = uptime::now_ms();
+        if now.wrapping_sub(usb.keepalive_at) >= MSC_KEEPALIVE_MS {
+            usb.keepalive_at = now;
+            let mut scratch = [0u8; 512];
+            let _ = usb.msc.read_block(0, &mut scratch);
+        }
+    }
+
+    if !drive_present && usb.listed {
+        usb.listed = false; // drive unplugged / mode left
+        usb.files.clear();
+        state.usb_file = -1;
+        state.usb_file_count = 0;
+        if state.card == menu::Card::Usb {
+            dirty = true;
+        }
+    }
+    if drive_present && !usb.listed && state.card == menu::Card::Usb {
+        usb.files.clear();
+        let n = with_fat(&usb.msc, |fs| {
+            usb_patch::list_patch_files(fs, &mut usb.files)
+        })
+        .unwrap_or(0);
+        state.usb_file_count = n as u8;
+        state.usb_file = if n > 0 { 0 } else { -1 };
+        usb.listed = true;
+        dirty = true;
+    }
+
+    (drive_present, dirty)
+}
+
 /// CvSink implementation over the engine FFI. Only used inside
 /// critical_section (ISR body, or main-loop blocks under `cs`).
 struct EngineSink;
@@ -398,13 +493,11 @@ fn main() -> ! {
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
 
     let spiflash = SPIFlash0::new(peripherals.SPIFLASH_CTRL, SPIFLASH_BASE, SPIFLASH_SZ_BYTES);
-    let mut store = UserPatchStore::new(spiflash, USER_BANK_FLASH_BASE);
-    // One shared 512B scratch for user-bank load / save / SysEx persist —
-    // keeps peak stack usage flat (mainram budget, CLAUDE.md).
-    let mut patch_buf = [0u8; 512];
-    // Engine/vflags of the last successfully loaded USER patch (the ROM-bank
-    // cache in the shim can't answer for user slots).
-    let mut user_detail: Option<(u8, u8)> = None;
+    let mut storage = Storage {
+        store: UserPatchStore::new(spiflash, USER_BANK_FLASH_BASE),
+        patch_buf: [0u8; 512],
+        user_detail: None,
+    };
     let mut status = Status::new();
 
     // Total banks = engine ROM banks + the flash User bank (always last).
@@ -419,7 +512,7 @@ fn main() -> ! {
     // decodes to defaults (TRS, all CV Off) — see settings_store.rs.
     let opt_window = bootinfo.manifest.get_option_storage_window();
     let settings = match opt_window {
-        Some(ref w) => settings_store::load(store.flash_mut(), w.start),
+        Some(ref w) => settings_store::load(storage.store.flash_mut(), w.start),
         None => settings_store::Settings::default(),
     };
     state.midi_src = if settings.midi_src == 1 {
@@ -447,10 +540,12 @@ fn main() -> ! {
 
     // M6a: USB mass-storage. All access is main-loop-only; a slow drive
     // stalls UI redraw, never audio (the ISR keeps ticking the engine).
-    let usb_msc = tiliqua_fw::usb_msc::UsbMsc::new(peripherals.USB_MSC);
-    let mut usb_files: usb_patch::FileList = usb_patch::FileList::new();
-    let mut usb_listed = false;
-    let mut msc_keepalive_at: u32 = 0;
+    let mut usb = Usb {
+        msc: tiliqua_fw::usb_msc::UsbMsc::new(peripherals.USB_MSC),
+        files: usb_patch::FileList::new(),
+        listed: false,
+        keepalive_at: 0,
+    };
 
     handler!(timer0 = || timer0_handler(&app));
 
@@ -492,70 +587,9 @@ fn main() -> ! {
                 dirty = true;
             }
 
-            // M6: derive USB state every iteration (M5 lesson). Leaving
-            // Storage mode (or losing the drive) collapses the Usb card and
-            // invalidates the cached file list. `state.card` is reassigned
-            // directly here (not via `Card::step`) because this is an
-            // unconditional collapse, not a navigation event — but it lands
-            // on the same value `step` would clamp to on the very next Card
-            // turn once `usb_storage` is false (see `Card::step`'s doc
-            // comment), so there is no window where `state.card == Usb`
-            // survives with `usb_storage == false`.
-            if !state.usb_storage && state.card == menu::Card::Usb {
-                state.card = menu::Card::Main;
-                state.focus = menu::ROW_CARD;
-                dirty = true;
-            }
-            // `connected()`, NOT `ready()`: `ready()` is `~busy`, so it is
-            // legitimately 0 for the duration of ANY in-flight command,
-            // including the idle keepalive's own read below (read_block()
-            // returns as soon as the 512 data bytes are drained, before the
-            // engine's CSW/READY housekeeping finishes — so a real, if
-            // brief, ready=0 window follows every read, keepalive included).
-            // Using `ready()` here raced the keepalive against its own
-            // presence check and periodically collapsed+rebuilt the Usb
-            // file list (visible flicker) even with nothing unplugged.
-            // `connected()` is the persistent enumeration flag instead.
-            let drive_present =
-                state.usb_storage && usb_msc.connected() && usb_msc.block_size() == 512;
-            diag::usb_status(&mut diag_serial, &usb_msc, &mut usb_diag_last);
-            // Idle keepalive: the MSC engine's watchdog (vendor msc.py) is
-            // handshake-fed since round seven — any ACK/NAK/NYET holds it
-            // cleared — but an IDLE bus produces no handshakes at all (SOFs
-            // don't touch the SIE response), so a quiet READY drive would
-            // still be reset every 10 s without probe traffic. The keepalive
-            // is ALSO what turns an unplug into evidence: a yanked drive
-            // answers the probe with silence (TIMEOUT), the watchdog runs
-            // out, `ready` drops. Do not remove it in either direction.
-            if drive_present {
-                const MSC_KEEPALIVE_MS: u32 = 2000;
-                let now = uptime::now_ms();
-                if now.wrapping_sub(msc_keepalive_at) >= MSC_KEEPALIVE_MS {
-                    msc_keepalive_at = now;
-                    let mut scratch = [0u8; 512];
-                    let _ = usb_msc.read_block(0, &mut scratch);
-                }
-            }
-            if !drive_present && usb_listed {
-                usb_listed = false; // drive unplugged / mode left
-                usb_files.clear();
-                state.usb_file = -1;
-                state.usb_file_count = 0;
-                if state.card == menu::Card::Usb {
-                    dirty = true;
-                }
-            }
-            if drive_present && !usb_listed && state.card == menu::Card::Usb {
-                usb_files.clear();
-                let n = with_fat(&usb_msc, |fs| {
-                    usb_patch::list_patch_files(fs, &mut usb_files)
-                })
-                .unwrap_or(0);
-                state.usb_file_count = n as u8;
-                state.usb_file = if n > 0 { 0 } else { -1 };
-                usb_listed = true;
-                dirty = true;
-            }
+            let (drive_present, usb_dirty) = sync_usb_state(&mut usb, &mut state);
+            dirty |= usb_dirty;
+            diag::usb_status(&mut diag_serial, &usb.msc, &mut usb_diag_last);
 
             let mut need_load = false;
             if ticks != 0 {
@@ -595,9 +629,9 @@ fn main() -> ! {
                         // On-device "save as": copy the live patch out under
                         // the ISR guard, then write flash OUTSIDE it (slow).
                         critical_section::with(|_cs| {
-                            mbsid_sys::current_patch_raw(&mut patch_buf);
+                            mbsid_sys::current_patch_raw(&mut storage.patch_buf);
                         });
-                        let ok = store.save(slot, &patch_buf).is_ok();
+                        let ok = storage.store.save(slot, &storage.patch_buf).is_ok();
                         if ok {
                             state.edited = false;
                         }
@@ -606,13 +640,13 @@ fn main() -> ! {
                     PressResult::UsbLoad(ix) => {
                         status.set(
                             usb_load(
-                                &usb_msc,
+                                &usb.msc,
                                 ix as usize,
                                 None,
-                                &mut store,
-                                &mut patch_buf,
+                                &mut storage.store,
+                                &mut storage.patch_buf,
                                 &mut state,
-                                &mut user_detail,
+                                &mut storage.user_detail,
                             ),
                             uptime::now_ms(),
                         );
@@ -620,13 +654,13 @@ fn main() -> ! {
                     PressResult::UsbLoadToSlot { file, slot } => {
                         status.set(
                             usb_load(
-                                &usb_msc,
+                                &usb.msc,
                                 file as usize,
                                 Some(slot),
-                                &mut store,
-                                &mut patch_buf,
+                                &mut storage.store,
+                                &mut storage.patch_buf,
                                 &mut state,
-                                &mut user_detail,
+                                &mut storage.user_detail,
                             ),
                             uptime::now_ms(),
                         );
@@ -637,8 +671,9 @@ fn main() -> ! {
                         // signal, same contract as export. Import writes
                         // internal SPI flash only — no drive writes, so no
                         // usb_msc.flush() needed.
-                        let outcome =
-                            with_fat(&usb_msc, |fs| bank_import::import_bank(fs, &mut store));
+                        let outcome = with_fat(&usb.msc, |fs| {
+                            bank_import::import_bank(fs, &mut storage.store)
+                        });
                         status.set(status::imported(outcome), uptime::now_ms());
                     }
                     PressResult::UsbExport { source } => {
@@ -656,29 +691,31 @@ fn main() -> ! {
                         let (slot, got) = match source {
                             menu::ExportSource::Edit => {
                                 critical_section::with(|_cs| {
-                                    mbsid_sys::current_patch_raw(&mut patch_buf);
+                                    mbsid_sys::current_patch_raw(&mut storage.patch_buf);
                                 });
                                 (0u8, true)
                             }
-                            menu::ExportSource::Slot(n) => (n, store.load(n, &mut patch_buf)),
+                            menu::ExportSource::Slot(n) => {
+                                (n, storage.store.load(n, &mut storage.patch_buf))
+                            }
                         };
                         let fname = menu::export_name(source);
                         // Stage-level export trace, usb-diag only.
-                        let snap0 = diag::export_begin(&mut diag_serial, &usb_msc, &fname, got);
+                        let snap0 = diag::export_begin(&mut diag_serial, &usb.msc, &fname, got);
                         let mounted = core::cell::Cell::new(false);
                         let ok = got
-                            && with_fat(&usb_msc, |fs| {
+                            && with_fat(&usb.msc, |fs| {
                                 mounted.set(true);
-                                usb_patch::export_patch(fs, &fname, &patch_buf, slot)
+                                usb_patch::export_patch(fs, &fname, &storage.patch_buf, slot)
                             })
                             .unwrap_or(false);
                         // Commit the drive's volatile cache before reporting
                         // success — the verify read may have been served
                         // from cache (round eight durability fix).
-                        let ok = ok && usb_msc.flush().is_ok();
-                        diag::export_result(&mut diag_serial, &usb_msc, ok, mounted.get(), &snap0);
+                        let ok = ok && usb.msc.flush().is_ok();
+                        diag::export_result(&mut diag_serial, &usb.msc, ok, mounted.get(), &snap0);
                         status.set(status::exported(ok, &fname), uptime::now_ms());
-                        usb_listed = false; // new file: refresh the list
+                        usb.listed = false; // new file: refresh the list
                     }
                 }
                 dirty = true;
@@ -688,7 +725,7 @@ fn main() -> ! {
             let pending = critical_section::with(|cs| app.borrow_ref_mut(cs).pending_save.take());
             if let Some((slot, bytes)) = pending {
                 status.set(
-                    status::saved(store.save(slot, &bytes).is_ok(), slot),
+                    status::saved(storage.store.save(slot, &bytes).is_ok(), slot),
                     uptime::now_ms(),
                 );
                 dirty = true;
@@ -696,17 +733,17 @@ fn main() -> ! {
 
             if need_load {
                 if state.is_user_bank() {
-                    if store.load(state.program, &mut patch_buf) {
+                    if storage.store.load(state.program, &mut storage.patch_buf) {
                         critical_section::with(|_cs| {
-                            mbsid_sys::load_patch(&patch_buf);
+                            mbsid_sys::load_patch(&storage.patch_buf);
                         });
-                        user_detail = Some(params::patch_detail_bytes(&patch_buf));
+                        storage.user_detail = Some(params::patch_detail_bytes(&storage.patch_buf));
                         state.refresh_params(|a| mbsid_sys::patch_byte(a));
                         state.edited = false;
                         // lead_loaded/state.lead_loaded resynced unconditionally
                         // at the top of the next loop iteration.
                     } else {
-                        user_detail = None; // empty slot: engine untouched
+                        storage.user_detail = None; // empty slot: engine untouched
                     }
                 } else {
                     critical_section::with(|_cs| {
@@ -728,7 +765,7 @@ fn main() -> ! {
                         usb_mode: state.usb_storage as u8,
                     };
                     if s != last_saved {
-                        let _ = settings_store::save(store.flash_mut(), w.start, &s);
+                        let _ = settings_store::save(storage.store.flash_mut(), w.start, &s);
                         last_saved = s;
                     }
                     settings_dirty_at = None;
@@ -743,13 +780,13 @@ fn main() -> ! {
                     w.host()
                         .bit(state.midi_src == menu::MidiSource::Usb && !state.usb_storage)
                 });
-                usb_msc.set_mode(state.usb_storage);
+                usb.msc.set_mode(state.usb_storage);
 
                 let mut namebuf = [0u8; 17];
                 let name_ok;
                 if state.is_user_bank() {
                     let mut n16 = [0u8; 16];
-                    name_ok = store.name(state.program, &mut n16);
+                    name_ok = storage.store.name(state.program, &mut n16);
                     namebuf[..16].copy_from_slice(&n16);
                     namebuf[16] = 0;
                     if !name_ok {
@@ -771,7 +808,7 @@ fn main() -> ! {
                 // directly (read-only, no ISR guard needed). None => show
                 // "---" rather than a stale/default Lead/Mono label.
                 let detail = if state.is_user_bank() {
-                    user_detail
+                    storage.user_detail
                 } else {
                     mbsid_sys::bank_patch_info(state.bank, state.program)
                 }
@@ -780,7 +817,7 @@ fn main() -> ! {
                 // Save-row preview: name of the slot under the cursor.
                 let mut savebuf = [0u8; 16];
                 let save_name: Option<&str> = if state.save_cursor >= 0
-                    && store.name(state.save_cursor as u8, &mut savebuf)
+                    && storage.store.name(state.save_cursor as u8, &mut savebuf)
                 {
                     core::str::from_utf8(&savebuf).ok()
                 } else {
@@ -791,12 +828,13 @@ fn main() -> ! {
                 // the card is focused (borrows usb_files/slotbuf).
                 let mut slotbuf = [0u8; 16];
                 let usb_info = if state.card == menu::Card::Usb {
-                    let slot_name: Option<&str> =
-                        if state.usb_slot >= 0 && store.name(state.usb_slot as u8, &mut slotbuf) {
-                            core::str::from_utf8(&slotbuf).ok()
-                        } else {
-                            None
-                        };
+                    let slot_name: Option<&str> = if state.usb_slot >= 0
+                        && storage.store.name(state.usb_slot as u8, &mut slotbuf)
+                    {
+                        core::str::from_utf8(&slotbuf).ok()
+                    } else {
+                        None
+                    };
                     Some(UsbInfo {
                         drive: if drive_present {
                             DriveState::Ready
@@ -804,7 +842,7 @@ fn main() -> ! {
                             DriveState::NoDrive
                         },
                         file_name: if state.usb_file >= 0 {
-                            usb_files.get(state.usb_file as usize).map(|n| n.as_str())
+                            usb.files.get(state.usb_file as usize).map(|n| n.as_str())
                         } else {
                             None
                         },
