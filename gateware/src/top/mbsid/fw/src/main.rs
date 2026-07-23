@@ -335,7 +335,7 @@ fn usb_load<F: tiliqua_hal::nor_flash::NorFlash + tiliqua_hal::nor_flash::ReadNo
     critical_section::with(|_cs| {
         mbsid_sys::load_patch(patch_buf);
     });
-    *user_detail = Some((patch_buf[0x10], patch_buf[0x50]));
+    *user_detail = Some(params::patch_detail_bytes(patch_buf));
     state.refresh_params(|a| mbsid_sys::patch_byte(a));
     state.edited = false;
     match slot {
@@ -738,16 +738,7 @@ fn main() -> ! {
                             }
                             menu::ExportSource::Slot(n) => (n, store.load(n, &mut patch_buf)),
                         };
-                        let mut fname: heapless::String<16> = heapless::String::new();
-                        let _ = match source {
-                            menu::ExportSource::Edit => {
-                                core::fmt::Write::write_str(&mut fname, "EDIT.SYX")
-                            }
-                            menu::ExportSource::Slot(n) => core::fmt::Write::write_fmt(
-                                &mut fname,
-                                format_args!("P{:03}.SYX", n),
-                            ),
-                        };
+                        let fname = menu::export_name(source);
                         // Stage-level export trace, usb-diag only.
                         #[cfg(feature = "usb-diag")]
                         let snap0 = {
@@ -914,8 +905,7 @@ fn main() -> ! {
                         critical_section::with(|_cs| {
                             mbsid_sys::load_patch(&patch_buf);
                         });
-                        // engine byte 0x10, vflags 0x50 (sid_patch_t layout)
-                        user_detail = Some((patch_buf[0x10], patch_buf[0x50]));
+                        user_detail = Some(params::patch_detail_bytes(&patch_buf));
                         state.refresh_params(|a| mbsid_sys::patch_byte(a));
                         state.edited = false;
                         // lead_loaded/state.lead_loaded resynced unconditionally
@@ -986,26 +976,11 @@ fn main() -> ! {
                 // directly (read-only, no ISR guard needed). None => show
                 // "---" rather than a stale/default Lead/Mono label.
                 let detail = if state.is_user_bank() {
-                    user_detail.map(|(eng, vfl)| {
-                        let e = menu::Engine::from_byte(eng);
-                        let vm = if e == menu::Engine::Lead {
-                            Some(menu::VoiceMode::from_vflags(vfl))
-                        } else {
-                            None
-                        };
-                        (e, vm)
-                    })
+                    user_detail
                 } else {
-                    mbsid_sys::bank_patch_info(state.bank, state.program).map(|(eng, vfl)| {
-                        let e = menu::Engine::from_byte(eng);
-                        let vm = if e == menu::Engine::Lead {
-                            Some(menu::VoiceMode::from_vflags(vfl))
-                        } else {
-                            None
-                        };
-                        (e, vm)
-                    })
-                };
+                    mbsid_sys::bank_patch_info(state.bank, state.program)
+                }
+                .map(|(eng, vfl)| menu::patch_detail(eng, vfl));
 
                 // Save-row preview: name of the slot under the cursor.
                 let mut savebuf = [0u8; 16];

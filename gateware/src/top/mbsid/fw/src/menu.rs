@@ -76,6 +76,19 @@ impl VoiceMode {
     }
 }
 
+/// Decode a patch's engine byte and voice-flags byte into the pair the menu
+/// renders. Voice mode is only meaningful for the Lead engine; the other
+/// three get `None` rather than a misleading Mono/Poly label.
+pub fn patch_detail(eng: u8, vfl: u8) -> (Engine, Option<VoiceMode>) {
+    let e = Engine::from_byte(eng);
+    let vm = if e == Engine::Lead {
+        Some(VoiceMode::from_vflags(vfl))
+    } else {
+        None
+    };
+    (e, vm)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Card {
     Main,
@@ -174,6 +187,18 @@ pub enum PressResult {
 pub enum ExportSource {
     Edit,
     Slot(u8),
+}
+
+/// 8.3 filename for a USB export. `fatfs` is built without the `lfn`
+/// feature (matching sid_player_sw), so anything longer would be silently
+/// mangled rather than round-trip.
+pub fn export_name(source: ExportSource) -> String<16> {
+    let mut s = String::new();
+    let _ = match source {
+        ExportSource::Edit => write!(s, "EDIT.SYX"),
+        ExportSource::Slot(n) => write!(s, "P{:03}.SYX", n),
+    };
+    s
 }
 
 pub struct MenuState {
@@ -1755,5 +1780,32 @@ mod tests {
         // title + Card + Bank + Program + Save + MidiSrc + UsbMode + detail = 8
         assert_eq!(fr.items.len(), 8);
         assert!(fr.items[6].text.contains("USB Mode MIDI"));
+    }
+
+    #[test]
+    fn patch_detail_reports_voice_mode_for_lead_only() {
+        // Lead (engine byte 0): voice mode is meaningful.
+        assert_eq!(patch_detail(0, 0x08), (Engine::Lead, Some(VoiceMode::Poly)));
+        assert_eq!(patch_detail(0, 0x01), (Engine::Lead, Some(VoiceMode::Legato)));
+        assert_eq!(patch_detail(0, 0x00), (Engine::Lead, Some(VoiceMode::Mono)));
+        // Non-Lead engines have no voice mode to show.
+        assert_eq!(patch_detail(1, 0x08), (Engine::Bassline, None));
+        assert_eq!(patch_detail(2, 0x08), (Engine::Drum, None));
+        assert_eq!(patch_detail(3, 0x08), (Engine::Multi, None));
+    }
+
+    #[test]
+    fn patch_detail_treats_unknown_engine_bytes_as_lead() {
+        // Engine::from_byte's existing fallback; pinned so patch_detail
+        // cannot silently diverge from it.
+        assert_eq!(patch_detail(200, 0x00), (Engine::Lead, Some(VoiceMode::Mono)));
+    }
+
+    #[test]
+    fn export_name_uses_83_filenames() {
+        assert_eq!(export_name(ExportSource::Edit).as_str(), "EDIT.SYX");
+        assert_eq!(export_name(ExportSource::Slot(0)).as_str(), "P000.SYX");
+        assert_eq!(export_name(ExportSource::Slot(42)).as_str(), "P042.SYX");
+        assert_eq!(export_name(ExportSource::Slot(127)).as_str(), "P127.SYX");
     }
 }

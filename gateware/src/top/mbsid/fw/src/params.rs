@@ -6,6 +6,16 @@
 //! rows mirror +6 so the L/R SIDs stay identical (factory-Lead invariant;
 //! stereo width comes from osc_detune, not divergent voice params).
 
+/// `sid_patch_t` engine-type byte. 0=Lead, 1=Bassline, 2=Drum, 3=Multi.
+pub const ENGINE_OFF: usize = 0x10;
+/// `sid_patch_t` voice-flags byte (bit 3 = poly, bit 0 = legato).
+pub const VFLAGS_OFF: usize = 0x50;
+
+/// Engine type and voice flags of a raw 512-byte patch image.
+pub fn patch_detail_bytes(buf: &[u8; 512]) -> (u8, u8) {
+    (buf[ENGINE_OFF], buf[VFLAGS_OFF])
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Enc {
     /// Sub-byte field: `(byte >> shift) & mask`.
@@ -285,5 +295,19 @@ mod tests {
         let d = &LEAD_PARAMS[0]; // Volume, max 15
         let ops = write_ops(d, 999, body_from(&[]));
         assert!(ops.iter().all(|(_, v)| (*v & 0x0F) <= 15));
+    }
+
+    #[test]
+    fn patch_detail_bytes_reads_engine_and_vflags_offsets() {
+        let mut buf = [0u8; 512];
+        buf[ENGINE_OFF] = 3;
+        buf[VFLAGS_OFF] = 0x08;
+        assert_eq!(patch_detail_bytes(&buf), (3, 0x08));
+    }
+
+    #[test]
+    fn patch_detail_offsets_match_sid_patch_t_layout() {
+        assert_eq!(ENGINE_OFF, 0x10);
+        assert_eq!(VFLAGS_OFF, 0x50);
     }
 }
