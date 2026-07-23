@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 HEADER = bytes((0xF0, 0x00, 0x00, 0x7E, 0x4B, 0x00))
@@ -15,6 +16,14 @@ DATA_END = 1034
 
 class PatchFormatError(ValueError):
     """An input is not one complete MBSID v2 Patch Write message."""
+
+
+@dataclass(frozen=True)
+class BuildResult:
+    data: bytes
+    included: int
+    skipped: int
+    warnings: tuple[str, ...]
 
 
 def natural_sort_key(path: Path) -> tuple[object, ...]:
@@ -67,3 +76,42 @@ def encode_bank_patch(patch: bytes, slot: int) -> bytes:
         nibbles.extend((value & 0x0F, value >> 4))
     checksum = (-sum(nibbles)) & 0x7F
     return HEADER + bytes((0x02, 0x00, 0x01, slot)) + bytes(nibbles) + bytes((checksum, 0xF7))
+
+
+def build_bank(
+    files: list[Path], preserve_patch_numbers: bool = False
+) -> BuildResult:
+    messages: list[bytes] = []
+    warnings: list[str] = []
+    occupied: set[int] = set()
+
+    for path in files:
+        try:
+            patch, embedded_slot = decode_patch_message(path.read_bytes())
+        except OSError as error:
+            warnings.append(f"{path}: cannot read: {error}")
+            continue
+        except PatchFormatError as error:
+            warnings.append(f"{path}: invalid patch: {error}")
+            continue
+
+        if preserve_patch_numbers:
+            slot = embedded_slot
+            if slot in occupied:
+                warnings.append(f"{path}: duplicate slot {slot}; keeping first")
+                continue
+        else:
+            if len(messages) == 128:
+                warnings.append(f"{path}: bank already has 128 patches; skipping")
+                continue
+            slot = len(messages)
+
+        occupied.add(slot)
+        messages.append(encode_bank_patch(patch, slot))
+
+    return BuildResult(
+        data=b"".join(messages),
+        included=len(messages),
+        skipped=len(warnings),
+        warnings=tuple(warnings),
+    )

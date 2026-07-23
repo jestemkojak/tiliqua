@@ -73,5 +73,67 @@ class DiscoveryTests(unittest.TestCase):
                              [root / "patch1.syx"])
 
 
+class BankAssemblyTests(unittest.TestCase):
+    def write_patch(self, root: Path, name: str, seed: int, slot: int) -> Path:
+        path = root / name
+        path.write_bytes(bank.encode_bank_patch(patch_bytes(seed), slot))
+        return path
+
+    def test_default_mode_skips_bad_file_without_consuming_slot(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            first = self.write_patch(root, "p1.syx", 1, 90)
+            bad = root / "p2.syx"
+            bad.write_bytes(b"bad")
+            third = self.write_patch(root, "p3.syx", 3, 91)
+
+            result = bank.build_bank([first, bad, third])
+
+            self.assertEqual((result.included, result.skipped), (2, 1))
+            self.assertIn("p2.syx", result.warnings[0])
+            self.assertEqual(bank.decode_patch_message(result.data[:1036]),
+                             (patch_bytes(1), 0))
+            self.assertEqual(bank.decode_patch_message(result.data[1036:]),
+                             (patch_bytes(3), 1))
+
+    def test_preserve_mode_keeps_first_duplicate_and_retains_gaps(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            first = self.write_patch(root, "p1.syx", 1, 7)
+            duplicate = self.write_patch(root, "p2.syx", 2, 7)
+            later = self.write_patch(root, "p3.syx", 3, 42)
+
+            result = bank.build_bank([first, duplicate, later], True)
+
+            self.assertEqual((result.included, result.skipped), (2, 1))
+            self.assertIn("duplicate slot 7", result.warnings[0])
+            self.assertEqual(bank.decode_patch_message(result.data[:1036]),
+                             (patch_bytes(1), 7))
+            self.assertEqual(bank.decode_patch_message(result.data[1036:]),
+                             (patch_bytes(3), 42))
+
+    def test_default_mode_warns_for_each_valid_patch_after_128(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            files = [
+                self.write_patch(root, f"p{index:03}.syx", index, index & 0x7F)
+                for index in range(130)
+            ]
+
+            result = bank.build_bank(files)
+
+            self.assertEqual((result.included, result.skipped), (128, 2))
+            self.assertEqual(len(result.data), 128 * 1036)
+            self.assertTrue(all("bank already has 128 patches" in warning
+                                for warning in result.warnings))
+
+    def test_unreadable_file_is_skipped(self):
+        with tempfile.TemporaryDirectory() as raw:
+            missing = Path(raw) / "missing.syx"
+            result = bank.build_bank([missing])
+            self.assertEqual((result.included, result.skipped), (0, 1))
+            self.assertIn("cannot read", result.warnings[0])
+
+
 if __name__ == "__main__":
     unittest.main()
