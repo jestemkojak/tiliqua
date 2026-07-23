@@ -15,11 +15,12 @@ def patch_bytes(seed: int) -> bytes:
 
 class CodecTests(unittest.TestCase):
     def test_encode_matches_firmware_layout_and_round_trips(self):
-        patch = patch_bytes(9)
+        patch = bytes([0xAB]) + patch_bytes(9)[1:]
         encoded = bank.encode_bank_patch(patch, 5)
 
         self.assertEqual(len(encoded), 1036)
         self.assertEqual(encoded[:10], bytes.fromhex("f0 00 00 7e 4b 00 02 00 01 05"))
+        self.assertEqual(encoded[10:12], bytes.fromhex("0b 0a"))
         self.assertEqual(encoded[-1], 0xF7)
         self.assertEqual(encoded[-2], (-sum(encoded[10:1034])) & 0x7F)
         self.assertEqual(bank.decode_patch_message(encoded), (patch, 5))

@@ -217,7 +217,8 @@ The `Usb` card's **Import** row replaces the *entire* User bank (all 128
 slots) in one operation from a single bank-dump file, instead of loading
 patches one at a time.
 
-To build a bank from a directory of individual patch dumps, run:
+To build a bank from a directory of individual patch dumps, run this from
+`gateware/src/top/mbsid`:
 
 ```console
 python3 make_patch_bank.py path/to/patches
@@ -229,6 +230,7 @@ assigned to slots from 0 upward. Invalid files and valid files beyond the
 in each dump, add `--preserve-patch-numbers`; when two files name the same
 slot, the first file wins. Use `-o PATH` to choose a name other than the
 default `BANK.SYX`.
+The default `BANK.SYX` is created in the current working directory.
 
 1. Copy a bank-dump `.syx` file (e.g. one exported from MIOS Studio, or
    another MIDIbox SID) onto the drive as **`/MBSID/BANK.SYX`** — this exact
