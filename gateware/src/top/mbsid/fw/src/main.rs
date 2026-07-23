@@ -29,7 +29,7 @@ use panic_halt as _;
 use tiliqua_hal as hal;
 use tiliqua_pac as pac;
 
-use tiliqua_fw::bank_import::{self, ImportOutcome};
+use tiliqua_fw::bank_import;
 use tiliqua_fw::cv::{self, CvSink};
 use tiliqua_fw::fat::{FileSystem, FsOptions, MscStorage};
 use tiliqua_fw::mbsid_sys;
@@ -37,6 +37,7 @@ use tiliqua_fw::menu::PressResult;
 use tiliqua_fw::menu::{DriveState, UsbInfo};
 use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
 use tiliqua_fw::regdiff::{RegDiff, WriteList};
+use tiliqua_fw::status::{self, Status};
 use tiliqua_fw::sysex_capture::SysexCapture;
 use tiliqua_fw::usb_patch;
 use tiliqua_fw::{params, settings_store, uptime};
@@ -299,16 +300,6 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
     });
 }
 
-fn save_status(ok: bool, slot: u8) -> heapless::String<24> {
-    let mut s = heapless::String::new();
-    let _ = if ok {
-        core::fmt::Write::write_fmt(&mut s, format_args!("Saved U{:03}", slot))
-    } else {
-        core::fmt::Write::write_fmt(&mut s, format_args!("Save FAILED U{:03}", slot))
-    };
-    s
-}
-
 /// Mount the drive's first FAT volume and run `f` on it. Every USB menu
 /// action re-mounts (sid_player_sw idiom): no FileSystem lifetime to hold
 /// across drive unplugs, and patch files are tiny so the cost is a few
@@ -337,11 +328,9 @@ fn usb_load<F: tiliqua_hal::nor_flash::NorFlash + tiliqua_hal::nor_flash::ReadNo
     state: &mut MenuState,
     user_detail: &mut Option<(u8, u8)>,
 ) -> heapless::String<24> {
-    let mut s = heapless::String::new();
     let ok = with_fat(msc, |fs| usb_patch::load_patch_by_index(fs, ix, patch_buf)).unwrap_or(false);
     if !ok {
-        let _ = core::fmt::Write::write_str(&mut s, "USB load FAILED");
-        return s;
+        return status::usb_load_failed();
     }
     critical_section::with(|_cs| {
         mbsid_sys::load_patch(patch_buf);
@@ -350,18 +339,9 @@ fn usb_load<F: tiliqua_hal::nor_flash::NorFlash + tiliqua_hal::nor_flash::ReadNo
     state.refresh_params(|a| mbsid_sys::patch_byte(a));
     state.edited = false;
     match slot {
-        Some(n) => {
-            if store.save(n, patch_buf).is_ok() {
-                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Loaded -> U{:03}", n));
-            } else {
-                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Save FAILED U{:03}", n));
-            }
-        }
-        None => {
-            let _ = core::fmt::Write::write_str(&mut s, "Loaded (audition)");
-        }
+        Some(n) => status::usb_loaded(Some(n), store.save(n, patch_buf).is_ok()),
+        None => status::usb_loaded(None, true),
     }
-    s
 }
 
 #[entry]
@@ -445,11 +425,7 @@ fn main() -> ! {
     // Engine/vflags of the last successfully loaded USER patch (the ROM-bank
     // cache in the shim can't answer for user slots).
     let mut user_detail: Option<(u8, u8)> = None;
-    let mut status: Option<heapless::String<24>> = None;
-    // Wall-clock timestamp of the most recent status set, for TTL auto-clear
-    // below (uptime::now_ms(), wraparound-safe via deadline_expired).
-    let mut status_set_at: Option<u32> = None;
-    const STATUS_TTL_MS: u32 = 3000;
+    let mut status = Status::new();
 
     // Total banks = engine ROM banks + the flash User bank (always last).
     let mut state = MenuState::new(mbsid_sys::bank_count() + 1, 0, BOOT_PATCH_INDEX);
@@ -561,13 +537,11 @@ fn main() -> ! {
             lead_loaded = mbsid_sys::current_engine() == 0;
             state.lead_loaded = lead_loaded;
 
-            // Auto-clear a stale status message after STATUS_TTL_MS so e.g.
+            // Auto-clear a stale status message after status::TTL_MS so e.g.
             // "Loaded -> U00x" doesn't linger across unrelated navigation
             // (it used to only clear on Cancel). Checked every iteration,
             // same resync-every-loop shape as lead_loaded above.
-            if uptime::ttl_expired(status_set_at, uptime::now_ms(), STATUS_TTL_MS) {
-                status = None;
-                status_set_at = None;
+            if status.expire(uptime::now_ms()) {
                 dirty = true;
             }
 
@@ -691,8 +665,7 @@ fn main() -> ! {
                 match state.on_press() {
                     PressResult::Toggled => {}
                     PressResult::Cancel => {
-                        status = None;
-                        status_set_at = None;
+                        status.clear();
                     }
                     PressResult::Commit(slot) => {
                         // On-device "save as": copy the live patch out under
@@ -704,32 +677,35 @@ fn main() -> ! {
                         if ok {
                             state.edited = false;
                         }
-                        status = Some(save_status(ok, slot));
-                        status_set_at = Some(uptime::now_ms());
+                        status.set(status::saved(ok, slot), uptime::now_ms());
                     }
                     PressResult::UsbLoad(ix) => {
-                        status = Some(usb_load(
-                            &usb_msc,
-                            ix as usize,
-                            None,
-                            &mut store,
-                            &mut patch_buf,
-                            &mut state,
-                            &mut user_detail,
-                        ));
-                        status_set_at = Some(uptime::now_ms());
+                        status.set(
+                            usb_load(
+                                &usb_msc,
+                                ix as usize,
+                                None,
+                                &mut store,
+                                &mut patch_buf,
+                                &mut state,
+                                &mut user_detail,
+                            ),
+                            uptime::now_ms(),
+                        );
                     }
                     PressResult::UsbLoadToSlot { file, slot } => {
-                        status = Some(usb_load(
-                            &usb_msc,
-                            file as usize,
-                            Some(slot),
-                            &mut store,
-                            &mut patch_buf,
-                            &mut state,
-                            &mut user_detail,
-                        ));
-                        status_set_at = Some(uptime::now_ms());
+                        status.set(
+                            usb_load(
+                                &usb_msc,
+                                file as usize,
+                                Some(slot),
+                                &mut store,
+                                &mut patch_buf,
+                                &mut state,
+                                &mut user_detail,
+                            ),
+                            uptime::now_ms(),
+                        );
                     }
                     PressResult::UsbImportBank => {
                         // Whole-bank replace from /MBSID/BANK.SYX (spec §4).
@@ -739,22 +715,7 @@ fn main() -> ! {
                         // usb_msc.flush() needed.
                         let outcome =
                             with_fat(&usb_msc, |fs| bank_import::import_bank(fs, &mut store));
-                        let mut s: heapless::String<24> = heapless::String::new();
-                        let _ = match outcome {
-                            None => core::fmt::Write::write_str(&mut s, "USB mount FAILED"),
-                            Some(ImportOutcome::BadFile) => {
-                                core::fmt::Write::write_str(&mut s, "No/bad BANK.SYX")
-                            }
-                            Some(ImportOutcome::Failed) => {
-                                core::fmt::Write::write_str(&mut s, "Import FAILED")
-                            }
-                            Some(ImportOutcome::Imported(n)) => core::fmt::Write::write_fmt(
-                                &mut s,
-                                format_args!("Imported {} patches", n),
-                            ),
-                        };
-                        status = Some(s);
-                        status_set_at = Some(uptime::now_ms());
+                        status.set(status::imported(outcome), uptime::now_ms());
                     }
                     PressResult::UsbExport { source } => {
                         // Re-enabled 2026-07-14 after the drive-corruption
@@ -930,14 +891,7 @@ fn main() -> ! {
                                 core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
                             }
                         }
-                        let mut s: heapless::String<24> = heapless::String::new();
-                        let _ = if ok {
-                            core::fmt::Write::write_fmt(&mut s, format_args!("Exported {}", fname))
-                        } else {
-                            core::fmt::Write::write_str(&mut s, "Export FAILED")
-                        };
-                        status = Some(s);
-                        status_set_at = Some(uptime::now_ms());
+                        status.set(status::exported(ok, &fname), uptime::now_ms());
                         usb_listed = false; // new file: refresh the list
                     }
                 }
@@ -947,8 +901,10 @@ fn main() -> ! {
             // SysEx Bank Write captured by the ISR -> persist here.
             let pending = critical_section::with(|cs| app.borrow_ref_mut(cs).pending_save.take());
             if let Some((slot, bytes)) = pending {
-                status = Some(save_status(store.save(slot, &bytes).is_ok(), slot));
-                status_set_at = Some(uptime::now_ms());
+                status.set(
+                    status::saved(store.save(slot, &bytes).is_ok(), slot),
+                    uptime::now_ms(),
+                );
                 dirty = true;
             }
 

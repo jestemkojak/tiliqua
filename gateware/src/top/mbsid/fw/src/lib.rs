@@ -11,6 +11,7 @@ pub mod partition;
 pub mod patch_store;
 pub mod regdiff;
 pub mod settings_store;
+pub mod status;
 pub mod sysex_capture;
 pub mod uptime;
 #[cfg(not(test))]
