@@ -27,6 +27,12 @@ impl RegDiff {
     }
 }
 
+impl Default for RegDiff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

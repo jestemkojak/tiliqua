@@ -3,6 +3,12 @@ name = "tiliqua-fw"
 version = "0.1.0"
 edition = "2021"
 
+# Clippy is advisory, not blocking: five warnings are deliberately
+# `#[allow]`ed at their call sites with a pointer to the refactor that
+# removes them. Do NOT raise this to "deny" until those are gone.
+[lints.clippy]
+all = "warn"
+
 [dependencies]
 tiliqua-hal = { path="../../../rs/hal", default-features = false }
 tiliqua-lib = { path = "../../../rs/lib" }

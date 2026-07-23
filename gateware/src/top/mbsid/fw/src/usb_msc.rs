@@ -52,7 +52,9 @@ pub struct MscDiag {
     ///  deterministically on hardware while the same sequence passes in
     ///  sim — these cells discriminate drive-busy (3 with high spins) from
     ///  engine-level rejection (2, with the reject snapshot saying where).
+    #[allow(clippy::type_complexity)] // replaced by ReadFailure in Task 4
     pub rd_fail_first: core::cell::Cell<(u8, u8, u32, u32, u8, u8, u8, u8)>,
+    #[allow(clippy::type_complexity)] // replaced by ReadFailure in Task 4
     pub rd_fail: core::cell::Cell<(u8, u8, u32, u32, u8, u8, u8, u8)>,
     /// Packed read_path_info CSR captured with rd_fail_first/rd_fail.
     /// [9:0]=engine bytes, [19:10]=peripheral bytes,
@@ -219,7 +221,7 @@ impl UsbMsc {
                 spins = spins.wrapping_add(1);
                 // Deadline/liveness checks every 1024 spins: each check is a
                 // critical_section + CSR read, too heavy for every iteration.
-                if spins % 1024 == 0 {
+                if spins.is_multiple_of(1024) {
                     if !self.connected() {
                         // rsn=4: the engine lost the drive mid-command
                         // (watchdog fired or the drive was yanked) —
@@ -360,7 +362,7 @@ impl UsbMsc {
                 };
             }
             spins = spins.wrapping_add(1);
-            if spins % 1024 == 0 {
+            if spins.is_multiple_of(1024) {
                 let now = crate::uptime::now_ms();
                 let conn_lost = !self.connected();
                 if conn_lost || crate::uptime::deadline_expired(t0, now, WRITE_TIMEOUT_MS) {
@@ -426,7 +428,7 @@ impl UsbMsc {
                 };
             }
             spins = spins.wrapping_add(1);
-            if spins % 1024 == 0 {
+            if spins.is_multiple_of(1024) {
                 let now = crate::uptime::now_ms();
                 if !self.connected() || crate::uptime::deadline_expired(t0, now, FLUSH_TIMEOUT_MS) {
                     return Err(MscError::WriteError);

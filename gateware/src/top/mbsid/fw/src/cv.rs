@@ -161,15 +161,15 @@ impl CvState {
 
     pub fn tick(&mut self, x: [i32; 4], sink: &mut impl CvSink) {
         // Continuous targets (knob/par), deadbanded on the 8-bit value.
-        for i in 0..4 {
-            let t = self.targets[i];
-            let (Some(_), v8) = (t.knob_number().or(t.par_number()), to_u8_scale(x[i])) else {
-                continue;
-            };
-            if self.last8[i] == Some(v8) {
+        for ((&t, last), &xi) in self.targets.iter().zip(self.last8.iter_mut()).zip(x.iter()) {
+            if t.knob_number().or(t.par_number()).is_none() {
                 continue;
             }
-            self.last8[i] = Some(v8);
+            let v8 = to_u8_scale(xi);
+            if *last == Some(v8) {
+                continue;
+            }
+            *last = Some(v8);
             if let Some(k) = t.knob_number() {
                 sink.knob(k, v8);
             } else if let Some(p) = t.par_number() {
@@ -209,6 +209,12 @@ impl CvState {
                 }
             }
         }
+    }
+}
+
+impl Default for CvState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

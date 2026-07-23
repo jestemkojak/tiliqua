@@ -187,6 +187,12 @@ impl SysexCapture {
     }
 }
 
+impl Default for SysexCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

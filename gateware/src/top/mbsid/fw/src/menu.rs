@@ -565,6 +565,10 @@ pub fn detail_line(detail: Option<(Engine, Option<VoiceMode>)>) -> String<48> {
 /// Build the menu's frame description at (pos_x, pos_y). Pure: same inputs as
 /// the old draw() (minus target/hue), returns the Item list that Painter
 /// diffs+blits. `bright` on each item maps to intensity 15 vs 9 at paint time.
+// Deferred: collapsed into a `FrameCtx<'_>` parameter struct by the
+// menu-API refactor (review step 5). Not a new problem — the arg list
+// has been 9-wide since the Usb card landed.
+#[allow(clippy::too_many_arguments)]
 pub fn build_frame(
     st: &MenuState,
     name: &str,
@@ -891,6 +895,12 @@ impl Painter {
         }
         self.prev = frame;
         Ok(())
+    }
+}
+
+impl Default for Painter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

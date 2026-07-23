@@ -12,7 +12,12 @@ use fatfs::{IoBase, IoError, Read, Seek, SeekFrom, Write};
 /// Minimal 512-byte block device. Implemented by `&usb_msc::UsbMsc` on
 /// target and by in-memory disks in host tests.
 pub trait BlockIo {
+    // Deferred: `Result<_, ()>` becomes a real error enum in the
+    // error-handling refactor (review step 4). Both impls (UsbMsc on
+    // target, MemDisk in tests) discard the cause today anyway.
+    #[allow(clippy::result_unit_err)]
     fn read_block(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), ()>;
+    #[allow(clippy::result_unit_err)]
     fn write_block(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), ()>;
 }
 
