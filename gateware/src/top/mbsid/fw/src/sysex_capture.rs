@@ -36,28 +36,38 @@ pub struct SysexCapture {
     state: State,
     hdr_ix: u8,
     buf: [u8; 512],
-    data_ix: u16,     // nibble-byte counter, 0..=1024
-    checksum: u8,     // running 7-bit sum (mirrors engine's u8 sysexChecksum)
-    lnibble: bool,    // true = low nibble already stored for buf[data_ix/2]
+    data_ix: u16,  // nibble-byte counter, 0..=1024
+    checksum: u8,  // running 7-bit sum (mirrors engine's u8 sysexChecksum)
+    lnibble: bool, // true = low nibble already stored for buf[data_ix/2]
     bank: u8,
     patch: u8,
     file_mode: bool,
 }
 
 impl SysexCapture {
-    pub fn new() -> Self { Self::with_mode(false) }
+    pub fn new() -> Self {
+        Self::with_mode(false)
+    }
 
     /// File-import mode (M6 spec §6c): accept ANY cmd-0x02 patch dump —
     /// type/bank/patch bytes are ignored (a file explicitly chosen by the
     /// user carries its own intent) — while still enforcing header, nibble
     /// count, checksum, and the F7 terminator. The live MIDI path keeps
     /// `new()`'s strict Bank-Write/bank-1 rule.
-    pub fn file_mode() -> Self { Self::with_mode(true) }
+    pub fn file_mode() -> Self {
+        Self::with_mode(true)
+    }
 
     fn with_mode(file_mode: bool) -> Self {
         Self {
-            state: State::Idle, hdr_ix: 0, buf: [0u8; 512],
-            data_ix: 0, checksum: 0, lnibble: false, bank: 0, patch: 0,
+            state: State::Idle,
+            hdr_ix: 0,
+            buf: [0u8; 512],
+            data_ix: 0,
+            checksum: 0,
+            lnibble: false,
+            bank: 0,
+            patch: 0,
             file_mode,
         }
     }
@@ -67,8 +77,12 @@ impl SysexCapture {
         self.hdr_ix = 0;
     }
 
-    pub fn slot(&self) -> u8 { self.patch & 0x7F }
-    pub fn data(&self) -> &[u8; 512] { &self.buf }
+    pub fn slot(&self) -> u8 {
+        self.patch & 0x7F
+    }
+    pub fn data(&self) -> &[u8; 512] {
+        &self.buf
+    }
 
     pub fn in_message(&self) -> bool {
         !(self.state == State::Idle && self.hdr_ix == 0)
@@ -78,7 +92,9 @@ impl SysexCapture {
     /// valid Bank Write (type 0x00, bank 1). Never allocates, never panics.
     pub fn feed(&mut self, b: u8) -> bool {
         // Realtime bytes are transparent everywhere (MIDI spec).
-        if b >= 0xF8 { return false; }
+        if b >= 0xF8 {
+            return false;
+        }
 
         // A status byte always (re)frames the stream.
         if b == 0xF0 {
@@ -109,7 +125,11 @@ impl SysexCapture {
                 }
             }
             State::Cmd => {
-                self.state = if b == CMD_PATCH_WRITE { State::Type } else { State::Skip };
+                self.state = if b == CMD_PATCH_WRITE {
+                    State::Type
+                } else {
+                    State::Skip
+                };
             }
             State::Type => {
                 // Strict: only Bank Write to sid 0. File mode: any type — the
@@ -151,7 +171,11 @@ impl SysexCapture {
             }
             State::Checksum => {
                 let expect = (self.checksum as i32).wrapping_neg() as u8 & 0x7F;
-                self.state = if b == expect { State::Term } else { State::Skip };
+                self.state = if b == expect {
+                    State::Term
+                } else {
+                    State::Skip
+                };
             }
             State::Term => {
                 // Extra data byte after checksum = malformed.
@@ -171,28 +195,41 @@ mod tests {
     fn encode(ptype: u8, bank: u8, patch: u8, data: &[u8; 512]) -> [u8; 1036] {
         let mut out = [0u8; 1036];
         let mut k = 0;
-        for &h in &HEADER { out[k] = h; k += 1; }
-        out[k] = CMD_PATCH_WRITE; k += 1;
-        out[k] = ptype; k += 1;
-        out[k] = bank; k += 1;
-        out[k] = patch; k += 1;
+        for &h in &HEADER {
+            out[k] = h;
+            k += 1;
+        }
+        out[k] = CMD_PATCH_WRITE;
+        k += 1;
+        out[k] = ptype;
+        k += 1;
+        out[k] = bank;
+        k += 1;
+        out[k] = patch;
+        k += 1;
         let mut sum: u32 = 0;
         for &d in data.iter() {
             let lo = d & 0x0F;
             let hi = (d >> 4) & 0x0F;
-            out[k] = lo; k += 1;
-            out[k] = hi; k += 1;
+            out[k] = lo;
+            k += 1;
+            out[k] = hi;
+            k += 1;
             sum += (lo + hi) as u32;
         }
-        out[k] = ((sum as i32).wrapping_neg() & 0x7F) as u8; k += 1;
-        out[k] = 0xF7; k += 1;
+        out[k] = ((sum as i32).wrapping_neg() & 0x7F) as u8;
+        k += 1;
+        out[k] = 0xF7;
+        k += 1;
         assert_eq!(k, 1036);
         out
     }
 
     fn test_patch() -> [u8; 512] {
         let mut p = [0u8; 512];
-        for (i, b) in p.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(37); }
+        for (i, b) in p.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37);
+        }
         p[..4].copy_from_slice(b"NAME");
         p
     }
@@ -305,8 +342,12 @@ mod tests {
         let mut cap = SysexCapture::new();
         let mut captured = 0;
         for (i, &b) in msg.iter().enumerate() {
-            if i == 100 { assert!(!cap.feed(0xF8)); }
-            if cap.feed(b) { captured += 1; }
+            if i == 100 {
+                assert!(!cap.feed(0xF8));
+            }
+            if cap.feed(b) {
+                captured += 1;
+            }
         }
         assert_eq!(captured, 1);
         assert_eq!(cap.slot(), 11);

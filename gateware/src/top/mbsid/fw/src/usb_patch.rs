@@ -7,8 +7,10 @@
 //! dump (*.SYX, parsed by SysexCapture::file_mode) or a raw 512-byte
 //! sid_patch_t (exact size match).
 
-use fatfs::{Dir, DefaultTimeProvider, File, FileSystem, LossyOemCpConverter, Read, ReadWriteSeek, Write};
 use crate::sysex_capture::SysexCapture;
+use fatfs::{
+    DefaultTimeProvider, Dir, File, FileSystem, LossyOemCpConverter, Read, ReadWriteSeek, Write,
+};
 
 pub type FileName = heapless::String<16>;
 pub const MAX_FILES: usize = 64;
@@ -37,17 +39,22 @@ fn patch_dir<IO: ReadWriteSeek>(
     }
 }
 
-pub fn list_patch_files<IO: ReadWriteSeek>(
-    fs: &FileSystem<IO>, out: &mut FileList) -> usize {
+pub fn list_patch_files<IO: ReadWriteSeek>(fs: &FileSystem<IO>, out: &mut FileList) -> usize {
     let dir = patch_dir(fs);
     for entry in dir.iter() {
         let Ok(e) = entry else { break };
-        if e.is_dir() { continue; }
+        if e.is_dir() {
+            continue;
+        }
         let name = e.short_file_name_as_bytes();
-        if !candidate(name, e.len()) { continue; }
+        if !candidate(name, e.len()) {
+            continue;
+        }
         let mut s = FileName::new();
         let _ = s.push_str(core::str::from_utf8(name).unwrap_or("?"));
-        if out.push(s).is_err() { break; }
+        if out.push(s).is_err() {
+            break;
+        }
     }
     out.len()
 }
@@ -71,14 +78,21 @@ pub fn parse_patch_file(bytes: &[u8], dst: &mut [u8; 512]) -> bool {
 
 /// Read the idx-th candidate file and parse it into `dst`.
 pub fn load_patch_by_index<IO: ReadWriteSeek>(
-    fs: &FileSystem<IO>, idx: usize, dst: &mut [u8; 512]) -> bool {
+    fs: &FileSystem<IO>,
+    idx: usize,
+    dst: &mut [u8; 512],
+) -> bool {
     let dir = patch_dir(fs);
     let mut count = 0usize;
     for entry in dir.iter() {
         let Ok(e) = entry else { return false };
-        if e.is_dir() { continue; }
+        if e.is_dir() {
+            continue;
+        }
         let name = e.short_file_name_as_bytes();
-        if !candidate(name, e.len()) { continue; }
+        if !candidate(name, e.len()) {
+            continue;
+        }
         if count == idx {
             let mut file = e.to_file();
             let mut buf = [0u8; MAX_FILE_BYTES];
@@ -102,9 +116,9 @@ pub fn load_patch_by_index<IO: ReadWriteSeek>(
 pub fn encode_syx(patch: &[u8; 512], slot: u8, out: &mut [u8; 1036]) {
     const HEADER: [u8; 6] = [0xF0, 0x00, 0x00, 0x7E, 0x4B, 0x00];
     out[..6].copy_from_slice(&HEADER);
-    out[6] = 0x02;        // cmd: Patch Write
-    out[7] = 0x00;        // type: Bank Write, sid 0
-    out[8] = 0x01;        // bank: User
+    out[6] = 0x02; // cmd: Patch Write
+    out[7] = 0x00; // type: Bank Write, sid 0
+    out[8] = 0x01; // bank: User
     out[9] = slot & 0x7F;
     let mut sum: u32 = 0;
     for (i, &d) in patch.iter().enumerate() {
@@ -119,7 +133,11 @@ pub fn encode_syx(patch: &[u8; 512], slot: u8, out: &mut [u8; 1036]) {
 
 /// Export `patch` as `/MBSID/<name>`; flush; verify by readback+reparse.
 pub fn export_patch<IO: ReadWriteSeek>(
-    fs: &FileSystem<IO>, name: &str, patch: &[u8; 512], slot: u8) -> bool {
+    fs: &FileSystem<IO>,
+    name: &str,
+    patch: &[u8; 512],
+    slot: u8,
+) -> bool {
     let root = fs.root_dir();
     let dir = match root.open_dir("MBSID") {
         Ok(d) => d,
@@ -131,8 +149,12 @@ pub fn export_patch<IO: ReadWriteSeek>(
     let mut syx = [0u8; 1036];
     encode_syx(patch, slot, &mut syx);
     {
-        let Ok(mut f) = dir.create_file(name) else { return false };
-        if f.truncate().is_err() { return false; }
+        let Ok(mut f) = dir.create_file(name) else {
+            return false;
+        };
+        if f.truncate().is_err() {
+            return false;
+        }
         let mut rest: &[u8] = &syx;
         while !rest.is_empty() {
             match f.write(rest) {
@@ -140,11 +162,15 @@ pub fn export_patch<IO: ReadWriteSeek>(
                 Ok(n) => rest = &rest[n..],
             }
         }
-        if f.flush().is_err() { return false; }
+        if f.flush().is_err() {
+            return false;
+        }
     }
     // Verify: re-open, re-read, re-parse, byte-compare (cheap end-to-end
     // check that the write path actually landed — spec §6b).
-    let Ok(mut f) = dir.open_file(name) else { return false };
+    let Ok(mut f) = dir.open_file(name) else {
+        return false;
+    };
     let mut back = [0u8; 1036];
     let mut total = 0usize;
     while total < back.len() {
@@ -203,17 +229,27 @@ fn stream_bank<IO: ReadWriteSeek>(
     let mut buf = [0u8; 1024];
     loop {
         let n = file.read(&mut buf).ok()?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         for &b in &buf[..n] {
-            if b == 0xF0 { starts += 1; }
+            if b == 0xF0 {
+                starts += 1;
+            }
             if cap.feed(b) {
                 count += 1;
-                if count > 128 { return None; }
-                if !on_patch(cap.slot(), cap.data()) { return None; }
+                if count > 128 {
+                    return None;
+                }
+                if !on_patch(cap.slot(), cap.data()) {
+                    return None;
+                }
             }
         }
     }
-    if cap.in_message() || count == 0 { return None; }
+    if cap.in_message() || count == 0 {
+        return None;
+    }
     Some((count as u8, starts))
 }
 
@@ -223,11 +259,15 @@ pub fn validate_bank<IO: ReadWriteSeek>(fs: &FileSystem<IO>) -> Option<BankSumma
     let mut slots = [0u8; 16];
     let (count, starts) = stream_bank(fs, |slot, _| {
         let (ix, bit) = ((slot >> 3) as usize, 1u8 << (slot & 7));
-        if slots[ix] & bit != 0 { return false; } // duplicate slot
+        if slots[ix] & bit != 0 {
+            return false;
+        } // duplicate slot
         slots[ix] |= bit;
         true
     })?;
-    if starts != count as u16 { return None; } // an invalid message was skipped
+    if starts != count as u16 {
+        return None;
+    } // an invalid message was skipped
     Some(BankSummary { count, slots })
 }
 
@@ -245,8 +285,8 @@ pub fn for_each_bank_patch<IO: ReadWriteSeek>(
 #[cfg(test)]
 pub(crate) mod testfs {
     use fatfs::{
-        format_volume, FileSystem, FormatVolumeOptions, FsOptions, IoBase,
-        IoError, Read, Seek, SeekFrom, Write,
+        format_volume, FileSystem, FormatVolumeOptions, FsOptions, IoBase, IoError, Read, Seek,
+        SeekFrom, Write,
     };
     use std::vec::Vec;
 
@@ -375,7 +415,8 @@ pub(crate) mod testfs {
         let mut sum: u32 = 0;
         for &d in patch.iter() {
             let (lo, hi) = (d & 0x0F, (d >> 4) & 0x0F);
-            out.push(lo); out.push(hi);
+            out.push(lo);
+            out.push(hi);
             sum += (lo + hi) as u32;
         }
         out.push(((sum as i32).wrapping_neg() & 0x7F) as u8);
@@ -405,8 +446,8 @@ pub(crate) mod testfs {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::testfs::*;
+    use super::*;
     use fatfs::FsOptions;
     use std::vec::Vec;
 
@@ -417,8 +458,8 @@ mod tests {
         let mut img = build_gpt_fat_image(&[
             ("LEAD1.SYX", &syx_bytes(&p)),
             ("README.TXT", b"not a patch"),
-            ("RAW.BIN", &raw),          // exactly 512 bytes -> candidate
-            ("BIG.SYX", &[0u8; 4096]),  // too big -> skipped
+            ("RAW.BIN", &raw),         // exactly 512 bytes -> candidate
+            ("BIG.SYX", &[0u8; 4096]), // too big -> skipped
         ]);
         let base = BASE_LBA as usize * SECTOR;
         let part = VecDisk::new(&mut img[base..]);
@@ -500,7 +541,7 @@ mod tests {
         assert!(parse_patch_file(&syx, &mut dst));
         assert_eq!(dst, p);
         assert_eq!(syx[8], 0x01); // bank byte 1 = User (re-sendable over MIDI)
-        assert_eq!(syx[9], 5);    // slot
+        assert_eq!(syx[9], 5); // slot
     }
 
     #[test]
@@ -540,9 +581,7 @@ mod tests {
         assert_eq!(dst, p2); // second export won, file not duplicated
     }
 
-    fn fs_with_root_file<'a>(
-        img: &'a mut Vec<u8>,
-    ) -> FileSystem<VecDisk<'a>> {
+    fn fs_with_root_file<'a>(img: &'a mut Vec<u8>) -> FileSystem<VecDisk<'a>> {
         let base = BASE_LBA as usize * SECTOR;
         FileSystem::new(VecDisk::new(&mut img[base..]), FsOptions::new()).unwrap()
     }
@@ -575,8 +614,8 @@ mod tests {
         let mut bytes = bank_bytes(&[(5u8, test_patch(5))]);
         assert_eq!(bytes[8], 0x01);
         bytes[8] = 0x00; // encode_syx writes bank 1; patch it to Factory
-        // fix the checksum? No — bank/patch bytes are OUTSIDE the checksummed
-        // 1024-nibble body (checksum covers data nibbles only), so no fixup.
+                         // fix the checksum? No — bank/patch bytes are OUTSIDE the checksummed
+                         // 1024-nibble body (checksum covers data nibbles only), so no fixup.
         let mut img = build_gpt_fat_image(&[("BANK.SYX", &bytes)]);
         let fs = fs_with_root_file(&mut img);
         let sum = validate_bank(&fs).expect("bank byte must be ignored");
@@ -590,8 +629,10 @@ mod tests {
         bytes[1034] = (bytes[1034] + 1) & 0x7F; // corrupt first message's checksum
         let mut img = build_gpt_fat_image(&[("BANK.SYX", &bytes)]);
         let fs = fs_with_root_file(&mut img);
-        assert!(validate_bank(&fs).is_none(),
-                "a skipped-invalid message must reject the file, not shrink it");
+        assert!(
+            validate_bank(&fs).is_none(),
+            "a skipped-invalid message must reject the file, not shrink it"
+        );
     }
 
     #[test]
@@ -624,8 +665,7 @@ mod tests {
 
     #[test]
     fn mbsid_dir_bank_preferred_over_root() {
-        let mut img = build_gpt_fat_image(
-            &[("BANK.SYX", &bank_bytes(&[(0u8, test_patch(1))]))]);
+        let mut img = build_gpt_fat_image(&[("BANK.SYX", &bank_bytes(&[(0u8, test_patch(1))]))]);
         {
             let base = BASE_LBA as usize * SECTOR;
             let part = VecDisk::new(&mut img[base..]);
@@ -659,7 +699,10 @@ mod tests {
         let mut img = build_gpt_fat_image(&[("BANK.SYX", &bank_bytes(&patches))]);
         let fs = fs_with_root_file(&mut img);
         let mut calls = 0;
-        assert!(!for_each_bank_patch(&fs, |_, _| { calls += 1; false }));
+        assert!(!for_each_bank_patch(&fs, |_, _| {
+            calls += 1;
+            false
+        }));
         assert_eq!(calls, 1);
     }
 }

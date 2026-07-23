@@ -41,7 +41,12 @@ impl Frame {
     pub fn push(&mut self, x: i32, y: i32, bright: bool, text: &str) {
         let mut s: String<48> = String::new();
         let _ = s.push_str(text);
-        let _ = self.items.push(Item { x, y, bright, text: s });
+        let _ = self.items.push(Item {
+            x,
+            y,
+            bright,
+            text: s,
+        });
     }
 }
 
@@ -65,16 +70,19 @@ pub enum PaintOp {
 pub fn diff(prev: &Frame, next: &Frame) -> Vec<PaintOp, MAX_OPS> {
     let mut ops: Vec<PaintOp, MAX_OPS> = Vec::new();
     for (i, o) in prev.items.iter().enumerate() {
-        let survives = next.items.iter()
+        let survives = next
+            .items
+            .iter()
             .any(|n| n.x == o.x && n.y == o.y && n.text == o.text);
         if !survives {
             let _ = ops.push(PaintOp::Erase(i as u8));
         }
     }
     for (i, n) in next.items.iter().enumerate() {
-        let unchanged = prev.items.iter()
-            .any(|o| o.x == n.x && o.y == n.y && o.text == n.text
-                     && o.bright == n.bright);
+        let unchanged = prev
+            .items
+            .iter()
+            .any(|o| o.x == n.x && o.y == n.y && o.text == n.text && o.bright == n.bright);
         if !unchanged {
             let _ = ops.push(PaintOp::Draw(i as u8));
         }
@@ -96,7 +104,10 @@ mod tests {
 
     #[test]
     fn identical_frames_produce_no_ops() {
-        let a = f(&[(60, 80, true, "MBSID  Patch"), (60, 104, false, "  Card     Main")]);
+        let a = f(&[
+            (60, 80, true, "MBSID  Patch"),
+            (60, 104, false, "  Card     Main"),
+        ]);
         let b = a.clone();
         assert!(diff(&a, &b).is_empty());
     }
@@ -139,9 +150,16 @@ mod tests {
         let a = f(&[(60, 104, true, "old A"), (60, 128, false, "old B")]);
         let b = f(&[(60, 104, true, "new A"), (60, 128, false, "new B")]);
         let ops = diff(&a, &b);
-        let first_draw = ops.iter().position(|o| matches!(o, PaintOp::Draw(_))).unwrap();
-        assert!(ops[..first_draw].iter().all(|o| matches!(o, PaintOp::Erase(_))));
-        assert!(ops[first_draw..].iter().all(|o| matches!(o, PaintOp::Draw(_))));
+        let first_draw = ops
+            .iter()
+            .position(|o| matches!(o, PaintOp::Draw(_)))
+            .unwrap();
+        assert!(ops[..first_draw]
+            .iter()
+            .all(|o| matches!(o, PaintOp::Erase(_))));
+        assert!(ops[first_draw..]
+            .iter()
+            .all(|o| matches!(o, PaintOp::Draw(_))));
     }
 
     #[test]

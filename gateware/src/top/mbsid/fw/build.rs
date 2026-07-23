@@ -49,34 +49,49 @@ fn main() {
     //      the mios32 firmware main) + our extern "C" shim. -----------------------
     let mut cxx = cc::Build::new();
     cxx.cpp(true).compiler("clang++").cpp_link_stdlib(None);
-    for f in &common_flags { cxx.flag(f); }
+    for f in &common_flags {
+        cxx.flag(f);
+    }
     cxx.flag("-fno-exceptions")
         .flag("-fno-rtti")
         .flag("-fno-threadsafe-statics")
         .flag("-fno-use-cxa-atexit");
-    for inc in &includes { cxx.include(inc); }
+    for inc in &includes {
+        cxx.include(inc);
+    }
 
     let mut n_cpp = 0;
     for dir in [&core, &components] {
         for entry in std::fs::read_dir(dir).expect("read core/components dir") {
             let p = entry.unwrap().path();
-            if p.extension().and_then(|e| e.to_str()) != Some("cpp") { continue; }
+            if p.extension().and_then(|e| e.to_str()) != Some("cpp") {
+                continue;
+            }
             let name = p.file_name().unwrap().to_str().unwrap();
-            if name == "app.cpp" { continue; } // mios32 firmware main — not ours
+            if name == "app.cpp" {
+                continue;
+            } // mios32 firmware main — not ours
             cxx.file(&p);
             n_cpp += 1;
         }
     }
     cxx.file("csrc/mbsid_shim.cpp");
     n_cpp += 1;
-    assert!(n_cpp > 20, "expected the full engine tree, only found {n_cpp} TUs");
+    assert!(
+        n_cpp > 20,
+        "expected the full engine tree, only found {n_cpp} TUs"
+    );
     cxx.compile("mbsid"); // -> libmbsid.a
 
     // ---- C modules the engine consumes (real implementations, not stubs). -------
     let mut c = cc::Build::new();
     c.cpp(false).compiler("clang");
-    for f in &common_flags { c.flag(f); }
-    for inc in &includes { c.include(inc); }
+    for f in &common_flags {
+        c.flag(f);
+    }
+    for inc in &includes {
+        c.include(inc);
+    }
     c.file(modules.join("sid/sid.c"))
         .file(modules.join("notestack/notestack.c"))
         .file(modules.join("random/jsw_rand.c"))
@@ -102,7 +117,10 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc");
     rerun_dir(&core);
     rerun_dir(&components);
-    println!("cargo:rerun-if-changed={}", modules.join("sid/sid.c").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        modules.join("sid/sid.c").display()
+    );
 }
 
 fn rerun_dir(dir: &Path) {

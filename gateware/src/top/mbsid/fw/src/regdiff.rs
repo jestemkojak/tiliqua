@@ -32,14 +32,15 @@ mod tests {
     use super::*;
     #[test]
     fn emits_only_changed_registers() {
-        let mut d = RegDiff::new();          // shadow all-zero
+        let mut d = RegDiff::new(); // shadow all-zero
         let mut out = WriteList::new();
         let mut img = [0u8; 32];
-        img[0x04] = 0x11; img[0x18] = 0x0f;  // two regs changed
+        img[0x04] = 0x11;
+        img[0x18] = 0x0f; // two regs changed
         d.update(&img, &mut out);
         assert_eq!(out.as_slice(), &[(0x04, 0x11), (0x18, 0x0f)]);
         out.clear();
-        d.update(&img, &mut out);            // no change second time
+        d.update(&img, &mut out); // no change second time
         assert!(out.is_empty());
     }
 
@@ -49,18 +50,20 @@ mod tests {
         let mut dr = RegDiff::new();
         let mut out = WriteList::new();
 
-        let mut img_l = [0u8; 32]; img_l[0x00] = 0xAA;   // L changes reg 0
-        let mut img_r = [0u8; 32]; img_r[0x07] = 0xBB;   // R changes reg 7
+        let mut img_l = [0u8; 32];
+        img_l[0x00] = 0xAA; // L changes reg 0
+        let mut img_r = [0u8; 32];
+        img_r[0x07] = 0xBB; // R changes reg 7
 
         dl.update(&img_l, &mut out);
         assert_eq!(out.as_slice(), &[(0x00, 0xAA)]);
         out.clear();
 
         dr.update(&img_r, &mut out);
-        assert_eq!(out.as_slice(), &[(0x07, 0xBB)]);   // independent shadow
+        assert_eq!(out.as_slice(), &[(0x07, 0xBB)]); // independent shadow
         out.clear();
 
-        dl.update(&img_l, &mut out);                    // L unchanged
+        dl.update(&img_l, &mut out); // L unchanged
         assert!(out.is_empty());
     }
 }

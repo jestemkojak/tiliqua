@@ -17,39 +17,39 @@
 #![no_std]
 #![no_main]
 
-use critical_section::Mutex;
 use core::cell::RefCell;
+use critical_section::Mutex;
 
-use riscv_rt::entry;
-use irq::{handler, scoped_interrupts};
 use amaranth_soc_isr::return_as_is;
+use irq::{handler, scoped_interrupts};
+use riscv_rt::entry;
 
 use panic_halt as _;
 
-use tiliqua_pac as pac;
 use tiliqua_hal as hal;
+use tiliqua_pac as pac;
 
+use tiliqua_fw::bank_import::{self, ImportOutcome};
+use tiliqua_fw::cv::{self, CvSink};
+use tiliqua_fw::fat::{FileSystem, FsOptions, MscStorage};
 use tiliqua_fw::mbsid_sys;
+use tiliqua_fw::menu::PressResult;
+use tiliqua_fw::menu::{DriveState, UsbInfo};
+use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
 use tiliqua_fw::regdiff::{RegDiff, WriteList};
 use tiliqua_fw::sysex_capture::SysexCapture;
-use tiliqua_fw::patch_store::{UserPatchStore, USER_BANK_FLASH_BASE};
-use tiliqua_fw::bank_import::{self, ImportOutcome};
-use tiliqua_fw::menu::PressResult;
-use tiliqua_fw::cv::{self, CvSink};
-use tiliqua_fw::{params, settings_store, uptime};
 use tiliqua_fw::usb_patch;
-use tiliqua_fw::fat::{FileSystem, FsOptions, MscStorage};
-use tiliqua_fw::menu::{DriveState, UsbInfo};
+use tiliqua_fw::{params, settings_store, uptime};
 
-use midi_types::MidiMessage;
 use midi_convert::parse::MidiTryParseSlice;
+use midi_types::MidiMessage;
 
-use tiliqua_lib::{bootinfo, palette, calibration};
+use pac::constants::*;
+use tiliqua_fw::menu::{self, MenuState, TurnResult};
 use tiliqua_hal::encoder::Encoder;
 use tiliqua_hal::persist::Persist;
 use tiliqua_hal::pmod::EurorackPmod;
-use pac::constants::*;
-use tiliqua_fw::menu::{self, MenuState, TurnResult};
+use tiliqua_lib::{bootinfo, calibration, palette};
 
 // Generates Serial0/Timer0/etc. for this (binary-only) crate. Kept out of lib.rs
 // so the host `cargo test --lib` build stays pure-Rust (no pac/hal on x86_64).
@@ -97,7 +97,9 @@ fn default_isr_handler() {
     let sysclk = pac::clock::sysclk();
     let timer = Timer0::new(peripherals.TIMER0, sysclk);
     if timer.is_pending() {
-        unsafe { TIMER0(); }
+        unsafe {
+            TIMER0();
+        }
         timer.clear_pending();
     }
 }
@@ -107,7 +109,7 @@ fn default_isr_handler() {
 struct App {
     diff_l: RegDiff,
     diff_r: RegDiff,
-    wl:     WriteList,
+    wl: WriteList,
     sysex_cap: SysexCapture,
     sysex_idle_ms: u16,
     /// Complete Bank Write captured by the ISR; persisted by the main loop
@@ -122,9 +124,14 @@ struct App {
 impl App {
     fn new(pmod: EurorackPmod0) -> Self {
         Self {
-            diff_l: RegDiff::new(), diff_r: RegDiff::new(), wl: WriteList::new(),
-            sysex_cap: SysexCapture::new(), sysex_idle_ms: 0, pending_save: None,
-            cv: cv::CvState::new(), pmod,
+            diff_l: RegDiff::new(),
+            diff_r: RegDiff::new(),
+            wl: WriteList::new(),
+            sysex_cap: SysexCapture::new(),
+            sysex_idle_ms: 0,
+            pending_save: None,
+            cv: cv::CvState::new(),
+            pmod,
         }
     }
 }
@@ -133,18 +140,24 @@ impl App {
 /// critical_section (ISR body, or main-loop blocks under `cs`).
 struct EngineSink;
 impl CvSink for EngineSink {
-    fn knob(&mut self, knob: u8, value: u8) { mbsid_sys::knob_set(knob, value); }
-    fn par(&mut self, par: u8, value16: u16) { mbsid_sys::par_set(par, value16); }
-    fn note_on(&mut self, note: u8) { mbsid_sys::note_on(0, note, 100); } // MIDI ch 1
-    fn note_off(&mut self, note: u8) { mbsid_sys::note_off(0, note); }
+    fn knob(&mut self, knob: u8, value: u8) {
+        mbsid_sys::knob_set(knob, value);
+    }
+    fn par(&mut self, par: u8, value16: u16) {
+        mbsid_sys::par_set(par, value16);
+    }
+    fn note_on(&mut self, note: u8) {
+        mbsid_sys::note_on(0, note, 100);
+    } // MIDI ch 1
+    fn note_off(&mut self, note: u8) {
+        mbsid_sys::note_off(0, note);
+    }
 }
 
 /// Drain a write list to a SID peripheral, respecting FIFO backpressure
 /// (poll txn_status.writable). `(data<<5)|addr` encoding == `top/sid`.
 /// Closures abstract over the two distinct PAC peripheral types.
-fn drain_writelist(wl: &WriteList,
-                   writable: impl Fn() -> bool,
-                   write_word: impl Fn(u16)) {
+fn drain_writelist(wl: &WriteList, writable: impl Fn() -> bool, write_word: impl Fn(u16)) {
     for (reg, val) in wl.iter() {
         while !writable() {}
         write_word(((*val as u16) << 5) | (*reg as u16));
@@ -154,7 +167,7 @@ fn drain_writelist(wl: &WriteList,
 /// 1 kHz control ISR: MIDI in -> engine -> tick -> diff -> SID writes.
 fn timer0_handler(app: &Mutex<RefCell<App>>) {
     let peripherals = unsafe { pac::Peripherals::steal() };
-    let sid   = peripherals.SID_PERIPH;
+    let sid = peripherals.SID_PERIPH;
     let sid_r = peripherals.SID_PERIPH_R;
 
     critical_section::with(|cs| {
@@ -164,7 +177,9 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         //     dispatch each parsed message into the engine.
         loop {
             let word = sid.midi_read().read().bits();
-            if word == 0 { break; }
+            if word == 0 {
+                break;
+            }
             let bytes = [
                 (word & 0xFF) as u8,
                 ((word >> 8) & 0xFF) as u8,
@@ -177,8 +192,7 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
                         mbsid_sys::note_on(u8::from(ch), u8::from(note), u8::from(vel));
                     }
                     // Note-on vel 0 (running-status note-off) or explicit note-off.
-                    MidiMessage::NoteOn(ch, note, _) |
-                    MidiMessage::NoteOff(ch, note, _) => {
+                    MidiMessage::NoteOn(ch, note, _) | MidiMessage::NoteOff(ch, note, _) => {
                         mbsid_sys::note_off(u8::from(ch), u8::from(note));
                     }
                     // Pitch bend: the engine wants the raw 14-bit MIDI value
@@ -216,7 +230,9 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         let mut got_byte = false;
         for _ in 0..SYSEX_BYTES_PER_TICK {
             let r = sid.sysex_read().read();
-            if !r.valid().bit() { break; }
+            if !r.valid().bit() {
+                break;
+            }
             let b = r.data().bits();
             got_byte = true;
             mbsid_sys::sysex_byte(b);
@@ -253,18 +269,31 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
         // (b) Tick the engine; on a register change, diff L and R vs their
         //     shadows and stream only the changed regs to their SIDs.
         if mbsid_sys::tick() {
-            let App { diff_l, diff_r, wl, .. } = &mut *app;
+            let App {
+                diff_l, diff_r, wl, ..
+            } = &mut *app;
 
             diff_l.update(mbsid_sys::regs_l(), wl);
-            drain_writelist(wl,
+            drain_writelist(
+                wl,
                 || sid.txn_status().read().writable().bit(),
-                |w| { sid.transaction_data().write(|r| unsafe { r.transaction_data().bits(w) }); });
+                |w| {
+                    sid.transaction_data()
+                        .write(|r| unsafe { r.transaction_data().bits(w) });
+                },
+            );
             wl.clear();
 
             diff_r.update(mbsid_sys::regs_r(), wl);
-            drain_writelist(wl,
+            drain_writelist(
+                wl,
                 || sid_r.txn_status().read().writable().bit(),
-                |w| { sid_r.transaction_data().write(|r| unsafe { r.transaction_data().bits(w) }); });
+                |w| {
+                    sid_r
+                        .transaction_data()
+                        .write(|r| unsafe { r.transaction_data().bits(w) });
+                },
+            );
             wl.clear();
         }
     });
@@ -284,9 +313,10 @@ fn save_status(ok: bool, slot: u8) -> heapless::String<24> {
 /// action re-mounts (sid_player_sw idiom): no FileSystem lifetime to hold
 /// across drive unplugs, and patch files are tiny so the cost is a few
 /// 512-byte reads.
-fn with_fat<R>(msc: &tiliqua_fw::usb_msc::UsbMsc,
-               f: impl FnOnce(&FileSystem<MscStorage<&tiliqua_fw::usb_msc::UsbMsc>>) -> R)
-               -> Option<R> {
+fn with_fat<R>(
+    msc: &tiliqua_fw::usb_msc::UsbMsc,
+    f: impl FnOnce(&FileSystem<MscStorage<&tiliqua_fw::usb_msc::UsbMsc>>) -> R,
+) -> Option<R> {
     let storage = MscStorage::new(msc);
     match FileSystem::new(storage, FsOptions::new()) {
         Ok(fs) => Some(f(&fs)),
@@ -308,9 +338,7 @@ fn usb_load<F: tiliqua_hal::nor_flash::NorFlash + tiliqua_hal::nor_flash::ReadNo
     user_detail: &mut Option<(u8, u8)>,
 ) -> heapless::String<24> {
     let mut s = heapless::String::new();
-    let ok = with_fat(msc, |fs| {
-        usb_patch::load_patch_by_index(fs, ix, patch_buf)
-    }).unwrap_or(false);
+    let ok = with_fat(msc, |fs| usb_patch::load_patch_by_index(fs, ix, patch_buf)).unwrap_or(false);
     if !ok {
         let _ = core::fmt::Write::write_str(&mut s, "USB load FAILED");
         return s;
@@ -324,14 +352,14 @@ fn usb_load<F: tiliqua_hal::nor_flash::NorFlash + tiliqua_hal::nor_flash::ReadNo
     match slot {
         Some(n) => {
             if store.save(n, patch_buf).is_ok() {
-                let _ = core::fmt::Write::write_fmt(&mut s,
-                    format_args!("Loaded -> U{:03}", n));
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Loaded -> U{:03}", n));
             } else {
-                let _ = core::fmt::Write::write_fmt(&mut s,
-                    format_args!("Save FAILED U{:03}", n));
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Save FAILED U{:03}", n));
             }
         }
-        None => { let _ = core::fmt::Write::write_str(&mut s, "Loaded (audition)"); }
+        None => {
+            let _ = core::fmt::Write::write_str(&mut s, "Loaded (audition)");
+        }
     }
     s
 }
@@ -389,7 +417,9 @@ fn main() -> ! {
 
     // --- Display init ---
     let bootinfo = unsafe { bootinfo::BootInfo::from_addr(BOOTINFO_BASE) }.unwrap();
-    let modeline = bootinfo.modeline.maybe_override_fixed(FIXED_MODELINE, CLOCK_DVI_HZ);
+    let modeline = bootinfo
+        .modeline
+        .maybe_override_fixed(FIXED_MODELINE, CLOCK_DVI_HZ);
     let mut display = DMAFramebuffer0::new(
         peripherals.FRAMEBUFFER_PERIPH,
         peripherals.PALETTE_PERIPH,
@@ -408,11 +438,7 @@ fn main() -> ! {
 
     let mut encoder = Encoder0::new(peripherals.ENCODER0);
 
-    let spiflash = SPIFlash0::new(
-        peripherals.SPIFLASH_CTRL,
-        SPIFLASH_BASE,
-        SPIFLASH_SZ_BYTES,
-    );
+    let spiflash = SPIFlash0::new(peripherals.SPIFLASH_CTRL, SPIFLASH_BASE, SPIFLASH_SZ_BYTES);
     let mut store = UserPatchStore::new(spiflash, USER_BANK_FLASH_BASE);
     // One shared 512B scratch for user-bank load / save / SysEx persist —
     // keeps peak stack usage flat (mainram budget, CLAUDE.md).
@@ -441,7 +467,11 @@ fn main() -> ! {
         Some(ref w) => settings_store::load(store.flash_mut(), w.start),
         None => settings_store::Settings::default(),
     };
-    state.midi_src = if settings.midi_src == 1 { menu::MidiSource::Usb } else { menu::MidiSource::Trs };
+    state.midi_src = if settings.midi_src == 1 {
+        menu::MidiSource::Usb
+    } else {
+        menu::MidiSource::Trs
+    };
     state.cv_targets = settings.cv_targets.map(cv::CvTarget::from_u8);
     state.usb_storage = settings.usb_mode == 1;
     let mut settings_dirty_at: Option<u32> = None;
@@ -502,8 +532,10 @@ fn main() -> ! {
                     if used > stack_probe_max {
                         stack_probe_max = used;
                         let mut msg: heapless::String<48> = heapless::String::new();
-                        let _ = core::fmt::Write::write_fmt(&mut msg,
-                            format_args!("stack peak: {} / {} B\r\n", used, high - low));
+                        let _ = core::fmt::Write::write_fmt(
+                            &mut msg,
+                            format_args!("stack peak: {} / {} B\r\n", used, high - low),
+                        );
                         core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
                     }
                 }
@@ -560,24 +592,29 @@ fn main() -> ! {
             // presence check and periodically collapsed+rebuilt the Usb
             // file list (visible flicker) even with nothing unplugged.
             // `connected()` is the persistent enumeration flag instead.
-            let drive_present = state.usb_storage && usb_msc.connected()
-                && usb_msc.block_size() == 512;
+            let drive_present =
+                state.usb_storage && usb_msc.connected() && usb_msc.block_size() == 512;
             // --- TEMPORARY M6b diag: log MSC status transitions over UART0.
             // A watchdog reset / re-enumeration cycle shows up here as
             // conn/rdy flapping; steady state should print once and go quiet
             // (constant drive-LED blinking otherwise unexplained).
             {
-                let snap = (usb_msc.connected(), usb_msc.ready(),
-                            usb_msc.block_size());
+                let snap = (usb_msc.connected(), usb_msc.ready(), usb_msc.block_size());
                 if snap != usb_diag_last {
                     usb_diag_last = snap;
                     let mut msg: heapless::String<80> = heapless::String::new();
-                    let _ = core::fmt::Write::write_fmt(&mut msg,
-                        format_args!("usb: conn={} rdy={} bs={} spd={} t={}ms\r\n",
-                            snap.0 as u8, snap.1 as u8, snap.2,
-                            usb_msc.speed(), uptime::now_ms()));
-                    core::fmt::Write::write_str(
-                        &mut stack_probe_serial, msg.as_str()).ok();
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut msg,
+                        format_args!(
+                            "usb: conn={} rdy={} bs={} spd={} t={}ms\r\n",
+                            snap.0 as u8,
+                            snap.1 as u8,
+                            snap.2,
+                            usb_msc.speed(),
+                            uptime::now_ms()
+                        ),
+                    );
+                    core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
                 }
             }
             // --- end TEMPORARY --------------------------------------------
@@ -599,17 +636,20 @@ fn main() -> ! {
                 }
             }
             if !drive_present && usb_listed {
-                usb_listed = false;           // drive unplugged / mode left
+                usb_listed = false; // drive unplugged / mode left
                 usb_files.clear();
                 state.usb_file = -1;
                 state.usb_file_count = 0;
-                if state.card == menu::Card::Usb { dirty = true; }
+                if state.card == menu::Card::Usb {
+                    dirty = true;
+                }
             }
             if drive_present && !usb_listed && state.card == menu::Card::Usb {
                 usb_files.clear();
                 let n = with_fat(&usb_msc, |fs| {
                     usb_patch::list_patch_files(fs, &mut usb_files)
-                }).unwrap_or(0);
+                })
+                .unwrap_or(0);
                 state.usb_file_count = n as u8;
                 state.usb_file = if n > 0 { 0 } else { -1 };
                 usb_listed = true;
@@ -619,7 +659,9 @@ fn main() -> ! {
             let mut need_load = false;
             if ticks != 0 {
                 match state.on_turn(ticks) {
-                    TurnResult::Load => { need_load = true; }
+                    TurnResult::Load => {
+                        need_load = true;
+                    }
                     TurnResult::Param { ix, value } => {
                         let d = &params::LEAD_PARAMS[ix as usize];
                         let ops = params::write_ops(d, value, |a| mbsid_sys::patch_byte(a));
@@ -645,7 +687,10 @@ fn main() -> ! {
             if pressed {
                 match state.on_press() {
                     PressResult::Toggled => {}
-                    PressResult::Cancel => { status = None; status_set_at = None; }
+                    PressResult::Cancel => {
+                        status = None;
+                        status_set_at = None;
+                    }
                     PressResult::Commit(slot) => {
                         // On-device "save as": copy the live patch out under
                         // the ISR guard, then write flash OUTSIDE it (slow).
@@ -653,20 +698,34 @@ fn main() -> ! {
                             mbsid_sys::current_patch_raw(&mut patch_buf);
                         });
                         let ok = store.save(slot, &patch_buf).is_ok();
-                        if ok { state.edited = false; }
+                        if ok {
+                            state.edited = false;
+                        }
                         status = Some(save_status(ok, slot));
                         status_set_at = Some(uptime::now_ms());
                     }
                     PressResult::UsbLoad(ix) => {
-                        status = Some(usb_load(&usb_msc, ix as usize, None,
-                                               &mut store, &mut patch_buf,
-                                               &mut state, &mut user_detail));
+                        status = Some(usb_load(
+                            &usb_msc,
+                            ix as usize,
+                            None,
+                            &mut store,
+                            &mut patch_buf,
+                            &mut state,
+                            &mut user_detail,
+                        ));
                         status_set_at = Some(uptime::now_ms());
                     }
                     PressResult::UsbLoadToSlot { file, slot } => {
-                        status = Some(usb_load(&usb_msc, file as usize, Some(slot),
-                                               &mut store, &mut patch_buf,
-                                               &mut state, &mut user_detail));
+                        status = Some(usb_load(
+                            &usb_msc,
+                            file as usize,
+                            Some(slot),
+                            &mut store,
+                            &mut patch_buf,
+                            &mut state,
+                            &mut user_detail,
+                        ));
                         status_set_at = Some(uptime::now_ms());
                     }
                     PressResult::UsbImportBank => {
@@ -675,19 +734,21 @@ fn main() -> ! {
                         // signal, same contract as export. Import writes
                         // internal SPI flash only — no drive writes, so no
                         // usb_msc.flush() needed.
-                        let outcome = with_fat(&usb_msc, |fs| {
-                            bank_import::import_bank(fs, &mut store)
-                        });
+                        let outcome =
+                            with_fat(&usb_msc, |fs| bank_import::import_bank(fs, &mut store));
                         let mut s: heapless::String<24> = heapless::String::new();
                         let _ = match outcome {
-                            None => core::fmt::Write::write_str(
-                                &mut s, "USB mount FAILED"),
-                            Some(ImportOutcome::BadFile) => core::fmt::Write::write_str(
-                                &mut s, "No/bad BANK.SYX"),
-                            Some(ImportOutcome::Failed) => core::fmt::Write::write_str(
-                                &mut s, "Import FAILED"),
+                            None => core::fmt::Write::write_str(&mut s, "USB mount FAILED"),
+                            Some(ImportOutcome::BadFile) => {
+                                core::fmt::Write::write_str(&mut s, "No/bad BANK.SYX")
+                            }
+                            Some(ImportOutcome::Failed) => {
+                                core::fmt::Write::write_str(&mut s, "Import FAILED")
+                            }
                             Some(ImportOutcome::Imported(n)) => core::fmt::Write::write_fmt(
-                                &mut s, format_args!("Imported {} patches", n)),
+                                &mut s,
+                                format_args!("Imported {} patches", n),
+                            ),
                         };
                         status = Some(s);
                         status_set_at = Some(uptime::now_ms());
@@ -711,51 +772,67 @@ fn main() -> ! {
                                 });
                                 (0u8, true)
                             }
-                            menu::ExportSource::Slot(n) =>
-                                (n, store.load(n, &mut patch_buf)),
+                            menu::ExportSource::Slot(n) => (n, store.load(n, &mut patch_buf)),
                         };
                         let mut fname: heapless::String<16> = heapless::String::new();
                         let _ = match source {
-                            menu::ExportSource::Edit =>
-                                core::fmt::Write::write_str(&mut fname, "EDIT.SYX"),
-                            menu::ExportSource::Slot(n) =>
-                                core::fmt::Write::write_fmt(&mut fname,
-                                    format_args!("P{:03}.SYX", n)),
+                            menu::ExportSource::Edit => {
+                                core::fmt::Write::write_str(&mut fname, "EDIT.SYX")
+                            }
+                            menu::ExportSource::Slot(n) => core::fmt::Write::write_fmt(
+                                &mut fname,
+                                format_args!("P{:03}.SYX", n),
+                            ),
                         };
                         // --- TEMPORARY M6b diag: stage-level export trace ---
                         let d = &usb_msc.diag;
-                        d.begin();   // capture FIRST failure of this attempt
-                        let snap0 = (d.rd.get(), d.rd_err.get(), d.wr.get(),
-                                     d.wr_ok.get(), d.wr_notready.get(),
-                                     d.wr_resp_err.get(), d.wr_timeout.get(),
-                                     d.wr_conn_lost.get());
+                        d.begin(); // capture FIRST failure of this attempt
+                        let snap0 = (
+                            d.rd.get(),
+                            d.rd_err.get(),
+                            d.wr.get(),
+                            d.wr_ok.get(),
+                            d.wr_notready.get(),
+                            d.wr_resp_err.get(),
+                            d.wr_timeout.get(),
+                            d.wr_conn_lost.get(),
+                        );
                         {
                             let mut msg: heapless::String<96> = heapless::String::new();
-                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut msg,
                                 format_args!(
                                     "export: begin {} got={} rdy={} conn={} bs={}\r\n",
-                                    fname, got as u8, usb_msc.ready() as u8,
-                                    usb_msc.connected() as u8, usb_msc.block_size()));
-                            core::fmt::Write::write_str(
-                                &mut stack_probe_serial, msg.as_str()).ok();
+                                    fname,
+                                    got as u8,
+                                    usb_msc.ready() as u8,
+                                    usb_msc.connected() as u8,
+                                    usb_msc.block_size()
+                                ),
+                            );
+                            core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
                         }
                         let mounted = core::cell::Cell::new(false);
-                        let ok = got && with_fat(&usb_msc, |fs| {
-                            mounted.set(true);
-                            usb_patch::export_patch(fs, &fname, &patch_buf, slot)
-                        }).unwrap_or(false);
+                        let ok = got
+                            && with_fat(&usb_msc, |fs| {
+                                mounted.set(true);
+                                usb_patch::export_patch(fs, &fname, &patch_buf, slot)
+                            })
+                            .unwrap_or(false);
                         // Commit the drive's volatile cache before reporting
                         // success — the verify read may have been served
                         // from cache (round eight durability fix).
                         let ok = ok && usb_msc.flush().is_ok();
                         {
                             let mut msg: heapless::String<320> = heapless::String::new();
-                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut msg,
                                 format_args!(
                                     "export: ok={} mount={} d_rd={} d_rderr={} d_wr={} \
                                      d_wrok={} d_wrnrdy={} d_wrerr={} d_wrto={} d_wrconn={} \
                                      spins={} wms={}\r\n",
-                                    ok as u8, mounted.get() as u8,
+                                    ok as u8,
+                                    mounted.get() as u8,
                                     d.rd.get().wrapping_sub(snap0.0),
                                     d.rd_err.get().wrapping_sub(snap0.1),
                                     d.wr.get().wrapping_sub(snap0.2),
@@ -764,69 +841,103 @@ fn main() -> ! {
                                     d.wr_resp_err.get().wrapping_sub(snap0.5),
                                     d.wr_timeout.get().wrapping_sub(snap0.6),
                                     d.wr_conn_lost.get().wrapping_sub(snap0.7),
-                                    d.wr_spins_last.get(), d.wr_ms_last.get()));
+                                    d.wr_spins_last.get(),
+                                    d.wr_ms_last.get()
+                                ),
+                            );
                             let (cs, cr) = d.wr_csw.get();
                             let (rr, rp, rt, rn, rl) = d.wr_reject.get();
                             let (fcs, fcr) = d.wr_csw_first.get();
                             let (frr, frp, frt, frn, frl) = d.wr_reject_first.get();
                             let (sv, sk, sa, sq) = usb_msc.sense_info();
-                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut msg,
                                 format_args!(
                                     "export: first csw={}/{} rej={}/{}/{} ny={} lph={} \
                                      last csw={}/{} rej={}/{}/{} ny={} lph={}\r\n\
                                      export: sense valid={} key={:x} asc={:02x} ascq={:02x}\r\n",
-                                    fcs, fcr, frr, frp, frt, frn, frl,
-                                    cs, cr, rr, rp, rt, rn, rl,
-                                    sv as u8, sk, sa, sq));
-                            core::fmt::Write::write_str(
-                                &mut stack_probe_serial, msg.as_str()).ok();
+                                    fcs,
+                                    fcr,
+                                    frr,
+                                    frp,
+                                    frt,
+                                    frn,
+                                    frl,
+                                    cs,
+                                    cr,
+                                    rr,
+                                    rp,
+                                    rt,
+                                    rn,
+                                    rl,
+                                    sv as u8,
+                                    sk,
+                                    sa,
+                                    sq
+                                ),
+                            );
+                            core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
                         }
                         {
                             // Round-six read-failure diag: reason 1=notready
                             // 2=resp_err 3=deadline 4=conn_lost, at word w of
                             // lba, after sp spins; rej/ny/lph = reject_info
                             // CSR snapshot at the failure.
-                            let (r1, w1, l1, s1, rr1, rp1, n1, p1) =
-                                d.rd_fail_first.get();
-                            let (r2, w2, l2, s2, rr2, rp2, n2, p2) =
-                                d.rd_fail.get();
+                            let (r1, w1, l1, s1, rr1, rp1, n1, p1) = d.rd_fail_first.get();
+                            let (r2, w2, l2, s2, rr2, rp2, n2, p2) = d.rd_fail.get();
                             let path1 = d.rd_path_first.get();
                             let path2 = d.rd_path.get();
                             let ms1 = d.rd_ms_first.get();
                             let ms2 = d.rd_ms.get();
-                            let mut msg: heapless::String<256> =
-                                heapless::String::new();
-                            let _ = core::fmt::Write::write_fmt(&mut msg,
+                            let mut msg: heapless::String<256> = heapless::String::new();
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut msg,
                                 format_args!(
                                     "export: rd1 rsn={} w={} lba={} sp={} ms={} \
                                      rej={}/{} ny={} lph={} pth={:08x}\r\n\
                                      export: rdL rsn={} w={} lba={} sp={} ms={} \
                                      rej={}/{} ny={} lph={} pth={:08x}\r\n",
-                                    r1, w1, l1, s1, ms1, rr1, rp1, n1, p1, path1,
-                                    r2, w2, l2, s2, ms2, rr2, rp2, n2, p2, path2));
-                            core::fmt::Write::write_str(
-                                &mut stack_probe_serial, msg.as_str()).ok();
+                                    r1,
+                                    w1,
+                                    l1,
+                                    s1,
+                                    ms1,
+                                    rr1,
+                                    rp1,
+                                    n1,
+                                    p1,
+                                    path1,
+                                    r2,
+                                    w2,
+                                    l2,
+                                    s2,
+                                    ms2,
+                                    rr2,
+                                    rp2,
+                                    n2,
+                                    p2,
+                                    path2
+                                ),
+                            );
+                            core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
                         }
                         // --- end TEMPORARY ----------------------------------
                         let mut s: heapless::String<24> = heapless::String::new();
                         let _ = if ok {
-                            core::fmt::Write::write_fmt(&mut s,
-                                format_args!("Exported {}", fname))
+                            core::fmt::Write::write_fmt(&mut s, format_args!("Exported {}", fname))
                         } else {
                             core::fmt::Write::write_str(&mut s, "Export FAILED")
                         };
                         status = Some(s);
                         status_set_at = Some(uptime::now_ms());
-                        usb_listed = false;   // new file: refresh the list
+                        usb_listed = false; // new file: refresh the list
                     }
                 }
                 dirty = true;
             }
 
             // SysEx Bank Write captured by the ISR -> persist here.
-            let pending = critical_section::with(|cs| {
-                app.borrow_ref_mut(cs).pending_save.take()
-            });
+            let pending = critical_section::with(|cs| app.borrow_ref_mut(cs).pending_save.take());
             if let Some((slot, bytes)) = pending {
                 status = Some(save_status(store.save(slot, &bytes).is_ok(), slot));
                 status_set_at = Some(uptime::now_ms());
@@ -880,8 +991,8 @@ fn main() -> ! {
                 // idempotent (mirrors top/sid's identical call) — cheap
                 // enough to run every redraw, no change-tracking needed.
                 sid.usb_midi_host().write(|w| unsafe {
-                    w.host().bit(state.midi_src == menu::MidiSource::Usb
-                                 && !state.usb_storage)
+                    w.host()
+                        .bit(state.midi_src == menu::MidiSource::Usb && !state.usb_storage)
                 });
                 usb_msc.set_mode(state.usb_storage);
 
@@ -892,12 +1003,18 @@ fn main() -> ! {
                     name_ok = store.name(state.program, &mut n16);
                     namebuf[..16].copy_from_slice(&n16);
                     namebuf[16] = 0;
-                    if !name_ok { namebuf[0] = 0; }
+                    if !name_ok {
+                        namebuf[0] = 0;
+                    }
                 } else {
                     mbsid_sys::bank_patch_name(state.bank, state.program, &mut namebuf);
                     name_ok = true;
                 }
-                let name = if name_ok { menu::name_from_cstr(&namebuf) } else { "Empty" };
+                let name = if name_ok {
+                    menu::name_from_cstr(&namebuf)
+                } else {
+                    "Empty"
+                };
 
                 // Fetch engine type + voice flags. USER bank uses the last
                 // successfully loaded slot's cached detail (the shim's ROM-
@@ -909,7 +1026,9 @@ fn main() -> ! {
                         let e = menu::Engine::from_byte(eng);
                         let vm = if e == menu::Engine::Lead {
                             Some(menu::VoiceMode::from_vflags(vfl))
-                        } else { None };
+                        } else {
+                            None
+                        };
                         (e, vm)
                     })
                 } else {
@@ -917,46 +1036,65 @@ fn main() -> ! {
                         let e = menu::Engine::from_byte(eng);
                         let vm = if e == menu::Engine::Lead {
                             Some(menu::VoiceMode::from_vflags(vfl))
-                        } else { None };
+                        } else {
+                            None
+                        };
                         (e, vm)
                     })
                 };
 
                 // Save-row preview: name of the slot under the cursor.
                 let mut savebuf = [0u8; 16];
-                let save_name: Option<&str> =
-                    if state.save_cursor >= 0
-                        && store.name(state.save_cursor as u8, &mut savebuf) {
-                        core::str::from_utf8(&savebuf).ok()
-                    } else { None };
+                let save_name: Option<&str> = if state.save_cursor >= 0
+                    && store.name(state.save_cursor as u8, &mut savebuf)
+                {
+                    core::str::from_utf8(&savebuf).ok()
+                } else {
+                    None
+                };
 
                 // Usb card detail: drive/file/slot names, built only while
                 // the card is focused (borrows usb_files/slotbuf).
                 let mut slotbuf = [0u8; 16];
                 let usb_info = if state.card == menu::Card::Usb {
                     let slot_name: Option<&str> =
-                        if state.usb_slot >= 0
-                            && store.name(state.usb_slot as u8, &mut slotbuf) {
+                        if state.usb_slot >= 0 && store.name(state.usb_slot as u8, &mut slotbuf) {
                             core::str::from_utf8(&slotbuf).ok()
-                        } else { None };
+                        } else {
+                            None
+                        };
                     Some(UsbInfo {
-                        drive: if drive_present { DriveState::Ready }
-                               else { DriveState::NoDrive },
+                        drive: if drive_present {
+                            DriveState::Ready
+                        } else {
+                            DriveState::NoDrive
+                        },
                         file_name: if state.usb_file >= 0 {
-                            usb_files.get(state.usb_file as usize)
-                                     .map(|n| n.as_str())
-                        } else { None },
+                            usb_files.get(state.usb_file as usize).map(|n| n.as_str())
+                        } else {
+                            None
+                        },
                         file_count: state.usb_file_count,
                         slot_name,
                     })
-                } else { None };
+                } else {
+                    None
+                };
 
                 // Diff-paint: blitter-only, erases stale glyphs by re-blitting
                 // old text at intensity 0 — no rectangle fill, no visible wipe
                 // (see menu::Painter).
-                let frame = menu::build_frame(&state, name, detail,
-                                              save_name, status.as_deref(), lead_loaded,
-                                              usb_info.as_ref(), MENU_X, MENU_Y);
+                let frame = menu::build_frame(
+                    &state,
+                    name,
+                    detail,
+                    save_name,
+                    status.as_deref(),
+                    lead_loaded,
+                    usb_info.as_ref(),
+                    MENU_X,
+                    MENU_Y,
+                );
                 painter.paint(&mut display, frame, MENU_HUE).ok();
                 dirty = false;
             }

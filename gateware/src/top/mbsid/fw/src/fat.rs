@@ -6,8 +6,8 @@
 //! M6b: writes go through a single-sector read-modify-write cache with
 //! write-back on flush/eviction (BlockIo::write_block).
 
-use fatfs::{IoBase, IoError, Read, Seek, SeekFrom, Write};
 pub use fatfs::{FileSystem, FsOptions};
+use fatfs::{IoBase, IoError, Read, Seek, SeekFrom, Write};
 
 /// Minimal 512-byte block device. Implemented by `&usb_msc::UsbMsc` on
 /// target and by in-memory disks in host tests.
@@ -20,9 +20,15 @@ pub trait BlockIo {
 pub struct StorageError;
 
 impl IoError for StorageError {
-    fn is_interrupted(&self) -> bool { false }
-    fn new_unexpected_eof_error() -> Self { StorageError }
-    fn new_write_zero_error() -> Self { StorageError }
+    fn is_interrupted(&self) -> bool {
+        false
+    }
+    fn new_unexpected_eof_error() -> Self {
+        StorageError
+    }
+    fn new_write_zero_error() -> Self {
+        StorageError
+    }
 }
 
 /// Block-cached storage adapter: presents the first FAT partition as a
@@ -38,17 +44,27 @@ pub struct MscStorage<B: BlockIo> {
 
 impl<B: BlockIo> MscStorage<B> {
     pub fn new(mut io: B) -> Self {
-        let base_lba = crate::partition::first_partition_lba(
-            |lba, buf| io.read_block(lba, buf));
-        Self { io, pos: 0, base_lba, cache_lba: None, cache: [0u8; 512], dirty: false }
+        let base_lba = crate::partition::first_partition_lba(|lba, buf| io.read_block(lba, buf));
+        Self {
+            io,
+            pos: 0,
+            base_lba,
+            cache_lba: None,
+            cache: [0u8; 512],
+            dirty: false,
+        }
     }
 
-    pub fn base_lba(&self) -> u32 { self.base_lba }
+    pub fn base_lba(&self) -> u32 {
+        self.base_lba
+    }
 
     fn flush_cache(&mut self) -> Result<(), StorageError> {
         if self.dirty {
             let lba = self.cache_lba.ok_or(StorageError)?;
-            self.io.write_block(lba, &self.cache).map_err(|_| StorageError)?;
+            self.io
+                .write_block(lba, &self.cache)
+                .map_err(|_| StorageError)?;
             self.dirty = false;
         }
         Ok(())
@@ -56,9 +72,11 @@ impl<B: BlockIo> MscStorage<B> {
 
     fn ensure_block(&mut self, lba: u32) -> Result<(), StorageError> {
         if self.cache_lba != Some(lba) {
-            self.flush_cache()?;           // evict dirty sector first
+            self.flush_cache()?; // evict dirty sector first
             let mut buf = [0u8; 512];
-            self.io.read_block(lba, &mut buf).map_err(|_| StorageError)?;
+            self.io
+                .read_block(lba, &mut buf)
+                .map_err(|_| StorageError)?;
             self.cache = buf;
             self.cache_lba = Some(lba);
         }
@@ -66,11 +84,15 @@ impl<B: BlockIo> MscStorage<B> {
     }
 }
 
-impl<B: BlockIo> IoBase for MscStorage<B> { type Error = StorageError; }
+impl<B: BlockIo> IoBase for MscStorage<B> {
+    type Error = StorageError;
+}
 
 impl<B: BlockIo> Read for MscStorage<B> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() { return Ok(0); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let lba = self.base_lba + (self.pos / 512) as u32;
         let off = (self.pos % 512) as usize;
         self.ensure_block(lba)?;
@@ -83,7 +105,9 @@ impl<B: BlockIo> Read for MscStorage<B> {
 
 impl<B: BlockIo> Write for MscStorage<B> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() { return Ok(0); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         // Loop across sector boundaries within a single call: a write may
         // span more than one cached sector (e.g. a short buffer straddling
         // a 512-byte boundary), and callers here invoke `write()` directly
@@ -100,7 +124,9 @@ impl<B: BlockIo> Write for MscStorage<B> {
             // return Ok(written) for what succeeded so far, and only
             // surface Err if the very first sector failed (written == 0).
             if let Err(e) = self.ensure_block(lba) {
-                if written > 0 { return Ok(written); }
+                if written > 0 {
+                    return Ok(written);
+                }
                 return Err(e);
             }
             let n = (512 - off).min(buf.len() - written);
@@ -111,7 +137,9 @@ impl<B: BlockIo> Write for MscStorage<B> {
         }
         Ok(written)
     }
-    fn flush(&mut self) -> Result<(), Self::Error> { self.flush_cache() }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.flush_cache()
+    }
 }
 
 impl<B: BlockIo> Seek for MscStorage<B> {
@@ -121,7 +149,9 @@ impl<B: BlockIo> Seek for MscStorage<B> {
             SeekFrom::Current(n) => self.pos as i64 + n,
             SeekFrom::End(_) => return Err(StorageError),
         };
-        if new_pos < 0 { return Err(StorageError); }
+        if new_pos < 0 {
+            return Err(StorageError);
+        }
         self.pos = new_pos as u64;
         Ok(self.pos)
     }
@@ -135,7 +165,11 @@ mod tests {
     /// `fail_read_lba`: if set, the next `read_block` for that LBA errors
     /// once (then clears itself) — used to inject a mid-multi-sector I/O
     /// failure without a larger test-double restructure.
-    struct MemDisk { data: std::vec::Vec<u8>, writes: usize, fail_read_lba: Option<u32> }
+    struct MemDisk {
+        data: std::vec::Vec<u8>,
+        writes: usize,
+        fail_read_lba: Option<u32>,
+    }
     impl crate::fat::BlockIo for &mut MemDisk {
         fn read_block(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), ()> {
             if self.fail_read_lba == Some(lba) {
@@ -143,13 +177,17 @@ mod tests {
                 return Err(());
             }
             let o = lba as usize * 512;
-            if o + 512 > self.data.len() { return Err(()); }
+            if o + 512 > self.data.len() {
+                return Err(());
+            }
             buf.copy_from_slice(&self.data[o..o + 512]);
             Ok(())
         }
         fn write_block(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), ()> {
             let o = lba as usize * 512;
-            if o + 512 > self.data.len() { return Err(()); }
+            if o + 512 > self.data.len() {
+                return Err(());
+            }
             self.data[o..o + 512].copy_from_slice(buf);
             self.writes += 1;
             Ok(())
@@ -158,7 +196,11 @@ mod tests {
 
     #[test]
     fn write_rmw_lands_after_flush() {
-        let mut disk = MemDisk { data: std::vec![0xAAu8; 8 * 512], writes: 0, fail_read_lba: None };
+        let mut disk = MemDisk {
+            data: std::vec![0xAAu8; 8 * 512],
+            writes: 0,
+            fail_read_lba: None,
+        };
         // superfloppy layout (no partition table) -> base_lba 0 fallback is
         // fine: we drive MscStorage directly, not through fatfs here.
         {
@@ -175,7 +217,11 @@ mod tests {
 
     #[test]
     fn crossing_sector_boundary_writes_back_dirty_sector() {
-        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0, fail_read_lba: None };
+        let mut disk = MemDisk {
+            data: std::vec![0u8; 8 * 512],
+            writes: 0,
+            fail_read_lba: None,
+        };
         {
             let mut s = MscStorage::new(&mut disk);
             use fatfs::{Seek, SeekFrom, Write};
@@ -189,7 +235,11 @@ mod tests {
 
     #[test]
     fn read_of_other_sector_evicts_dirty_cache_first() {
-        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0, fail_read_lba: None };
+        let mut disk = MemDisk {
+            data: std::vec![0u8; 8 * 512],
+            writes: 0,
+            fail_read_lba: None,
+        };
         {
             let mut s = MscStorage::new(&mut disk);
             use fatfs::{Read, Seek, SeekFrom, Write};
@@ -197,7 +247,7 @@ mod tests {
             s.write(&[7; 8]).unwrap();
             s.seek(SeekFrom::Start(3 * 512)).unwrap();
             let mut b = [0u8; 4];
-            s.read(&mut b).unwrap();   // must not lose sector 0's dirty data
+            s.read(&mut b).unwrap(); // must not lose sector 0's dirty data
         }
         assert_eq!(&disk.data[0..8], &[7; 8]);
     }
@@ -210,19 +260,29 @@ mod tests {
         // discard the already-cached, already-dirty first-sector progress
         // (the bug: the old `ensure_block(lba)?` in the loop threw away
         // `written` on any later-sector failure).
-        let mut disk = MemDisk { data: std::vec![0u8; 8 * 512], writes: 0, fail_read_lba: Some(1) };
+        let mut disk = MemDisk {
+            data: std::vec![0u8; 8 * 512],
+            writes: 0,
+            fail_read_lba: Some(1),
+        };
         let n = {
             let mut s = MscStorage::new(&mut disk);
             use fatfs::{Seek, SeekFrom, Write};
             s.seek(SeekFrom::Start(510)).unwrap();
             // 4 bytes: 2 land in sector 0 (offsets 510,511), 2 would land
             // in sector 1 (offsets 0,1) but sector 1's read fails.
-            let n = s.write(&[9; 4]).expect("partial write must succeed, not error out");
+            let n = s
+                .write(&[9; 4])
+                .expect("partial write must succeed, not error out");
             s.flush().unwrap(); // flush only touches the still-cached sector 0
             n
         };
         assert_eq!(n, 2, "only sector 0's 2 bytes were written this call");
-        assert_eq!(&disk.data[510..512], &[9, 9], "sector 0's dirty data was not lost/orphaned");
+        assert_eq!(
+            &disk.data[510..512],
+            &[9, 9],
+            "sector 0's dirty data was not lost/orphaned"
+        );
         assert_eq!(disk.writes, 1, "only sector 0 was ever flushed to the disk");
     }
 }

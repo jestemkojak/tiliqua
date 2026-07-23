@@ -9,7 +9,7 @@
 use tiliqua_hal::nor_flash::{NorFlash, ReadNorFlash};
 
 const MAGIC: [u8; 4] = *b"MBS5";
-const VERSION: u8 = 2;   // v2 adds usb_mode (M6); v1 records still decode.
+const VERSION: u8 = 2; // v2 adds usb_mode (M6); v1 records still decode.
 pub const RECORD_LEN: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -32,23 +32,36 @@ pub fn encode(s: &Settings) -> [u8; RECORD_LEN] {
 }
 
 pub fn decode(r: &[u8; RECORD_LEN]) -> Option<Settings> {
-    if r[0..4] != MAGIC || !(r[4] == 1 || r[4] == 2) { return None; }
-    if r.iter().fold(0u8, |a, &b| a.wrapping_add(b)) != 0 { return None; }
+    if r[0..4] != MAGIC || !(r[4] == 1 || r[4] == 2) {
+        return None;
+    }
+    if r.iter().fold(0u8, |a, &b| a.wrapping_add(b)) != 0 {
+        return None;
+    }
     let mut cv = [0u8; 4];
     cv.copy_from_slice(&r[6..10]);
     // v1 records carry reserved-zero at byte 10, so reading it as usb_mode
     // is exactly the intended "old records default to MIDI" behavior.
-    Some(Settings { midi_src: r[5], cv_targets: cv, usb_mode: r[10] & 1 })
+    Some(Settings {
+        midi_src: r[5],
+        cv_targets: cv,
+        usb_mode: r[10] & 1,
+    })
 }
 
 pub fn load<F: ReadNorFlash>(flash: &mut F, base: u32) -> Settings {
     let mut r = [0u8; RECORD_LEN];
-    if flash.read(base, &mut r).is_err() { return Settings::default(); }
+    if flash.read(base, &mut r).is_err() {
+        return Settings::default();
+    }
     decode(&r).unwrap_or_default()
 }
 
-pub fn save<F: NorFlash + ReadNorFlash>(flash: &mut F, base: u32,
-                                        s: &Settings) -> Result<(), F::Error> {
+pub fn save<F: NorFlash + ReadNorFlash>(
+    flash: &mut F,
+    base: u32,
+    s: &Settings,
+) -> Result<(), F::Error> {
     let rec = encode(s);
     let mut cur = [0u8; RECORD_LEN];
     if flash.read(base, &mut cur).is_ok() && cur == rec {
@@ -61,7 +74,7 @@ pub fn save<F: NorFlash + ReadNorFlash>(flash: &mut F, base: u32,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tiliqua_hal::nor_flash::{ErrorType, NorFlashErrorKind, NorFlashError};
+    use tiliqua_hal::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind};
 
     // ---- in-memory NOR mock: erase -> 0xFF, write -> AND (real NOR can only
     // clear bits), so a double-write-without-erase corrupts like hardware.
@@ -73,7 +86,9 @@ mod tests {
     #[derive(Debug)]
     struct MockErr;
     impl NorFlashError for MockErr {
-        fn kind(&self) -> NorFlashErrorKind { NorFlashErrorKind::Other }
+        fn kind(&self) -> NorFlashErrorKind {
+            NorFlashErrorKind::Other
+        }
     }
 
     struct MockFlash {
@@ -81,31 +96,46 @@ mod tests {
         erase_count: usize,
     }
     impl MockFlash {
-        fn new() -> Self { Self { mem: [0xFF; MOCK_SIZE], erase_count: 0 } }
+        fn new() -> Self {
+            Self {
+                mem: [0xFF; MOCK_SIZE],
+                erase_count: 0,
+            }
+        }
     }
-    impl ErrorType for MockFlash { type Error = MockErr; }
+    impl ErrorType for MockFlash {
+        type Error = MockErr;
+    }
     impl ReadNorFlash for MockFlash {
         const READ_SIZE: usize = 1;
         fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), MockErr> {
             let o = offset as usize;
-            if o + bytes.len() > MOCK_SIZE { return Err(MockErr); }
+            if o + bytes.len() > MOCK_SIZE {
+                return Err(MockErr);
+            }
             bytes.copy_from_slice(&self.mem[o..o + bytes.len()]);
             Ok(())
         }
-        fn capacity(&self) -> usize { MOCK_SIZE }
+        fn capacity(&self) -> usize {
+            MOCK_SIZE
+        }
     }
     impl NorFlash for MockFlash {
         const WRITE_SIZE: usize = 1;
         const ERASE_SIZE: usize = 4096;
         fn erase(&mut self, from: u32, to: u32) -> Result<(), MockErr> {
-            if to as usize > MOCK_SIZE || from > to { return Err(MockErr); }
+            if to as usize > MOCK_SIZE || from > to {
+                return Err(MockErr);
+            }
             self.mem[from as usize..to as usize].fill(0xFF);
             self.erase_count += 1;
             Ok(())
         }
         fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), MockErr> {
             let o = offset as usize;
-            if o + bytes.len() > MOCK_SIZE { return Err(MockErr); }
+            if o + bytes.len() > MOCK_SIZE {
+                return Err(MockErr);
+            }
             for (i, &b) in bytes.iter().enumerate() {
                 self.mem[o + i] &= b; // NOR semantics
             }
@@ -115,19 +145,30 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let s = Settings { midi_src: 1, cv_targets: [0, 3, 11, 12], usb_mode: 0 };
+        let s = Settings {
+            midi_src: 1,
+            cv_targets: [0, 3, 11, 12],
+            usb_mode: 0,
+        };
         assert_eq!(decode(&encode(&s)), Some(s));
     }
 
     #[test]
     fn corrupt_records_rejected() {
-        let s = Settings { midi_src: 1, cv_targets: [1, 2, 3, 4], usb_mode: 0 };
+        let s = Settings {
+            midi_src: 1,
+            cv_targets: [1, 2, 3, 4],
+            usb_mode: 0,
+        };
         let good = encode(&s);
-        let mut bad_magic = good; bad_magic[0] ^= 0xFF;
+        let mut bad_magic = good;
+        bad_magic[0] ^= 0xFF;
         assert_eq!(decode(&bad_magic), None);
-        let mut bad_ver = good; bad_ver[4] = 99;
+        let mut bad_ver = good;
+        bad_ver[4] = 99;
         assert_eq!(decode(&bad_ver), None);
-        let mut bad_sum = good; bad_sum[6] ^= 0x01; // flip a target byte, keep chk
+        let mut bad_sum = good;
+        bad_sum[6] ^= 0x01; // flip a target byte, keep chk
         assert_eq!(decode(&bad_sum), None);
     }
 
@@ -141,7 +182,11 @@ mod tests {
     #[test]
     fn save_then_load_and_identical_save_skips_erase() {
         let mut f = MockFlash::new();
-        let s = Settings { midi_src: 1, cv_targets: [12, 11, 0, 0], usb_mode: 0 };
+        let s = Settings {
+            midi_src: 1,
+            cv_targets: [12, 11, 0, 0],
+            usb_mode: 0,
+        };
         save(&mut f, 0, &s).unwrap();
         assert_eq!(load(&mut f, 0), s);
         let erases_before = f.erase_count;
@@ -151,14 +196,22 @@ mod tests {
 
     #[test]
     fn v2_roundtrip_with_usb_mode() {
-        let s = Settings { midi_src: 1, cv_targets: [0, 3, 11, 12], usb_mode: 1 };
+        let s = Settings {
+            midi_src: 1,
+            cv_targets: [0, 3, 11, 12],
+            usb_mode: 1,
+        };
         assert_eq!(decode(&encode(&s)), Some(s));
     }
 
     #[test]
     fn v1_record_decodes_with_usb_mode_default() {
         // A v1 record as M5 wrote it: version byte 1, byte 10 reserved-zero.
-        let s = Settings { midi_src: 1, cv_targets: [1, 2, 3, 4], usb_mode: 0 };
+        let s = Settings {
+            midi_src: 1,
+            cv_targets: [1, 2, 3, 4],
+            usb_mode: 0,
+        };
         let mut r = encode(&s);
         r[4] = 1; // rewrite as v1
         let sum: u8 = r[..15].iter().fold(0u8, |a, &b| a.wrapping_add(b));

@@ -26,13 +26,19 @@ pub struct UserPatchStore<F> {
 }
 
 impl<F: NorFlash + ReadNorFlash> UserPatchStore<F> {
-    pub fn new(flash: F, base: u32) -> Self { Self { flash, base } }
+    pub fn new(flash: F, base: u32) -> Self {
+        Self { flash, base }
+    }
     /// Take the flash back out (tests / teardown).
-    pub fn into_inner(self) -> F { self.flash }
+    pub fn into_inner(self) -> F {
+        self.flash
+    }
 
     /// Borrow the flash driver (shared with the M5 settings record — one
     /// SPIFlash instance serves both stores; never called from the ISR).
-    pub fn flash_mut(&mut self) -> &mut F { &mut self.flash }
+    pub fn flash_mut(&mut self) -> &mut F {
+        &mut self.flash
+    }
 
     fn slot_addr(&self, slot: u8) -> u32 {
         self.base + (slot as u32) * SLOT_SIZE
@@ -42,23 +48,39 @@ impl<F: NorFlash + ReadNorFlash> UserPatchStore<F> {
     /// checksum on success.
     fn read_header(&mut self, slot: u8) -> Option<u16> {
         let mut hdr = [0u8; HEADER_LEN as usize];
-        if slot >= N_SLOTS { return None; }
-        if self.flash.read(self.slot_addr(slot), &mut hdr).is_err() { return None; }
-        if hdr[0..4] != MAGIC || hdr[4] != VERSION { return None; }
+        if slot >= N_SLOTS {
+            return None;
+        }
+        if self.flash.read(self.slot_addr(slot), &mut hdr).is_err() {
+            return None;
+        }
+        if hdr[0..4] != MAGIC || hdr[4] != VERSION {
+            return None;
+        }
         Some(u16::from_le_bytes([hdr[6], hdr[7]]))
     }
 
     pub fn load(&mut self, slot: u8, out: &mut [u8; 512]) -> bool {
-        let Some(want) = self.read_header(slot) else { return false; };
-        if self.flash.read(self.slot_addr(slot) + HEADER_LEN, out).is_err() {
+        let Some(want) = self.read_header(slot) else {
+            return false;
+        };
+        if self
+            .flash
+            .read(self.slot_addr(slot) + HEADER_LEN, out)
+            .is_err()
+        {
             return false;
         }
         payload_checksum(out) == want
     }
 
     pub fn name(&mut self, slot: u8, out: &mut [u8; 16]) -> bool {
-        if self.read_header(slot).is_none() { return false; }
-        self.flash.read(self.slot_addr(slot) + HEADER_LEN, out).is_ok()
+        if self.read_header(slot).is_none() {
+            return false;
+        }
+        self.flash
+            .read(self.slot_addr(slot) + HEADER_LEN, out)
+            .is_ok()
     }
 
     pub fn save(&mut self, slot: u8, patch: &[u8; 512]) -> Result<(), F::Error> {
@@ -88,7 +110,7 @@ impl<F: NorFlash + ReadNorFlash> UserPatchStore<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tiliqua_hal::nor_flash::{ErrorType, NorFlashErrorKind, NorFlashError};
+    use tiliqua_hal::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind};
 
     // ---- in-memory NOR mock: erase -> 0xFF, write -> AND (real NOR can only
     // clear bits), so a double-write-without-erase corrupts like hardware ----
@@ -98,37 +120,53 @@ mod tests {
     #[derive(Debug)]
     struct MockErr;
     impl NorFlashError for MockErr {
-        fn kind(&self) -> NorFlashErrorKind { NorFlashErrorKind::Other }
+        fn kind(&self) -> NorFlashErrorKind {
+            NorFlashErrorKind::Other
+        }
     }
 
     struct MockFlash {
         mem: [u8; MOCK_SIZE],
     }
     impl MockFlash {
-        fn new() -> Self { Self { mem: [0xFF; MOCK_SIZE] } }
+        fn new() -> Self {
+            Self {
+                mem: [0xFF; MOCK_SIZE],
+            }
+        }
     }
-    impl ErrorType for MockFlash { type Error = MockErr; }
+    impl ErrorType for MockFlash {
+        type Error = MockErr;
+    }
     impl ReadNorFlash for MockFlash {
         const READ_SIZE: usize = 1;
         fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), MockErr> {
             let o = offset as usize;
-            if o + bytes.len() > MOCK_SIZE { return Err(MockErr); }
+            if o + bytes.len() > MOCK_SIZE {
+                return Err(MockErr);
+            }
             bytes.copy_from_slice(&self.mem[o..o + bytes.len()]);
             Ok(())
         }
-        fn capacity(&self) -> usize { MOCK_SIZE }
+        fn capacity(&self) -> usize {
+            MOCK_SIZE
+        }
     }
     impl NorFlash for MockFlash {
         const WRITE_SIZE: usize = 1;
         const ERASE_SIZE: usize = 4096;
         fn erase(&mut self, from: u32, to: u32) -> Result<(), MockErr> {
-            if to as usize > MOCK_SIZE || from > to { return Err(MockErr); }
+            if to as usize > MOCK_SIZE || from > to {
+                return Err(MockErr);
+            }
             self.mem[from as usize..to as usize].fill(0xFF);
             Ok(())
         }
         fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), MockErr> {
             let o = offset as usize;
-            if o + bytes.len() > MOCK_SIZE { return Err(MockErr); }
+            if o + bytes.len() > MOCK_SIZE {
+                return Err(MockErr);
+            }
             for (i, &b) in bytes.iter().enumerate() {
                 self.mem[o + i] &= b; // NOR semantics
             }

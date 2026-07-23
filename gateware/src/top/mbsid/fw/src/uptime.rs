@@ -50,9 +50,15 @@ mod tests {
     fn survives_u32_wraparound() {
         let start = u32::MAX - 5_000;
         assert!(!super::deadline_expired(
-            start, start.wrapping_add(29_999), 30_000));
+            start,
+            start.wrapping_add(29_999),
+            30_000
+        ));
         assert!(super::deadline_expired(
-            start, start.wrapping_add(30_000), 30_000));
+            start,
+            start.wrapping_add(30_000),
+            30_000
+        ));
     }
 
     #[test]
@@ -77,7 +83,15 @@ mod tests {
     #[test]
     fn ttl_expired_survives_wraparound() {
         let start = u32::MAX - 100;
-        assert!(!super::ttl_expired(Some(start), start.wrapping_add(2_999), 3_000));
-        assert!(super::ttl_expired(Some(start), start.wrapping_add(3_000), 3_000));
+        assert!(!super::ttl_expired(
+            Some(start),
+            start.wrapping_add(2_999),
+            3_000
+        ));
+        assert!(super::ttl_expired(
+            Some(start),
+            start.wrapping_add(3_000),
+            3_000
+        ));
     }
 }

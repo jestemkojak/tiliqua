@@ -88,12 +88,7 @@ impl MscDiag {
         self.wr_ms_last.set(0);
     }
 
-    fn record_rd_failure(
-        &self,
-        v: (u8, u8, u32, u32, u8, u8, u8, u8),
-        path: u32,
-        ms: u32,
-    ) {
+    fn record_rd_failure(&self, v: (u8, u8, u32, u32, u8, u8, u8, u8), path: u32, ms: u32) {
         self.rd_fail.set(v);
         self.rd_path.set(path);
         self.rd_ms.set(ms);
@@ -116,14 +111,24 @@ impl MscDiag {
     }
 }
 
-pub struct UsbMsc { regs: pac::USB_MSC, pub diag: MscDiag }
+pub struct UsbMsc {
+    regs: pac::USB_MSC,
+    pub diag: MscDiag,
+}
 
 #[derive(Debug)]
-pub enum MscError { NotReady, ReadError, WriteError }
+pub enum MscError {
+    NotReady,
+    ReadError,
+    WriteError,
+}
 
 impl UsbMsc {
     pub fn new(regs: pac::USB_MSC) -> Self {
-        Self { regs, diag: MscDiag::default() }
+        Self {
+            regs,
+            diag: MscDiag::default(),
+        }
     }
 
     pub fn ready(&self) -> bool {
@@ -157,8 +162,12 @@ impl UsbMsc {
     /// nyets, last_phase) captured at a read-failure site.
     fn reject_snapshot(&self) -> (u8, u8, u8, u8) {
         let ri = self.regs.reject_info().read();
-        (ri.response().bits(), ri.phase().bits(),
-         ri.nyets().bits(), ri.last_phase().bits())
+        (
+            ri.response().bits(),
+            ri.phase().bits(),
+            ri.nyets().bits(),
+            ri.last_phase().bits(),
+        )
     }
 
     fn read_path_snapshot(&self) -> u32 {
@@ -176,8 +185,8 @@ impl UsbMsc {
             self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
             let (rr, rp, ny, lp) = self.reject_snapshot();
             let path = self.read_path_snapshot();
-            self.diag.record_rd_failure(
-                (1, 0, lba, 0, rr, rp, ny, lp), path, 0);
+            self.diag
+                .record_rd_failure((1, 0, lba, 0, rr, rp, ny, lp), path, 0);
             return Err(MscError::NotReady);
         }
         self.regs.lba().write(|w| unsafe { w.value().bits(lba) });
@@ -195,14 +204,16 @@ impl UsbMsc {
             let mut spins: u32 = 0;
             loop {
                 let st = self.regs.status().read();
-                if st.rx_avail().bit_is_set() { break; }
+                if st.rx_avail().bit_is_set() {
+                    break;
+                }
                 if self.regs.resp().read().error().bit_is_set() {
                     self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
                     let (rr, rp, ny, lp) = self.reject_snapshot();
                     let path = self.read_path_snapshot();
                     let ms = crate::uptime::now_ms().wrapping_sub(t0);
-                    self.diag.record_rd_failure(
-                        (2, i as u8, lba, spins, rr, rp, ny, lp), path, ms);
+                    self.diag
+                        .record_rd_failure((2, i as u8, lba, spins, rr, rp, ny, lp), path, ms);
                     return Err(MscError::ReadError);
                 }
                 spins = spins.wrapping_add(1);
@@ -213,30 +224,33 @@ impl UsbMsc {
                         // rsn=4: the engine lost the drive mid-command
                         // (watchdog fired or the drive was yanked) —
                         // resp.done can never come; fail fast.
-                        self.diag.rd_err.set(
-                            self.diag.rd_err.get().wrapping_add(1));
+                        self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
                         let (rr, rp, ny, lp) = self.reject_snapshot();
                         let path = self.read_path_snapshot();
                         let ms = crate::uptime::now_ms().wrapping_sub(t0);
                         self.diag.record_rd_failure(
-                            (4, i as u8, lba, spins, rr, rp, ny, lp), path, ms);
+                            (4, i as u8, lba, spins, rr, rp, ny, lp),
+                            path,
+                            ms,
+                        );
                         return Err(MscError::ReadError);
                     }
                     let now = crate::uptime::now_ms();
                     if crate::uptime::deadline_expired(t0, now, READ_TIMEOUT_MS) {
-                        self.diag.rd_err.set(
-                            self.diag.rd_err.get().wrapping_add(1));
+                        self.diag.rd_err.set(self.diag.rd_err.get().wrapping_add(1));
                         let (rr, rp, ny, lp) = self.reject_snapshot();
                         let path = self.read_path_snapshot();
                         self.diag.record_rd_failure(
-                            (3, i as u8, lba, spins, rr, rp, ny, lp), path,
-                            now.wrapping_sub(t0));
+                            (3, i as u8, lba, spins, rr, rp, ny, lp),
+                            path,
+                            now.wrapping_sub(t0),
+                        );
                         return Err(MscError::ReadError);
                     }
                 }
             }
             let word = self.regs.rx_data().read().word().bits();
-            buf[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+            buf[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         Ok(())
     }
@@ -246,10 +260,12 @@ impl UsbMsc {
     pub fn sense_info(&self) -> (bool, u8, u8, u8) {
         let r = self.regs.sense_info().read();
         let code = r.code().bits();
-        (r.valid().bit_is_set(),
-         ((code >> 16) & 0xF) as u8,
-         ((code >> 8) & 0xFF) as u8,
-         (code & 0xFF) as u8)
+        (
+            r.valid().bit_is_set(),
+            ((code >> 16) & 0xF) as u8,
+            ((code >> 8) & 0xFF) as u8,
+            (code & 0xFF) as u8,
+        )
     }
 
     /// Write one 512-byte block at `lba`. Same block_size()==512 precondition
@@ -272,16 +288,16 @@ impl UsbMsc {
     /// stack-paint remeasure of this write leg.
     pub fn write_block(&self, lba: u32, buf: &[u8; 512]) -> Result<(), MscError> {
         self.diag.wr.set(self.diag.wr.get().wrapping_add(1)); // TEMPORARY diag
-        // Bounded ready-wait instead of an instant NotReady: after a failed
-        // write the engine stays busy for a few ms running its automatic
-        // REQUEST SENSE; an immediate retry must wait that out, not fail.
+                                                              // Bounded ready-wait instead of an instant NotReady: after a failed
+                                                              // write the engine stays busy for a few ms running its automatic
+                                                              // REQUEST SENSE; an immediate retry must wait that out, not fail.
         const READY_WAIT_MS: u32 = 1_000;
         let t0r = crate::uptime::now_ms();
         while !self.ready() {
-            if crate::uptime::deadline_expired(
-                t0r, crate::uptime::now_ms(), READY_WAIT_MS) {
-                self.diag.wr_notready.set(
-                    self.diag.wr_notready.get().wrapping_add(1));
+            if crate::uptime::deadline_expired(t0r, crate::uptime::now_ms(), READY_WAIT_MS) {
+                self.diag
+                    .wr_notready
+                    .set(self.diag.wr_notready.get().wrapping_add(1));
                 return Err(MscError::NotReady);
             }
         }
@@ -304,18 +320,27 @@ impl UsbMsc {
             let r = self.regs.resp().read();
             if r.done().bit_is_set() {
                 self.diag.wr_spins_last.set(spins); // TEMPORARY diag
-                self.diag.wr_ms_last.set(
-                    crate::uptime::now_ms().wrapping_sub(t0));
+                self.diag
+                    .wr_ms_last
+                    .set(crate::uptime::now_ms().wrapping_sub(t0));
                 return if r.error().bit_is_set() {
-                    self.diag.wr_resp_err.set(
-                        self.diag.wr_resp_err.get().wrapping_add(1));
+                    self.diag
+                        .wr_resp_err
+                        .set(self.diag.wr_resp_err.get().wrapping_add(1));
                     let ri = self.regs.reject_info().read();
                     self.diag.record_failure(
-                        (self.regs.csw_status().read().value().bits(),
-                         self.regs.csw_residue().read().value().bits()),
-                        (ri.response().bits(), ri.phase().bits(),
-                         ri.txdone().bits(), ri.nyets().bits(),
-                         ri.last_phase().bits()));
+                        (
+                            self.regs.csw_status().read().value().bits(),
+                            self.regs.csw_residue().read().value().bits(),
+                        ),
+                        (
+                            ri.response().bits(),
+                            ri.phase().bits(),
+                            ri.txdone().bits(),
+                            ri.nyets().bits(),
+                            ri.last_phase().bits(),
+                        ),
+                    );
                     Err(MscError::WriteError)
                 } else {
                     // BOT: PASSED + residue != 0 means the device silently
@@ -323,8 +348,9 @@ impl UsbMsc {
                     // on media is NOT what we sent. Round-eight fix.
                     let residue = self.regs.csw_residue().read().value().bits();
                     if residue != 0 {
-                        self.diag.wr_resp_err.set(
-                            self.diag.wr_resp_err.get().wrapping_add(1));
+                        self.diag
+                            .wr_resp_err
+                            .set(self.diag.wr_resp_err.get().wrapping_add(1));
                         self.diag.record_failure((0, residue), (0, 0, 0, 0, 0));
                         Err(MscError::WriteError)
                     } else {
@@ -337,28 +363,35 @@ impl UsbMsc {
             if spins % 1024 == 0 {
                 let now = crate::uptime::now_ms();
                 let conn_lost = !self.connected();
-                if conn_lost
-                    || crate::uptime::deadline_expired(t0, now, WRITE_TIMEOUT_MS)
-                {
+                if conn_lost || crate::uptime::deadline_expired(t0, now, WRITE_TIMEOUT_MS) {
                     self.diag.wr_spins_last.set(spins); // TEMPORARY diag
                     self.diag.wr_ms_last.set(now.wrapping_sub(t0));
                     // Distinguish "drive gone mid-write" from a genuine
                     // wall-clock timeout, same fail-fast-on-lost-connection
                     // ordering as read_block's rsn=4 check.
                     if conn_lost {
-                        self.diag.wr_conn_lost.set(
-                            self.diag.wr_conn_lost.get().wrapping_add(1));
+                        self.diag
+                            .wr_conn_lost
+                            .set(self.diag.wr_conn_lost.get().wrapping_add(1));
                     } else {
-                        self.diag.wr_timeout.set(
-                            self.diag.wr_timeout.get().wrapping_add(1));
+                        self.diag
+                            .wr_timeout
+                            .set(self.diag.wr_timeout.get().wrapping_add(1));
                     }
                     let ri = self.regs.reject_info().read();
                     self.diag.record_failure(
-                        (self.regs.csw_status().read().value().bits(),
-                         self.regs.csw_residue().read().value().bits()),
-                        (ri.response().bits(), ri.phase().bits(),
-                         ri.txdone().bits(), ri.nyets().bits(),
-                         ri.last_phase().bits()));
+                        (
+                            self.regs.csw_status().read().value().bits(),
+                            self.regs.csw_residue().read().value().bits(),
+                        ),
+                        (
+                            ri.response().bits(),
+                            ri.phase().bits(),
+                            ri.txdone().bits(),
+                            ri.nyets().bits(),
+                            ri.last_phase().bits(),
+                        ),
+                    );
                     return Err(MscError::WriteError);
                 }
             }
@@ -373,8 +406,7 @@ impl UsbMsc {
         const READY_WAIT_MS: u32 = 1_000;
         let t0r = crate::uptime::now_ms();
         while !self.ready() {
-            if crate::uptime::deadline_expired(
-                t0r, crate::uptime::now_ms(), READY_WAIT_MS) {
+            if crate::uptime::deadline_expired(t0r, crate::uptime::now_ms(), READY_WAIT_MS) {
                 return Err(MscError::NotReady);
             }
         }
@@ -396,15 +428,12 @@ impl UsbMsc {
             spins = spins.wrapping_add(1);
             if spins % 1024 == 0 {
                 let now = crate::uptime::now_ms();
-                if !self.connected()
-                    || crate::uptime::deadline_expired(t0, now, FLUSH_TIMEOUT_MS)
-                {
+                if !self.connected() || crate::uptime::deadline_expired(t0, now, FLUSH_TIMEOUT_MS) {
                     return Err(MscError::WriteError);
                 }
             }
         }
     }
-
 }
 
 impl crate::fat::BlockIo for &UsbMsc {

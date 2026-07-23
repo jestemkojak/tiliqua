@@ -56,9 +56,15 @@ mod tests {
     // 128-slot in-memory NOR: the shared 4-slot MockFlash is too small for
     // whole-bank replace semantics (import touches all 128 slot indices, and
     // an out-of-range erase would fail the import spuriously).
-    struct BigFlash { mem: Vec<u8> }
+    struct BigFlash {
+        mem: Vec<u8>,
+    }
     impl BigFlash {
-        fn new() -> Self { Self { mem: vec![0xFF; 128 * SLOT_SIZE as usize] } }
+        fn new() -> Self {
+            Self {
+                mem: vec![0xFF; 128 * SLOT_SIZE as usize],
+            }
+        }
     }
     use tiliqua_hal::nor_flash::{
         ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
@@ -66,31 +72,45 @@ mod tests {
     #[derive(Debug)]
     struct BigErr;
     impl NorFlashError for BigErr {
-        fn kind(&self) -> NorFlashErrorKind { NorFlashErrorKind::Other }
+        fn kind(&self) -> NorFlashErrorKind {
+            NorFlashErrorKind::Other
+        }
     }
-    impl ErrorType for BigFlash { type Error = BigErr; }
+    impl ErrorType for BigFlash {
+        type Error = BigErr;
+    }
     impl ReadNorFlash for BigFlash {
         const READ_SIZE: usize = 1;
         fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), BigErr> {
             let o = offset as usize;
-            if o + bytes.len() > self.mem.len() { return Err(BigErr); }
+            if o + bytes.len() > self.mem.len() {
+                return Err(BigErr);
+            }
             bytes.copy_from_slice(&self.mem[o..o + bytes.len()]);
             Ok(())
         }
-        fn capacity(&self) -> usize { self.mem.len() }
+        fn capacity(&self) -> usize {
+            self.mem.len()
+        }
     }
     impl NorFlash for BigFlash {
         const WRITE_SIZE: usize = 1;
         const ERASE_SIZE: usize = 4096;
         fn erase(&mut self, from: u32, to: u32) -> Result<(), BigErr> {
-            if to as usize > self.mem.len() || from > to { return Err(BigErr); }
+            if to as usize > self.mem.len() || from > to {
+                return Err(BigErr);
+            }
             self.mem[from as usize..to as usize].fill(0xFF);
             Ok(())
         }
         fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), BigErr> {
             let o = offset as usize;
-            if o + bytes.len() > self.mem.len() { return Err(BigErr); }
-            for (i, &b) in bytes.iter().enumerate() { self.mem[o + i] &= b; }
+            if o + bytes.len() > self.mem.len() {
+                return Err(BigErr);
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                self.mem[o + i] &= b;
+            }
             Ok(())
         }
     }
@@ -121,14 +141,17 @@ mod tests {
         let patches = vec![(3u8, test_patch(3)), (7u8, test_patch(7))];
         let mut img = build_gpt_fat_image(&[("BANK.SYX", &bank_bytes(&patches))]);
         let mut store = UserPatchStore::new(BigFlash::new(), 0);
-        store.save(5, &test_patch(50)).unwrap();   // must be wiped
+        store.save(5, &test_patch(50)).unwrap(); // must be wiped
         store.save(100, &test_patch(90)).unwrap(); // must be wiped
         let fs = fs_of(&mut img);
         assert_eq!(import_bank(&fs, &mut store), ImportOutcome::Imported(2));
         let mut out = [0u8; 512];
         assert!(store.load(3, &mut out) && out == test_patch(3));
         assert!(store.load(7, &mut out) && out == test_patch(7));
-        assert!(!store.load(5, &mut out), "replace semantics: unlisted slot wiped");
+        assert!(
+            !store.load(5, &mut out),
+            "replace semantics: unlisted slot wiped"
+        );
         assert!(!store.load(100, &mut out));
     }
 
@@ -145,8 +168,11 @@ mod tests {
         };
         let fs = fs_of(&mut img);
         assert_eq!(import_bank(&fs, &mut store), ImportOutcome::BadFile);
-        assert_eq!(store.flash_mut().mem, before,
-                   "a rejected file must not touch flash");
+        assert_eq!(
+            store.flash_mut().mem,
+            before,
+            "a rejected file must not touch flash"
+        );
     }
 
     #[test]

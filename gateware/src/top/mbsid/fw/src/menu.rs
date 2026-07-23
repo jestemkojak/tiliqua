@@ -1,62 +1,97 @@
 //! Minimal patch-browser menu: host-pure state machine + cstr helper + build_frame/Painter.
 
+use core::fmt::Write;
+use heapless::String;
 use tiliqua_hal::embedded_graphics::{
     mono_font::{ascii::FONT_9X15, MonoTextStyle},
-    text::Text,
     prelude::*,
+    text::Text,
 };
 use tiliqua_lib::color::HI8;
-use heapless::String;
-use core::fmt::Write;
 
 use crate::cv::CvTarget;
-use crate::params;
 use crate::frame::Frame;
+use crate::params;
 
 pub const N_PARAMS: usize = params::LEAD_PARAMS.len();
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Engine { Lead, Bassline, Drum, Multi }
+pub enum Engine {
+    Lead,
+    Bassline,
+    Drum,
+    Multi,
+}
 
 impl Engine {
     pub fn from_byte(b: u8) -> Self {
-        match b { 1 => Self::Bassline, 2 => Self::Drum, 3 => Self::Multi, _ => Self::Lead }
+        match b {
+            1 => Self::Bassline,
+            2 => Self::Drum,
+            3 => Self::Multi,
+            _ => Self::Lead,
+        }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Lead => "Lead", Self::Bassline => "Bass",
-                     Self::Drum => "Drum", Self::Multi    => "Multi" }
+        match self {
+            Self::Lead => "Lead",
+            Self::Bassline => "Bass",
+            Self::Drum => "Drum",
+            Self::Multi => "Multi",
+        }
     }
     pub fn ch_map(self) -> &'static str {
         match self {
-            Self::Lead     => "Ch 1",
+            Self::Lead => "Ch 1",
             Self::Bassline => "Ch 1/<60  2/>=60",
-            Self::Drum     => "Ch 1",
-            Self::Multi    => "Ch 1-3:L  4-6:R",
+            Self::Drum => "Ch 1",
+            Self::Multi => "Ch 1-3:L  4-6:R",
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VoiceMode { Mono, Poly, Legato }
+pub enum VoiceMode {
+    Mono,
+    Poly,
+    Legato,
+}
 
 impl VoiceMode {
     pub fn from_vflags(b: u8) -> Self {
-        if b & 0x08 != 0 { Self::Poly }
-        else if b & 0x01 != 0 { Self::Legato }
-        else { Self::Mono }
+        if b & 0x08 != 0 {
+            Self::Poly
+        } else if b & 0x01 != 0 {
+            Self::Legato
+        } else {
+            Self::Mono
+        }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Mono => "Mono", Self::Poly => "Poly", Self::Legato => "Legato" }
+        match self {
+            Self::Mono => "Mono",
+            Self::Poly => "Poly",
+            Self::Legato => "Legato",
+        }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Card { Main, CvMod, PatchEdit, Usb }
+pub enum Card {
+    Main,
+    CvMod,
+    PatchEdit,
+    Usb,
+}
 
 impl Card {
     pub fn label(self) -> &'static str {
-        match self { Self::Main => "Main", Self::CvMod => "CV Mod",
-                     Self::PatchEdit => "Edit", Self::Usb => "USB" }
+        match self {
+            Self::Main => "Main",
+            Self::CvMod => "CV Mod",
+            Self::PatchEdit => "Edit",
+            Self::Usb => "USB",
+        }
     }
     /// `usb_enabled` gates whether the Card row can reach `Usb` at all — the
     /// Usb card only exists in the selector when `usb_storage` is on. When
@@ -67,12 +102,16 @@ impl Card {
     /// call rather than caching it.
     fn step(self, delta: i8, usb_enabled: bool) -> Self {
         let ix = match self {
-            Self::Main => 0i16, Self::CvMod => 1,
-            Self::PatchEdit => 2, Self::Usb => 3,
+            Self::Main => 0i16,
+            Self::CvMod => 1,
+            Self::PatchEdit => 2,
+            Self::Usb => 3,
         };
         let hi = if usb_enabled { 3 } else { 2 };
         match (ix + delta as i16).clamp(0, hi) {
-            0 => Self::Main, 1 => Self::CvMod, 2 => Self::PatchEdit,
+            0 => Self::Main,
+            1 => Self::CvMod,
+            2 => Self::PatchEdit,
             _ => Self::Usb,
         }
     }
@@ -92,38 +131,50 @@ pub const USB_ROW_IMPORT: u8 = 4;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TurnResult {
     None,
-    Load,                             // (bank, program) load required
-    Param { ix: u8, value: u16 },     // patch-edit row changed -> sysex_param writes
-    SettingsChanged,                  // cv target or midi_src changed -> persist
+    Load,                         // (bank, program) load required
+    Param { ix: u8, value: u16 }, // patch-edit row changed -> sysex_param writes
+    SettingsChanged,              // cv target or midi_src changed -> persist
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MidiSource { Trs, Usb }
+pub enum MidiSource {
+    Trs,
+    Usb,
+}
 
 impl MidiSource {
     pub fn label(self) -> &'static str {
-        match self { Self::Trs => "TRS", Self::Usb => "USB" }
+        match self {
+            Self::Trs => "TRS",
+            Self::Usb => "USB",
+        }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Mode { Nav, Edit }
+pub enum Mode {
+    Nav,
+    Edit,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PressResult {
     Toggled,
     Commit(u8),
     Cancel,
-    UsbLoad(u8),                        // audition file idx (M6a; Task 9 wires I/O)
+    UsbLoad(u8), // audition file idx (M6a; Task 9 wires I/O)
     UsbLoadToSlot { file: u8, slot: u8 },
     UsbExport { source: ExportSource },
-    UsbImportBank,                      // replace user bank from /MBSID/BANK.SYX
+    UsbImportBank, // replace user bank from /MBSID/BANK.SYX
 }
 
 /// Source patch for a USB export (M6b): the live EDIT buffer (current engine
 /// state) or a saved user-bank slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ExportSource { Edit, Slot(u8) }
+pub enum ExportSource {
+    Edit,
+    Slot(u8),
+}
 
 pub struct MenuState {
     pub card: Card,
@@ -166,7 +217,13 @@ pub struct MenuState {
 
 #[inline]
 fn clamp_i16(v: i16, lo: i16, hi: i16) -> i16 {
-    if v < lo { lo } else if v > hi { hi } else { v }
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
 }
 
 impl MenuState {
@@ -198,14 +255,20 @@ impl MenuState {
     pub fn row_count(&self) -> u8 {
         match self.card {
             Card::Main => 6,
-            Card::CvMod => 5,                       // Card + CV1..CV4
+            Card::CvMod => 5, // Card + CV1..CV4
             // Card + params + Save, but params are Lead-layout only: when the
             // loaded patch isn't Lead, collapse to Card + Save (matches what
             // `draw()` renders for `!lead_loaded`, and bounds `focus` so the
             // param branch in `on_turn`'s Edit-mode PatchEdit arm becomes
             // unreachable by construction).
-            Card::PatchEdit => if self.lead_loaded { 2 + N_PARAMS as u8 } else { 2 },
-            Card::Usb => 5,     // Card + File + Load>Slot + Export + Import
+            Card::PatchEdit => {
+                if self.lead_loaded {
+                    2 + N_PARAMS as u8
+                } else {
+                    2
+                }
+            }
+            Card::Usb => 5, // Card + File + Load>Slot + Export + Import
         }
     }
 
@@ -226,7 +289,9 @@ impl MenuState {
                 self.focus = clamp_i16(self.focus as i16 + delta as i16, 0, hi) as u8;
                 if self.card == Card::PatchEdit && self.focus >= 1 {
                     let ix = self.focus - 1; // 0-based row within the scrolling list
-                    if ix < self.edit_scroll { self.edit_scroll = ix; }
+                    if ix < self.edit_scroll {
+                        self.edit_scroll = ix;
+                    }
                     if ix >= self.edit_scroll + PATCH_EDIT_WINDOW {
                         self.edit_scroll = ix - PATCH_EDIT_WINDOW + 1;
                     }
@@ -245,7 +310,11 @@ impl MenuState {
                             let next = clamp_i16(self.program as i16 + delta as i16, 0, 127) as u8;
                             let changed = next != self.program;
                             self.program = next;
-                            if changed { TurnResult::Load } else { TurnResult::None }
+                            if changed {
+                                TurnResult::Load
+                            } else {
+                                TurnResult::None
+                            }
                         }
                         MAIN_ROW_BANK => {
                             let hi = (self.bank_count - 1) as i16;
@@ -254,11 +323,14 @@ impl MenuState {
                             self.bank = next;
                             // All banks hold 128 patches, so program needs no re-clamp;
                             // a load is required whenever the bank actually changed.
-                            if changed { TurnResult::Load } else { TurnResult::None }
+                            if changed {
+                                TurnResult::Load
+                            } else {
+                                TurnResult::None
+                            }
                         }
                         MAIN_ROW_SAVE => {
-                            self.save_cursor =
-                                clamp_i16(self.save_cursor + delta as i16, -1, 127);
+                            self.save_cursor = clamp_i16(self.save_cursor + delta as i16, -1, 127);
                             TurnResult::None // preview only; never a load, never a write
                         }
                         MAIN_ROW_MIDISRC => {
@@ -276,7 +348,9 @@ impl MenuState {
                             if delta != 0 {
                                 self.usb_storage = !self.usb_storage;
                                 TurnResult::SettingsChanged
-                            } else { TurnResult::None }
+                            } else {
+                                TurnResult::None
+                            }
                         }
                         _ => TurnResult::None,
                     },
@@ -286,15 +360,18 @@ impl MenuState {
                             let next = self.cv_targets[i].step(delta);
                             let changed = next != self.cv_targets[i];
                             self.cv_targets[i] = next;
-                            if changed { TurnResult::SettingsChanged } else { TurnResult::None }
+                            if changed {
+                                TurnResult::SettingsChanged
+                            } else {
+                                TurnResult::None
+                            }
                         } else {
                             TurnResult::None
                         }
                     }
                     Card::PatchEdit => {
                         if self.is_save_row() {
-                            self.save_cursor =
-                                clamp_i16(self.save_cursor + delta as i16, -1, 127);
+                            self.save_cursor = clamp_i16(self.save_cursor + delta as i16, -1, 127);
                             TurnResult::None
                         } else {
                             let ix = (self.focus - 1) as usize;
@@ -302,12 +379,16 @@ impl MenuState {
                                 let d = &params::LEAD_PARAMS[ix];
                                 let cur = self.edit_values[ix] as i32;
                                 let step = d.step as i32;
-                                let next = (cur + delta as i32 * step).clamp(0, d.max as i32) as u16;
+                                let next =
+                                    (cur + delta as i32 * step).clamp(0, d.max as i32) as u16;
                                 let changed = next != self.edit_values[ix];
                                 self.edit_values[ix] = next;
                                 if changed {
                                     self.edited = true;
-                                    TurnResult::Param { ix: ix as u8, value: next }
+                                    TurnResult::Param {
+                                        ix: ix as u8,
+                                        value: next,
+                                    }
                                 } else {
                                     TurnResult::None
                                 }
@@ -319,23 +400,19 @@ impl MenuState {
                     Card::Usb => match self.focus {
                         USB_ROW_FILE => {
                             let hi = self.usb_file_count as i16 - 1;
-                            self.usb_file = clamp_i16(
-                                self.usb_file + delta as i16, -1, hi.max(-1));
+                            self.usb_file = clamp_i16(self.usb_file + delta as i16, -1, hi.max(-1));
                             TurnResult::None
                         }
                         USB_ROW_LOADSLOT => {
-                            self.usb_slot =
-                                clamp_i16(self.usb_slot + delta as i16, -1, 127);
+                            self.usb_slot = clamp_i16(self.usb_slot + delta as i16, -1, 127);
                             TurnResult::None
                         }
                         USB_ROW_EXPORT => {
-                            self.usb_export =
-                                clamp_i16(self.usb_export + delta as i16, -1, 128);
+                            self.usb_export = clamp_i16(self.usb_export + delta as i16, -1, 128);
                             TurnResult::None
                         }
                         USB_ROW_IMPORT => {
-                            self.usb_import =
-                                clamp_i16(self.usb_import + delta as i16, -1, 0);
+                            self.usb_import = clamp_i16(self.usb_import + delta as i16, -1, 0);
                             TurnResult::None
                         }
                         _ => TurnResult::None,
@@ -352,30 +429,46 @@ impl MenuState {
         let result = if self.card == Card::Usb && self.mode == Mode::Edit {
             match self.focus {
                 USB_ROW_FILE => {
-                    if self.usb_file >= 0 { PressResult::UsbLoad(self.usb_file as u8) }
-                    else { PressResult::Cancel }
+                    if self.usb_file >= 0 {
+                        PressResult::UsbLoad(self.usb_file as u8)
+                    } else {
+                        PressResult::Cancel
+                    }
                 }
                 USB_ROW_LOADSLOT => {
                     if self.usb_file >= 0 && self.usb_slot >= 0 {
                         PressResult::UsbLoadToSlot {
-                            file: self.usb_file as u8, slot: self.usb_slot as u8 }
-                    } else { PressResult::Cancel }
+                            file: self.usb_file as u8,
+                            slot: self.usb_slot as u8,
+                        }
+                    } else {
+                        PressResult::Cancel
+                    }
                 }
                 USB_ROW_EXPORT => match self.usb_export {
                     -1 => PressResult::Cancel,
-                    0 => PressResult::UsbExport { source: ExportSource::Edit },
+                    0 => PressResult::UsbExport {
+                        source: ExportSource::Edit,
+                    },
                     n => PressResult::UsbExport {
-                        source: ExportSource::Slot((n - 1) as u8) },
-                }
+                        source: ExportSource::Slot((n - 1) as u8),
+                    },
+                },
                 USB_ROW_IMPORT => {
-                    if self.usb_import == 0 { PressResult::UsbImportBank }
-                    else { PressResult::Cancel }
+                    if self.usb_import == 0 {
+                        PressResult::UsbImportBank
+                    } else {
+                        PressResult::Cancel
+                    }
                 }
                 _ => PressResult::Toggled,
             }
         } else if self.is_save_row() && self.mode == Mode::Edit {
-            if self.save_cursor < 0 { PressResult::Cancel }
-            else { PressResult::Commit(self.save_cursor as u8) }
+            if self.save_cursor < 0 {
+                PressResult::Cancel
+            } else {
+                PressResult::Commit(self.save_cursor as u8)
+            }
         } else {
             PressResult::Toggled
         };
@@ -420,7 +513,11 @@ pub fn name_from_cstr(buf: &[u8; 17]) -> &str {
 /// USB drive status shown on the Usb card's Drive row. `NoDrive`/`Busy` are
 /// UI-only in this task — Task 9 wires actual FAT/USB state into these.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DriveState { NoDrive, Ready, Busy }
+pub enum DriveState {
+    NoDrive,
+    Ready,
+    Busy,
+}
 
 /// Everything `build_frame` needs to render the Usb card, supplied by
 /// main.rs. `None` (any non-Usb card) renders as `DriveState::NoDrive` with
@@ -447,7 +544,13 @@ pub fn detail_line(detail: Option<(Engine, Option<VoiceMode>)>) -> String<48> {
     let mut line: String<48> = String::new();
     match detail {
         Some((engine, Some(vm))) => {
-            let _ = write!(line, "  {} {}  {}", engine.label(), vm.label(), engine.ch_map());
+            let _ = write!(
+                line,
+                "  {} {}  {}",
+                engine.label(),
+                vm.label(),
+                engine.ch_map()
+            );
         }
         Some((engine, None)) => {
             let _ = write!(line, "  {}  {}", engine.label(), engine.ch_map());
@@ -462,12 +565,17 @@ pub fn detail_line(detail: Option<(Engine, Option<VoiceMode>)>) -> String<48> {
 /// Build the menu's frame description at (pos_x, pos_y). Pure: same inputs as
 /// the old draw() (minus target/hue), returns the Item list that Painter
 /// diffs+blits. `bright` on each item maps to intensity 15 vs 9 at paint time.
-pub fn build_frame(st: &MenuState, name: &str,
-                   detail: Option<(Engine, Option<VoiceMode>)>,
-                   save_name: Option<&str>, status: Option<&str>,
-                   lead_loaded: bool,
-                   usb: Option<&UsbInfo>,
-                   pos_x: i32, pos_y: i32) -> Frame {
+pub fn build_frame(
+    st: &MenuState,
+    name: &str,
+    detail: Option<(Engine, Option<VoiceMode>)>,
+    save_name: Option<&str>,
+    status: Option<&str>,
+    lead_loaded: bool,
+    usb: Option<&UsbInfo>,
+    pos_x: i32,
+    pos_y: i32,
+) -> Frame {
     let mut f = Frame::default();
 
     // Title, with an edited-patch marker (" *") to the right of "MBSID".
@@ -492,7 +600,11 @@ pub fn build_frame(st: &MenuState, name: &str,
             // Bank row.
             let marker = row_marker(st, MAIN_ROW_BANK);
             line.clear();
-            let bank_char = if st.is_user_bank() { 'U' } else { (b'A' + st.bank) as char };
+            let bank_char = if st.is_user_bank() {
+                'U'
+            } else {
+                (b'A' + st.bank) as char
+            };
             let _ = write!(line, "{} Bank     {}", marker, bank_char);
             f.push(pos_x, pos_y + 2 * ROW_DY, st.focus == MAIN_ROW_BANK, &line);
 
@@ -500,7 +612,12 @@ pub fn build_frame(st: &MenuState, name: &str,
             let marker = row_marker(st, MAIN_ROW_PROGRAM);
             line.clear();
             let _ = write!(line, "{} Program  {:03}  {}", marker, st.program, name);
-            f.push(pos_x, pos_y + 3 * ROW_DY, st.focus == MAIN_ROW_PROGRAM, &line);
+            f.push(
+                pos_x,
+                pos_y + 3 * ROW_DY,
+                st.focus == MAIN_ROW_PROGRAM,
+                &line,
+            );
 
             // Save row: destination cursor. Cancel-first (spec §6d [DEFAULT]).
             let marker = row_marker(st, MAIN_ROW_SAVE);
@@ -508,8 +625,13 @@ pub fn build_frame(st: &MenuState, name: &str,
             if st.save_cursor < 0 {
                 let _ = write!(line, "{} Save     Cancel", marker);
             } else {
-                let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
-                               save_name.unwrap_or("Empty"));
+                let _ = write!(
+                    line,
+                    "{} Save     U{:03}  {}",
+                    marker,
+                    st.save_cursor,
+                    save_name.unwrap_or("Empty")
+                );
             }
             f.push(pos_x, pos_y + 4 * ROW_DY, st.focus == MAIN_ROW_SAVE, &line);
 
@@ -517,14 +639,28 @@ pub fn build_frame(st: &MenuState, name: &str,
             let marker = row_marker(st, MAIN_ROW_MIDISRC);
             line.clear();
             let _ = write!(line, "{} MIDI Src {}", marker, st.midi_src.label());
-            f.push(pos_x, pos_y + 5 * ROW_DY, st.focus == MAIN_ROW_MIDISRC, &line);
+            f.push(
+                pos_x,
+                pos_y + 5 * ROW_DY,
+                st.focus == MAIN_ROW_MIDISRC,
+                &line,
+            );
 
             // USB Mode row: MIDI (default) vs Storage; gates Card::Usb reachability.
             let marker = row_marker(st, MAIN_ROW_USBMODE);
             line.clear();
-            let _ = write!(line, "{} USB Mode {}", marker,
-                           if st.usb_storage { "Storage" } else { "MIDI" });
-            f.push(pos_x, pos_y + 6 * ROW_DY, st.focus == MAIN_ROW_USBMODE, &line);
+            let _ = write!(
+                line,
+                "{} USB Mode {}",
+                marker,
+                if st.usb_storage { "Storage" } else { "MIDI" }
+            );
+            f.push(
+                pos_x,
+                pos_y + 6 * ROW_DY,
+                st.focus == MAIN_ROW_USBMODE,
+                &line,
+            );
 
             // Detail row: engine label + voice mode (Lead only) + channel map, or "---".
             f.push(pos_x, pos_y + 7 * ROW_DY, false, &detail_line(detail));
@@ -538,9 +674,19 @@ pub fn build_frame(st: &MenuState, name: &str,
                 let row = i + 1;
                 let marker = row_marker(st, row);
                 line.clear();
-                let _ = write!(line, "{} CV{}      {}", marker, i + 1,
-                               st.cv_targets[i as usize].label());
-                f.push(pos_x, pos_y + (2 + i as i32) * ROW_DY, st.focus == row, &line);
+                let _ = write!(
+                    line,
+                    "{} CV{}      {}",
+                    marker,
+                    i + 1,
+                    st.cv_targets[i as usize].label()
+                );
+                f.push(
+                    pos_x,
+                    pos_y + (2 + i as i32) * ROW_DY,
+                    st.focus == row,
+                    &line,
+                );
             }
             // Dim footer line in place of Main's detail line.
             f.push(pos_x, pos_y + 6 * ROW_DY, false, "mods engine knobs/params");
@@ -561,8 +707,13 @@ pub fn build_frame(st: &MenuState, name: &str,
                 if st.save_cursor < 0 {
                     let _ = write!(line, "{} Save     Cancel", marker);
                 } else {
-                    let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
-                                   save_name.unwrap_or("Empty"));
+                    let _ = write!(
+                        line,
+                        "{} Save     U{:03}  {}",
+                        marker,
+                        st.save_cursor,
+                        save_name.unwrap_or("Empty")
+                    );
                 }
                 f.push(pos_x, pos_y + 3 * ROW_DY, st.focus == save_row, &line);
             } else {
@@ -574,9 +725,17 @@ pub fn build_frame(st: &MenuState, name: &str,
                     let d_param = &params::LEAD_PARAMS[ix];
                     let marker = row_marker(st, row);
                     line.clear();
-                    let _ = write!(line, "{} {:<8} {}", marker, d_param.label,
-                                   st.edit_values[ix]);
-                    f.push(pos_x, pos_y + (2 + slot as i32) * ROW_DY, st.focus == row, &line);
+                    let _ = write!(
+                        line,
+                        "{} {:<8} {}",
+                        marker, d_param.label, st.edit_values[ix]
+                    );
+                    f.push(
+                        pos_x,
+                        pos_y + (2 + slot as i32) * ROW_DY,
+                        st.focus == row,
+                        &line,
+                    );
                 }
 
                 // Scroll indicators at the window edges.
@@ -595,12 +754,21 @@ pub fn build_frame(st: &MenuState, name: &str,
                 if st.save_cursor < 0 {
                     let _ = write!(line, "{} Save     Cancel", marker);
                 } else {
-                    let _ = write!(line, "{} Save     U{:03}  {}", marker, st.save_cursor,
-                                   save_name.unwrap_or("Empty"));
+                    let _ = write!(
+                        line,
+                        "{} Save     U{:03}  {}",
+                        marker,
+                        st.save_cursor,
+                        save_name.unwrap_or("Empty")
+                    );
                 }
                 let visible_rows = (end - scroll) as i32;
-                f.push(pos_x, pos_y + (2 + visible_rows) * ROW_DY,
-                       st.focus == save_row, &line);
+                f.push(
+                    pos_x,
+                    pos_y + (2 + visible_rows) * ROW_DY,
+                    st.focus == save_row,
+                    &line,
+                );
             }
         }
         Card::Usb => {
@@ -611,8 +779,8 @@ pub fn build_frame(st: &MenuState, name: &str,
             line.clear();
             let _ = match drive {
                 DriveState::NoDrive => write!(line, "  Drive    No drive"),
-                DriveState::Busy    => write!(line, "  Drive    BUSY"),
-                DriveState::Ready   => write!(line, "  Drive    Ready ({} files)", count),
+                DriveState::Busy => write!(line, "  Drive    BUSY"),
+                DriveState::Ready => write!(line, "  Drive    Ready ({} files)", count),
             };
             f.push(pos_x, pos_y + 2 * ROW_DY, false, &line);
 
@@ -621,8 +789,13 @@ pub fn build_frame(st: &MenuState, name: &str,
             if st.usb_file < 0 {
                 let _ = write!(line, "{} File     -", marker);
             } else {
-                let _ = write!(line, "{} File     {:03}  {}", marker, st.usb_file,
-                               fname.unwrap_or("?"));
+                let _ = write!(
+                    line,
+                    "{} File     {:03}  {}",
+                    marker,
+                    st.usb_file,
+                    fname.unwrap_or("?")
+                );
             }
             f.push(pos_x, pos_y + 3 * ROW_DY, st.focus == USB_ROW_FILE, &line);
 
@@ -631,17 +804,33 @@ pub fn build_frame(st: &MenuState, name: &str,
             if st.usb_slot < 0 {
                 let _ = write!(line, "{} Load>Slot Cancel", marker);
             } else {
-                let _ = write!(line, "{} Load>Slot U{:03}  {}", marker, st.usb_slot,
-                               sname.unwrap_or("Empty"));
+                let _ = write!(
+                    line,
+                    "{} Load>Slot U{:03}  {}",
+                    marker,
+                    st.usb_slot,
+                    sname.unwrap_or("Empty")
+                );
             }
-            f.push(pos_x, pos_y + 4 * ROW_DY, st.focus == USB_ROW_LOADSLOT, &line);
+            f.push(
+                pos_x,
+                pos_y + 4 * ROW_DY,
+                st.focus == USB_ROW_LOADSLOT,
+                &line,
+            );
 
             let marker = row_marker(st, USB_ROW_EXPORT);
             line.clear();
             match st.usb_export {
-                -1 => { let _ = write!(line, "{} Export   Cancel", marker); }
-                0 => { let _ = write!(line, "{} Export   EDIT -> USB", marker); }
-                n => { let _ = write!(line, "{} Export   U{:03} -> USB", marker, n - 1); }
+                -1 => {
+                    let _ = write!(line, "{} Export   Cancel", marker);
+                }
+                0 => {
+                    let _ = write!(line, "{} Export   EDIT -> USB", marker);
+                }
+                n => {
+                    let _ = write!(line, "{} Export   U{:03} -> USB", marker, n - 1);
+                }
             }
             f.push(pos_x, pos_y + 5 * ROW_DY, st.focus == USB_ROW_EXPORT, &line);
 
@@ -649,7 +838,7 @@ pub fn build_frame(st: &MenuState, name: &str,
             line.clear();
             let _ = match st.usb_import {
                 -1 => write!(line, "{} Import   Cancel", marker),
-                _  => write!(line, "{} Import   REPLACE bank!", marker),
+                _ => write!(line, "{} Import   REPLACE bank!", marker),
             };
             f.push(pos_x, pos_y + 6 * ROW_DY, st.focus == USB_ROW_IMPORT, &line);
 
@@ -675,15 +864,17 @@ pub struct Painter {
 
 impl Painter {
     pub fn new() -> Self {
-        Self { prev: Frame::default() }
+        Self {
+            prev: Frame::default(),
+        }
     }
 
     pub fn paint<D>(&mut self, d: &mut D, frame: Frame, hue: u8) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = HI8>,
     {
-        let erase  = MonoTextStyle::new(&FONT_9X15, HI8::new(0, 0));
-        let dim    = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 9));
+        let erase = MonoTextStyle::new(&FONT_9X15, HI8::new(0, 0));
+        let dim = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 9));
         let bright = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 15));
         for op in crate::frame::diff(&self.prev, &frame).iter() {
             match *op {
@@ -722,29 +913,29 @@ mod tests {
     fn nav_turn_moves_cursor_and_clamps_no_load() {
         let mut m = MenuState::new(1, 0, 10); // Nav, focus=Card
         assert_eq!(m.focus, ROW_CARD);
-        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> Bank, no load
+        assert!(matches!(m.on_turn(1), TurnResult::None)); // -> Bank, no load
         assert_eq!(m.focus, MAIN_ROW_BANK);
-        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> Program, no load
+        assert!(matches!(m.on_turn(1), TurnResult::None)); // -> Program, no load
         assert_eq!(m.focus, MAIN_ROW_PROGRAM);
-        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> Save, no load
+        assert!(matches!(m.on_turn(1), TurnResult::None)); // -> Save, no load
         assert_eq!(m.focus, MAIN_ROW_SAVE);
-        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> MidiSrc, no load
+        assert!(matches!(m.on_turn(1), TurnResult::None)); // -> MidiSrc, no load
         assert_eq!(m.focus, MAIN_ROW_MIDISRC);
-        assert!(matches!(m.on_turn(1), TurnResult::None));      // -> UsbMode, no load
+        assert!(matches!(m.on_turn(1), TurnResult::None)); // -> UsbMode, no load
         assert_eq!(m.focus, MAIN_ROW_USBMODE);
-        assert!(matches!(m.on_turn(3), TurnResult::None));      // clamp: stays UsbMode
+        assert!(matches!(m.on_turn(3), TurnResult::None)); // clamp: stays UsbMode
         assert_eq!(m.focus, MAIN_ROW_USBMODE);
-        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> MidiSrc
+        assert!(matches!(m.on_turn(-1), TurnResult::None)); // -> MidiSrc
         assert_eq!(m.focus, MAIN_ROW_MIDISRC);
-        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Save
+        assert!(matches!(m.on_turn(-1), TurnResult::None)); // -> Save
         assert_eq!(m.focus, MAIN_ROW_SAVE);
-        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Program
+        assert!(matches!(m.on_turn(-1), TurnResult::None)); // -> Program
         assert_eq!(m.focus, MAIN_ROW_PROGRAM);
-        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Bank
+        assert!(matches!(m.on_turn(-1), TurnResult::None)); // -> Bank
         assert_eq!(m.focus, MAIN_ROW_BANK);
-        assert!(matches!(m.on_turn(-1), TurnResult::None));     // -> Card
+        assert!(matches!(m.on_turn(-1), TurnResult::None)); // -> Card
         assert_eq!(m.focus, ROW_CARD);
-        assert!(matches!(m.on_turn(-5), TurnResult::None));     // clamp: stays Card
+        assert!(matches!(m.on_turn(-5), TurnResult::None)); // clamp: stays Card
         assert_eq!(m.focus, ROW_CARD);
     }
 
@@ -762,16 +953,16 @@ mod tests {
     fn edit_program_changes_value_clamps_and_loads_only_on_change() {
         let mut m = MenuState::new(1, 0, 0);
         m.focus = MAIN_ROW_PROGRAM;
-        let _ = m.on_press();                 // -> Edit
-        assert!(matches!(m.on_turn(5), TurnResult::Load));       // 0 -> 5, load
+        let _ = m.on_press(); // -> Edit
+        assert!(matches!(m.on_turn(5), TurnResult::Load)); // 0 -> 5, load
         assert_eq!(m.program, 5);
-        assert!(matches!(m.on_turn(-100), TurnResult::Load));    // clamp to 0, value changed -> load
+        assert!(matches!(m.on_turn(-100), TurnResult::Load)); // clamp to 0, value changed -> load
         assert_eq!(m.program, 0);
-        assert!(!matches!(m.on_turn(-1), TurnResult::Load));     // already 0, no change -> no load
+        assert!(!matches!(m.on_turn(-1), TurnResult::Load)); // already 0, no change -> no load
         assert_eq!(m.program, 0);
-        assert!(matches!(m.on_turn(127), TurnResult::Load));     // -> 127
+        assert!(matches!(m.on_turn(127), TurnResult::Load)); // -> 127
         assert_eq!(m.program, 127);
-        assert!(!matches!(m.on_turn(10), TurnResult::Load));     // clamp at 127, no change
+        assert!(!matches!(m.on_turn(10), TurnResult::Load)); // clamp at 127, no change
     }
 
     #[test]
@@ -779,18 +970,18 @@ mod tests {
         let mut one = MenuState::new(1, 0, 0);
         one.focus = MAIN_ROW_BANK;
         let _ = one.on_press();
-        assert!(!matches!(one.on_turn(1), TurnResult::Load));    // clamp to [0,0]: inert
+        assert!(!matches!(one.on_turn(1), TurnResult::Load)); // clamp to [0,0]: inert
         assert_eq!(one.bank, 0);
 
         let mut many = MenuState::new(3, 0, 7);
         many.focus = MAIN_ROW_BANK;
         let _ = many.on_press();
-        assert!(matches!(many.on_turn(1), TurnResult::Load));    // 0 -> 1, load at current program
+        assert!(matches!(many.on_turn(1), TurnResult::Load)); // 0 -> 1, load at current program
         assert_eq!(many.bank, 1);
-        assert_eq!(many.program, 7);          // program preserved
-        assert!(matches!(many.on_turn(5), TurnResult::Load));    // clamp to 2 (bank_count-1)
+        assert_eq!(many.program, 7); // program preserved
+        assert!(matches!(many.on_turn(5), TurnResult::Load)); // clamp to 2 (bank_count-1)
         assert_eq!(many.bank, 2);
-        assert!(!matches!(many.on_turn(1), TurnResult::Load));   // already max, no change
+        assert!(!matches!(many.on_turn(1), TurnResult::Load)); // already max, no change
     }
 
     #[test]
@@ -820,9 +1011,9 @@ mod tests {
     #[test]
     fn voice_mode_from_vflags_all_cases() {
         assert_eq!(VoiceMode::from_vflags(0x00), VoiceMode::Mono);
-        assert_eq!(VoiceMode::from_vflags(0x01), VoiceMode::Legato);  // bit 0
-        assert_eq!(VoiceMode::from_vflags(0x08), VoiceMode::Poly);    // bit 3
-        assert_eq!(VoiceMode::from_vflags(0x09), VoiceMode::Poly);    // POLY wins
+        assert_eq!(VoiceMode::from_vflags(0x01), VoiceMode::Legato); // bit 0
+        assert_eq!(VoiceMode::from_vflags(0x08), VoiceMode::Poly); // bit 3
+        assert_eq!(VoiceMode::from_vflags(0x09), VoiceMode::Poly); // POLY wins
     }
 
     #[test]
@@ -906,7 +1097,7 @@ mod tests {
         let _ = m.on_press(); // Nav -> Edit: cursor must reset to Cancel
         assert_eq!(m.mode, Mode::Edit);
         assert_eq!(m.save_cursor, -1);
-        assert!(!matches!(m.on_turn(1), TurnResult::Load));  // Cancel -> slot 0; never a load
+        assert!(!matches!(m.on_turn(1), TurnResult::Load)); // Cancel -> slot 0; never a load
         assert_eq!(m.save_cursor, 0);
         assert!(!matches!(m.on_turn(-5), TurnResult::Load)); // clamp at Cancel
         assert_eq!(m.save_cursor, -1);
@@ -927,7 +1118,7 @@ mod tests {
 
         assert_eq!(m.on_press(), PressResult::Toggled); // back to Edit, cursor reset
         assert_eq!(m.save_cursor, -1);
-        assert_eq!(m.on_press(), PressResult::Cancel);  // press at Cancel
+        assert_eq!(m.on_press(), PressResult::Cancel); // press at Cancel
         assert_eq!(m.mode, Mode::Nav);
     }
 
@@ -945,11 +1136,11 @@ mod tests {
         assert_eq!(m.midi_src, MidiSource::Trs);
         m.focus = MAIN_ROW_MIDISRC;
         let _ = m.on_press(); // Nav -> Edit
-        assert!(matches!(m.on_turn(1), TurnResult::SettingsChanged));   // never a load
+        assert!(matches!(m.on_turn(1), TurnResult::SettingsChanged)); // never a load
         assert_eq!(m.midi_src, MidiSource::Usb);
         assert!(matches!(m.on_turn(-1), TurnResult::SettingsChanged));
         assert_eq!(m.midi_src, MidiSource::Trs);
-        assert!(matches!(m.on_turn(0), TurnResult::None));   // zero delta: no change
+        assert!(matches!(m.on_turn(0), TurnResult::None)); // zero delta: no change
         assert_eq!(m.midi_src, MidiSource::Trs);
     }
 
@@ -983,7 +1174,7 @@ mod tests {
     fn switching_cards_keeps_per_card_focus_in_range() {
         let mut m = MenuState::new(2, 0, 0);
         m.focus = MAIN_ROW_MIDISRC; // row 4 on Main
-        m.card = Card::CvMod;       // CvMod also has 5 rows: still valid
+        m.card = Card::CvMod; // CvMod also has 5 rows: still valid
         assert!(m.focus < m.row_count());
         m.focus = 0;
         m.card = Card::PatchEdit;
@@ -1026,25 +1217,39 @@ mod tests {
 
     #[test]
     fn patch_edit_wide_row_uses_coarse_step() {
-        let cutoff_ix = params::LEAD_PARAMS.iter()
-            .position(|d| d.label == "Cutoff").unwrap();
+        let cutoff_ix = params::LEAD_PARAMS
+            .iter()
+            .position(|d| d.label == "Cutoff")
+            .unwrap();
         let mut m = MenuState::new(2, 0, 0);
         m.card = Card::PatchEdit;
         m.focus = cutoff_ix as u8 + 1;
         let _ = m.on_press();
-        assert_eq!(m.on_turn(1),
-                   TurnResult::Param { ix: cutoff_ix as u8, value: 16 });
+        assert_eq!(
+            m.on_turn(1),
+            TurnResult::Param {
+                ix: cutoff_ix as u8,
+                value: 16
+            }
+        );
     }
 
     #[test]
     fn patch_edit_scroll_follows_focus() {
         let mut m = MenuState::new(2, 0, 0);
         m.card = Card::PatchEdit;
-        for _ in 0..(N_PARAMS + 1) { m.on_turn(1); } // Nav to the Save row
+        for _ in 0..(N_PARAMS + 1) {
+            m.on_turn(1);
+        } // Nav to the Save row
         assert_eq!(m.focus, m.row_count() - 1);
         let ix = m.focus - 1;
-        assert!(ix >= m.edit_scroll && ix < m.edit_scroll + 6, "focus visible");
-        for _ in 0..(N_PARAMS + 1) { m.on_turn(-1); } // back to Card row
+        assert!(
+            ix >= m.edit_scroll && ix < m.edit_scroll + 6,
+            "focus visible"
+        );
+        for _ in 0..(N_PARAMS + 1) {
+            m.on_turn(-1);
+        } // back to Card row
         assert_eq!(m.edit_scroll, 0);
     }
 
@@ -1075,7 +1280,11 @@ mod tests {
         // be unreachable, not just unrendered.
         for _ in 0..(N_PARAMS + 5) {
             m.on_turn(1);
-            assert!(m.focus <= 1, "focus escaped the Card/Save bound: {}", m.focus);
+            assert!(
+                m.focus <= 1,
+                "focus escaped the Card/Save bound: {}",
+                m.focus
+            );
         }
         assert_eq!(m.focus, m.row_count() - 1); // landed on Save, the only other row
 
@@ -1086,8 +1295,10 @@ mod tests {
         let _ = m.on_press();
         for _ in 0..(N_PARAMS + 5) {
             let r = m.on_turn(1);
-            assert!(!matches!(r, TurnResult::Param { .. }),
-                    "on_turn emitted Param while lead_loaded == false");
+            assert!(
+                !matches!(r, TurnResult::Param { .. }),
+                "on_turn emitted Param while lead_loaded == false"
+            );
         }
         assert!(m.is_save_row());
     }
@@ -1108,10 +1319,20 @@ mod tests {
     fn refresh_params_reads_lead_layout() {
         let mut m = MenuState::new(2, 0, 0);
         // Body: volume=0xC (0x52), OSC1 ad=0x84 (0x62: A=8, D=4).
-        m.refresh_params(|a| match a { 0x52 => 0x0C, 0x62 => 0x84, _ => 0 });
+        m.refresh_params(|a| match a {
+            0x52 => 0x0C,
+            0x62 => 0x84,
+            _ => 0,
+        });
         assert_eq!(m.edit_values[0], 12);
-        let atk_ix = params::LEAD_PARAMS.iter().position(|d| d.label == "O1 Atk").unwrap();
-        let dec_ix = params::LEAD_PARAMS.iter().position(|d| d.label == "O1 Dec").unwrap();
+        let atk_ix = params::LEAD_PARAMS
+            .iter()
+            .position(|d| d.label == "O1 Atk")
+            .unwrap();
+        let dec_ix = params::LEAD_PARAMS
+            .iter()
+            .position(|d| d.label == "O1 Dec")
+            .unwrap();
         assert_eq!(m.edit_values[atk_ix], 8);
         assert_eq!(m.edit_values[dec_ix], 4);
     }
@@ -1121,19 +1342,27 @@ mod tests {
     #[test]
     fn build_frame_main_card_rows_and_styles() {
         let m = MenuState::new(2, 0, 5);
-        let fr = build_frame(&m, "TestPatch",
-                             Some((Engine::Lead, Some(VoiceMode::Mono))),
-                             None, None, true, None, 60, 80);
+        let fr = build_frame(
+            &m,
+            "TestPatch",
+            Some((Engine::Lead, Some(VoiceMode::Mono))),
+            None,
+            None,
+            true,
+            None,
+            60,
+            80,
+        );
         // title + Card + Bank + Program + Save + MidiSrc + UsbMode + detail (no status)
         assert_eq!(fr.items.len(), 8);
         assert!(fr.items[0].text.starts_with("MBSID"));
-        assert!(fr.items[0].bright);                    // title always bright
-        assert!(fr.items[1].bright);                    // Card row focused (default)
-        assert!(fr.items[1].text.contains("> Menu"));   // nav marker on focus
-        assert!(!fr.items[2].bright);                   // Bank unfocused -> dim
+        assert!(fr.items[0].bright); // title always bright
+        assert!(fr.items[1].bright); // Card row focused (default)
+        assert!(fr.items[1].text.contains("> Menu")); // nav marker on focus
+        assert!(!fr.items[2].bright); // Bank unfocused -> dim
         assert!(fr.items[3].text.contains("Program  005  TestPatch"));
-        assert!(!fr.items[7].bright);                   // detail row always dim
-        // Rows stack at ROW_DY spacing from pos_y.
+        assert!(!fr.items[7].bright); // detail row always dim
+                                      // Rows stack at ROW_DY spacing from pos_y.
         assert_eq!(fr.items[0].y, 80);
         assert_eq!(fr.items[1].y, 80 + 24);
         assert_eq!(fr.items[7].y, 80 + 7 * 24);
@@ -1158,7 +1387,11 @@ mod tests {
                 crate::frame::PaintOp::Erase(i) => f0.items[i as usize].y,
                 crate::frame::PaintOp::Draw(i) => f1.items[i as usize].y,
             };
-            assert!(y == card_y || y == bank_y, "op outside the two focus rows: y={}", y);
+            assert!(
+                y == card_y || y == bank_y,
+                "op outside the two focus rows: y={}",
+                y
+            );
         }
     }
 
@@ -1176,8 +1409,8 @@ mod tests {
     fn card_switch_replaces_body_rows() {
         let mut m = MenuState::new(2, 0, 0);
         let f0 = build_frame(&m, "P", None, None, None, true, None, 60, 80);
-        let _ = m.on_press();          // Edit on Card row
-        let _ = m.on_turn(1);          // Main -> CvMod
+        let _ = m.on_press(); // Edit on Card row
+        let _ = m.on_turn(1); // Main -> CvMod
         let f1 = build_frame(&m, "P", None, None, None, true, None, 60, 80);
         let ops = crate::frame::diff(&f0, &f1);
         // Title is unchanged; everything under it differs. No panic on
@@ -1200,8 +1433,14 @@ mod tests {
         let fr = build_frame(&m, "P", None, Some("SlotName"), None, true, None, 60, 80);
         // title + Card + 6 params + "^" + "v" + Save = 11
         assert_eq!(fr.items.len(), 11);
-        assert!(fr.items.iter().any(|it| it.text.as_str() == "^" && it.x == 50));
-        assert!(fr.items.iter().any(|it| it.text.as_str() == "v" && it.x == 50));
+        assert!(fr
+            .items
+            .iter()
+            .any(|it| it.text.as_str() == "^" && it.x == 50));
+        assert!(fr
+            .items
+            .iter()
+            .any(|it| it.text.as_str() == "v" && it.x == 50));
         assert!(fr.items.last().unwrap().text.contains("Save"));
     }
 
@@ -1224,7 +1463,9 @@ mod tests {
 
     impl RecordingTarget {
         fn new() -> Self {
-            Self { pixels: heapless::Vec::new() }
+            Self {
+                pixels: heapless::Vec::new(),
+            }
         }
     }
 
@@ -1274,11 +1515,16 @@ mod tests {
         // and none is an Erase -- no intensity-0 pixels should appear at all.
         painter.paint(&mut d, f0.clone(), 0).unwrap();
         assert!(!d.pixels.is_empty());
-        assert!(d.pixels.iter().all(|&(_, c)| c.intensity() != 0),
-                "first paint (empty prev) must contain no erase pixels");
-        assert!(d.pixels.iter().any(|&(p, _)| p.x >= card_x && p.x < card_x + 9
-                                     && (p.y - card_y).abs() < ROW_DY),
-                "expected the focused Card row's '>' marker glyph in the first paint");
+        assert!(
+            d.pixels.iter().all(|&(_, c)| c.intensity() != 0),
+            "first paint (empty prev) must contain no erase pixels"
+        );
+        assert!(
+            d.pixels
+                .iter()
+                .any(|&(p, _)| p.x >= card_x && p.x < card_x + 9 && (p.y - card_y).abs() < ROW_DY),
+            "expected the focused Card row's '>' marker glyph in the first paint"
+        );
 
         // Second paint: focus moves off Card onto Bank.
         d.pixels.clear();
@@ -1286,18 +1532,24 @@ mod tests {
 
         // Erase output (intensity 0) must draw the OLD (f0) Card row, which
         // had the marker -- proving Erase indexes `self.prev`, not `frame`.
-        assert!(d.pixels.iter().any(|&(p, c)| c.intensity() == 0
-                                     && p.x >= card_x && p.x < card_x + 9
-                                     && (p.y - card_y).abs() < ROW_DY),
-                "erase must re-blit the OLD frame's Card marker glyph");
+        assert!(
+            d.pixels.iter().any(|&(p, c)| c.intensity() == 0
+                && p.x >= card_x
+                && p.x < card_x + 9
+                && (p.y - card_y).abs() < ROW_DY),
+            "erase must re-blit the OLD frame's Card marker glyph"
+        );
 
         // Draw output (nonzero intensity) must draw the NEW (f1) Bank row,
         // which now has the marker -- proving Draw indexes the passed-in
         // `frame`, not `self.prev`.
-        assert!(d.pixels.iter().any(|&(p, c)| c.intensity() != 0
-                                     && p.x >= card_x && p.x < card_x + 9
-                                     && (p.y - bank_y).abs() < ROW_DY),
-                "draw must blit the NEW frame's Bank marker glyph");
+        assert!(
+            d.pixels.iter().any(|&(p, c)| c.intensity() != 0
+                && p.x >= card_x
+                && p.x < card_x + 9
+                && (p.y - bank_y).abs() < ROW_DY),
+            "draw must blit the NEW frame's Bank marker glyph"
+        );
 
         // After painting, `prev` must become the just-painted frame so the
         // next diff() call compares against what's actually on screen.
@@ -1322,7 +1574,9 @@ mod tests {
     fn usb_card_unreachable_unless_storage_mode() {
         let mut m = MenuState::new(1, 0, 0);
         let _ = m.on_press(); // Edit on Card row
-        for _ in 0..5 { let _ = m.on_turn(1); }
+        for _ in 0..5 {
+            let _ = m.on_turn(1);
+        }
         assert_eq!(m.card, Card::PatchEdit); // clamped, no Usb
         m.usb_storage = true;
         let _ = m.on_turn(1);
@@ -1337,9 +1591,9 @@ mod tests {
         m.usb_file_count = 3;
         m.focus = USB_ROW_FILE;
         assert_eq!(m.on_press(), PressResult::Toggled); // Nav -> Edit
-        let _ = m.on_turn(2);           // -1 -> 1
+        let _ = m.on_turn(2); // -1 -> 1
         assert_eq!(m.usb_file, 1);
-        let _ = m.on_turn(10);          // clamp at 2
+        let _ = m.on_turn(10); // clamp at 2
         assert_eq!(m.usb_file, 2);
         assert_eq!(m.on_press(), PressResult::UsbLoad(2)); // Edit -> Nav commits
         assert_eq!(m.mode, Mode::Nav);
@@ -1353,7 +1607,7 @@ mod tests {
         m.usb_file_count = 0;
         m.focus = USB_ROW_FILE;
         let _ = m.on_press();
-        let _ = m.on_turn(5);           // nothing to select
+        let _ = m.on_turn(5); // nothing to select
         assert_eq!(m.usb_file, -1);
         assert_eq!(m.on_press(), PressResult::Cancel);
     }
@@ -1367,10 +1621,12 @@ mod tests {
         m.usb_file = 1;
         m.focus = USB_ROW_LOADSLOT;
         assert_eq!(m.on_press(), PressResult::Toggled);
-        assert_eq!(m.usb_slot, -1);     // Cancel-first
+        assert_eq!(m.usb_slot, -1); // Cancel-first
         let _ = m.on_turn(4);
-        assert_eq!(m.on_press(),
-                   PressResult::UsbLoadToSlot { file: 1, slot: 3 });
+        assert_eq!(
+            m.on_press(),
+            PressResult::UsbLoadToSlot { file: 1, slot: 3 }
+        );
     }
 
     #[test]
@@ -1392,11 +1648,13 @@ mod tests {
         m.card = Card::Usb;
         m.usb_file_count = 2;
         m.usb_file = 0;
-        let usb = UsbInfo { drive: DriveState::Ready,
-                            file_name: Some("LEAD1.SYX"), file_count: 2,
-                            slot_name: None };
-        let fr = build_frame(&m, "P", None, None, None, true,
-                             Some(&usb), 60, 80);
+        let usb = UsbInfo {
+            drive: DriveState::Ready,
+            file_name: Some("LEAD1.SYX"),
+            file_count: 2,
+            slot_name: None,
+        };
+        let fr = build_frame(&m, "P", None, None, None, true, Some(&usb), 60, 80);
         // title + Card + Drive + File + Load>Slot + Export + Import = 7 (no status)
         assert_eq!(fr.items.len(), 7);
         assert!(fr.items[2].text.contains("Ready"));
@@ -1413,15 +1671,24 @@ mod tests {
         m.card = Card::Usb;
         m.focus = USB_ROW_EXPORT;
         assert_eq!(m.on_press(), PressResult::Toggled);
-        assert_eq!(m.usb_export, -1);                      // Cancel-first
-        let _ = m.on_turn(1);                              // -> EDIT
-        assert_eq!(m.on_press(), PressResult::UsbExport { source: ExportSource::Edit });
-        let _ = m.on_press();                              // re-enter Edit
-        let _ = m.on_turn(3);                              // -> slot 1 (0-based: 1+? )
-        assert_eq!(m.on_press(),
-                   PressResult::UsbExport { source: ExportSource::Slot(1) });
+        assert_eq!(m.usb_export, -1); // Cancel-first
+        let _ = m.on_turn(1); // -> EDIT
+        assert_eq!(
+            m.on_press(),
+            PressResult::UsbExport {
+                source: ExportSource::Edit
+            }
+        );
+        let _ = m.on_press(); // re-enter Edit
+        let _ = m.on_turn(3); // -> slot 1 (0-based: 1+? )
+        assert_eq!(
+            m.on_press(),
+            PressResult::UsbExport {
+                source: ExportSource::Slot(1)
+            }
+        );
         let _ = m.on_press();
-        assert_eq!(m.on_press(), PressResult::Cancel);     // press at Cancel
+        assert_eq!(m.on_press(), PressResult::Cancel); // press at Cancel
     }
 
     #[test]
@@ -1454,14 +1721,21 @@ mod tests {
         m.usb_storage = true;
         m.card = Card::Usb;
         m.focus = USB_ROW_IMPORT;
-        let usb = UsbInfo { drive: DriveState::Ready, file_name: None,
-                            file_count: 0, slot_name: None };
+        let usb = UsbInfo {
+            drive: DriveState::Ready,
+            file_name: None,
+            file_count: 0,
+            slot_name: None,
+        };
         let f = build_frame(&m, "P", None, None, None, true, Some(&usb), 60, 80);
         assert!(f.items.iter().any(|it| it.text.contains("Import   Cancel")));
-        m.on_press();       // Edit at Cancel
-        m.on_turn(1);       // arm
+        m.on_press(); // Edit at Cancel
+        m.on_turn(1); // arm
         let f = build_frame(&m, "P", None, None, None, true, Some(&usb), 60, 80);
-        assert!(f.items.iter().any(|it| it.text.contains("Import   REPLACE bank!")));
+        assert!(f
+            .items
+            .iter()
+            .any(|it| it.text.contains("Import   REPLACE bank!")));
     }
 
     #[test]
