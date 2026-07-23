@@ -9,6 +9,29 @@ edition = "2021"
 [lints.clippy]
 all = "warn"
 
+# Bring-up diagnostics. BOTH DEFAULT OFF — they are not part of the
+# shipping firmware.
+#
+# The build driver (gateware/src/tiliqua/tiliqua_soc.py) runs a bare
+# `cargo build --release` with no --features flag and is shared by all
+# 17 bitstreams, so it must not be modified. To turn a diagnostic on
+# for a bring-up session, edit the `default` line below, rebuild with
+# `pdm mbsid build --fw-only`, and revert it before committing:
+#
+#     default = ["usb-diag"]
+#
+# For a host-only check (`cargo test`/`cargo clippy`) you can instead
+# pass `--features usb-diag` directly.
+[features]
+default = []
+# UART0 trace of MSC status transitions, per-stage export progress, and
+# the latched first/last read+write failure snapshots. See
+# M6_USB_STORAGE.md §7b.
+usb-diag = []
+# Boot-time stack painting (0xAA) + a high-water-mark scan every 64 main
+# loop iterations, logged over UART0. See M6_USB_STORAGE.md §7a.
+stack-probe = []
+
 [dependencies]
 tiliqua-hal = { path="../../../rs/hal", default-features = false }
 tiliqua-lib = { path = "../../../rs/lib" }

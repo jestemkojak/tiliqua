@@ -370,36 +370,35 @@ fn main() -> ! {
     let sysclk = pac::clock::sysclk();
     let mut timer = Timer0::new(peripherals.TIMER0, sysclk);
 
-    // --- TEMPORARY stack-paint probe (M6_USB_STORAGE.md §7a's last hardware
-    // checklist item) --------------------------------------------------------
-    // mbsid has no logger/UI wiring (unlike sid_player_sw's
-    // `handlers::logger_init`) — this bypasses that entirely and just talks
-    // to UART0 directly, matching the throwaway technique root CLAUDE.md's
-    // RAM-budget gotcha describes and M4 already used once (measured
-    // 4016/25824 B; that probe was never committed, see CLAUDE.md/
-    // M4_USER_PATCH_BANKS.md §6f). Paint the region between the end of .bss
-    // and the current stack pointer with a sentinel byte; the main loop below
-    // scans for the high-water mark and logs new peaks. Remove this whole
-    // block (and its main-loop counterpart, search "end TEMPORARY") once the
-    // hardware number is recorded in M6_USB_STORAGE.md §7a.
-    let mut stack_probe_serial = Serial0::new(peripherals.UART0);
-    unsafe {
-        extern "C" {
-            static _eheap: u8;
-            static _stack_start: u8;
+    // Bring-up diagnostics over UART0. mbsid has no logger/UI wiring (unlike
+    // sid_player_sw's `handlers::logger_init`), so this talks to Serial0
+    // directly. Shared by the `stack-probe` and `usb-diag` features; built
+    // only when at least one of them is on.
+    #[cfg(any(feature = "stack-probe", feature = "usb-diag"))]
+    let mut diag_serial = Serial0::new(peripherals.UART0);
+
+    // Stack high-water measurement (M6_USB_STORAGE.md §7a): paint the region
+    // between the end of .bss and the current stack pointer with a sentinel
+    // byte; the main loop scans for the high-water mark and logs new peaks.
+    #[cfg(feature = "stack-probe")]
+    {
+        unsafe {
+            extern "C" {
+                static _eheap: u8;
+                static _stack_start: u8;
+            }
+            let low = &_eheap as *const u8 as usize;
+            let sp: usize;
+            core::arch::asm!("mv {0}, sp", out(reg) sp);
+            // Leave a safety margin below the live call frame so we don't
+            // clobber locals `main()` has already pushed getting here.
+            let paint_until = sp.saturating_sub(256);
+            if paint_until > low {
+                core::ptr::write_bytes(low as *mut u8, 0xAA, paint_until - low);
+            }
         }
-        let low = &_eheap as *const u8 as usize;
-        let sp: usize;
-        core::arch::asm!("mv {0}, sp", out(reg) sp);
-        // Leave a safety margin below the live call frame so we don't
-        // clobber locals `main()` has already pushed getting here.
-        let paint_until = sp.saturating_sub(256);
-        if paint_until > low {
-            core::ptr::write_bytes(low as *mut u8, 0xAA, paint_until - low);
-        }
+        core::fmt::Write::write_str(&mut diag_serial, "\r\nstack-paint probe armed\r\n").ok();
     }
-    core::fmt::Write::write_str(&mut stack_probe_serial, "\r\nstack-paint probe armed\r\n").ok();
-    // --- end TEMPORARY (probe continues in the main loop below) -------------
 
     // Engine bring-up + boot patch (unchanged).
     mbsid_sys::init();
@@ -499,9 +498,10 @@ fn main() -> ! {
 
     handler!(timer0 = || timer0_handler(&app));
 
-    // TEMPORARY stack-paint probe state (see the block at the top of main()
-    // for why this exists / how to remove it).
+    // stack-probe state (see the paint block at the top of main()).
+    #[cfg(feature = "stack-probe")]
     let mut stack_probe_max: usize = 0;
+    #[cfg(feature = "stack-probe")]
     let mut stack_probe_ctr: u32 = 0;
     // TEMPORARY M6b diag: last-seen MSC status for transition logging.
     let mut usb_diag_last: (bool, bool, u16) = (false, false, 0);
@@ -512,35 +512,37 @@ fn main() -> ! {
 
         let mut dirty = true; // draw once on startup
         loop {
-            // --- TEMPORARY stack-paint probe: scan every 64 iterations (a
-            // full-region byte scan every iteration would be wasteful for a
-            // menu-driven loop) and log only when the high-water mark grows.
-            stack_probe_ctr = stack_probe_ctr.wrapping_add(1);
-            if stack_probe_ctr % 64 == 0 {
-                unsafe {
-                    extern "C" {
-                        static _eheap: u8;
-                        static _stack_start: u8;
-                    }
-                    let low = &_eheap as *const u8 as usize;
-                    let high = &_stack_start as *const u8 as usize;
-                    let mut addr = low;
-                    while addr < high && *(addr as *const u8) == 0xAA {
-                        addr += 1;
-                    }
-                    let used = high - addr;
-                    if used > stack_probe_max {
-                        stack_probe_max = used;
-                        let mut msg: heapless::String<48> = heapless::String::new();
-                        let _ = core::fmt::Write::write_fmt(
-                            &mut msg,
-                            format_args!("stack peak: {} / {} B\r\n", used, high - low),
-                        );
-                        core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
+            // Scan every 64 iterations (a full-region byte scan every
+            // iteration would be wasteful for a menu-driven loop) and log
+            // only when the high-water mark grows.
+            #[cfg(feature = "stack-probe")]
+            {
+                stack_probe_ctr = stack_probe_ctr.wrapping_add(1);
+                if stack_probe_ctr.is_multiple_of(64) {
+                    unsafe {
+                        extern "C" {
+                            static _eheap: u8;
+                            static _stack_start: u8;
+                        }
+                        let low = &_eheap as *const u8 as usize;
+                        let high = &_stack_start as *const u8 as usize;
+                        let mut addr = low;
+                        while addr < high && *(addr as *const u8) == 0xAA {
+                            addr += 1;
+                        }
+                        let used = high - addr;
+                        if used > stack_probe_max {
+                            stack_probe_max = used;
+                            let mut msg: heapless::String<48> = heapless::String::new();
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut msg,
+                                format_args!("stack peak: {} / {} B\r\n", used, high - low),
+                            );
+                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
+                        }
                     }
                 }
             }
-            // --- end TEMPORARY --------------------------------------------
 
             encoder.update();
             let ticks = encoder.poke_ticks();
@@ -614,7 +616,7 @@ fn main() -> ! {
                             uptime::now_ms()
                         ),
                     );
-                    core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
+                    core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
                 }
             }
             // --- end TEMPORARY --------------------------------------------
@@ -810,7 +812,7 @@ fn main() -> ! {
                                     usb_msc.block_size()
                                 ),
                             );
-                            core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
+                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
                         }
                         let mounted = core::cell::Cell::new(false);
                         let ok = got
@@ -876,7 +878,7 @@ fn main() -> ! {
                                     sq
                                 ),
                             );
-                            core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
+                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
                         }
                         {
                             // Round-six read-failure diag: reason 1=notready
@@ -919,7 +921,7 @@ fn main() -> ! {
                                     path2
                                 ),
                             );
-                            core::fmt::Write::write_str(&mut stack_probe_serial, msg.as_str()).ok();
+                            core::fmt::Write::write_str(&mut diag_serial, msg.as_str()).ok();
                         }
                         // --- end TEMPORARY ----------------------------------
                         let mut s: heapless::String<24> = heapless::String::new();
