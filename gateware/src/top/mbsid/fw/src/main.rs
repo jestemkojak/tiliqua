@@ -404,7 +404,7 @@ fn render(
     status: &Status,
     drive_present: bool,
 ) {
-    sid.usb_midi_host().write(|w| unsafe {
+    sid.usb_midi_host().write(|w| {
         w.host()
             .bit(state.midi_src == menu::MidiSource::Usb && !state.usb_storage)
     });

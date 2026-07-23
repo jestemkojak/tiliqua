@@ -11,7 +11,7 @@ guide, limitations, extending) — update the relevant page when a feature lands
 `top.py`, `fw/` (incl. `build.rs`), and the `pdm mbsid build` script all exist on this branch
 (`mbsid-port`). Verified green: freestanding compile, host oracle (shim == engine, 28/28 OK +
 Multi differential + 128-patch sweep + SysEx RAM-Write-equivalence + bad-checksum-rejection),
-host `cargo test --lib` (138/138, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
+host `cargo test --lib` (155/155, incl. `patch_store`/`sysex_capture`/menu Save-row, frame diff/painter,
 `usb_patch`/FAT-fixture/menu Usb-card coverage, `export_patch`/encode_syx round-trip, `uptime` wall-clock,
 `bank_import` whole-bank replace),
 full bitstream
