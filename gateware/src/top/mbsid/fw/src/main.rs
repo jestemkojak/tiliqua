@@ -720,7 +720,10 @@ fn usb_load<F: tiliqua_hal::nor_flash::NorFlash + tiliqua_hal::nor_flash::ReadNo
     state: &mut MenuState,
     user_detail: &mut Option<(u8, u8)>,
 ) -> heapless::String<24> {
-    let ok = with_fat(msc, |fs| usb_patch::load_patch_by_index(fs, ix, patch_buf)).unwrap_or(false);
+    let ok = matches!(
+        with_fat(msc, |fs| usb_patch::load_patch_by_index(fs, ix, patch_buf)),
+        Some(Ok(()))
+    );
     if !ok {
         return status::usb_load_failed();
     }

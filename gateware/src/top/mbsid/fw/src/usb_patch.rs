@@ -76,16 +76,39 @@ pub fn parse_patch_file(bytes: &[u8], dst: &mut [u8; 512]) -> bool {
     false
 }
 
+/// Why loading a USB patch file by index failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadError {
+    /// No candidate file at that index (or a directory-iteration error).
+    NotFound,
+    /// A candidate was found but a block read failed mid-file.
+    Read,
+    /// The bytes read weren't a valid patch file.
+    Parse,
+}
+
+impl LoadError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LoadError::NotFound => "not found",
+            LoadError::Read => "read",
+            LoadError::Parse => "parse",
+        }
+    }
+}
+
 /// Read the idx-th candidate file and parse it into `dst`.
 pub fn load_patch_by_index<IO: ReadWriteSeek>(
     fs: &FileSystem<IO>,
     idx: usize,
     dst: &mut [u8; 512],
-) -> bool {
+) -> Result<(), LoadError> {
     let dir = patch_dir(fs);
     let mut count = 0usize;
     for entry in dir.iter() {
-        let Ok(e) = entry else { return false };
+        let Ok(e) = entry else {
+            return Err(LoadError::NotFound);
+        };
         if e.is_dir() {
             continue;
         }
@@ -101,14 +124,18 @@ pub fn load_patch_by_index<IO: ReadWriteSeek>(
                 match file.read(&mut buf[total..]) {
                     Ok(0) => break,
                     Ok(n) => total += n,
-                    Err(_) => return false,
+                    Err(_) => return Err(LoadError::Read),
                 }
             }
-            return parse_patch_file(&buf[..total], dst);
+            return if parse_patch_file(&buf[..total], dst) {
+                Ok(())
+            } else {
+                Err(LoadError::Parse)
+            };
         }
         count += 1;
     }
-    false
+    Err(LoadError::NotFound)
 }
 
 /// Encode `patch` as a standard MBSID v2 single-patch dump (bank 1 = User,
@@ -509,7 +536,7 @@ mod tests {
         let part = VecDisk::new(&mut img[base..]);
         let fs = FileSystem::new(part, FsOptions::new()).unwrap();
         let mut dst = [0u8; 512];
-        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert!(load_patch_by_index(&fs, 0, &mut dst).is_ok());
         assert_eq!(dst, p);
     }
 
@@ -521,7 +548,7 @@ mod tests {
         let part = VecDisk::new(&mut img[base..]);
         let fs = FileSystem::new(part, FsOptions::new()).unwrap();
         let mut dst = [0u8; 512];
-        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert!(load_patch_by_index(&fs, 0, &mut dst).is_ok());
         assert_eq!(dst, p);
     }
 
@@ -546,7 +573,7 @@ mod tests {
         assert_eq!(list_patch_files(&fs, &mut out), 1);
         assert_eq!(out[0].as_str(), "IN.SYX");
         let mut dst = [0u8; 512];
-        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert!(load_patch_by_index(&fs, 0, &mut dst).is_ok());
         assert_eq!(dst, p_dir);
     }
 
@@ -560,7 +587,17 @@ mod tests {
         let part = VecDisk::new(&mut img[base..]);
         let fs = FileSystem::new(part, FsOptions::new()).unwrap();
         let mut dst = [0u8; 512];
-        assert!(!load_patch_by_index(&fs, 0, &mut dst));
+        assert_eq!(load_patch_by_index(&fs, 0, &mut dst), Err(LoadError::Parse));
+    }
+
+    #[test]
+    fn no_candidate_file_is_not_found() {
+        let mut img = build_gpt_fat_image(&[("README.TXT", b"not a patch")]);
+        let base = BASE_LBA as usize * SECTOR;
+        let part = VecDisk::new(&mut img[base..]);
+        let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+        let mut dst = [0u8; 512];
+        assert_eq!(load_patch_by_index(&fs, 0, &mut dst), Err(LoadError::NotFound));
     }
 
     #[test]
@@ -591,7 +628,7 @@ mod tests {
         assert_eq!(list_patch_files(&fs, &mut out), 1); // in /MBSID/, .SYX
         assert_eq!(out[0].as_str(), "P007.SYX");
         let mut dst = [0u8; 512];
-        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert!(load_patch_by_index(&fs, 0, &mut dst).is_ok());
         assert_eq!(dst, p);
     }
 
@@ -608,7 +645,7 @@ mod tests {
         let part = VecDisk::new(&mut img[base..]);
         let fs = FileSystem::new(part, FsOptions::new()).unwrap();
         let mut dst = [0u8; 512];
-        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert!(load_patch_by_index(&fs, 0, &mut dst).is_ok());
         assert_eq!(dst, p2); // second export won, file not duplicated
     }
 
@@ -622,7 +659,7 @@ mod tests {
         assert_eq!(export_patch(&fs, "P007.SYX", &p, 7), Ok(()));
         // round-trips back through the loader
         let mut dst = [0u8; 512];
-        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert!(load_patch_by_index(&fs, 0, &mut dst).is_ok());
         assert_eq!(dst, p);
     }
 
