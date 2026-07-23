@@ -262,6 +262,7 @@ that gets saved.
 | `fw/` | RISC-V firmware (engine FFI, MIDI drain, RegDiff, patch menu) |
 | `fw/csrc/` | `mbsid_shim.cpp` + `mios32_shim/` facade headers |
 | `host_oracle/` | x86 oracle: bit-exact diff of shim vs JUCE engine |
+| `tools/make_patch_bank/` | PC-side CLI: build a `BANK.SYX` from a directory of single-patch `.syx` dumps for [whole-bank USB import](docs/user-guide.md#importing-a-whole-bank-from-a-drive) |
 | `fetch-mios32.sh` | One-time vendor checkout (personal non-commercial use only; gitignored) |
 | `DESIGN.md` | Authoritative spec (interfaces, milestones, acceptance) |
 | `CLAUDE.md` | Developer reference and gotchas |
