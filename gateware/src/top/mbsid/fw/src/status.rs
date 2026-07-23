@@ -102,12 +102,11 @@ pub fn imported(outcome: Option<ImportOutcome>) -> String<24> {
 }
 
 /// Patch export to the drive.
-pub fn exported(ok: bool, fname: &str) -> String<24> {
+pub fn exported(result: Result<(), crate::usb_patch::ExportError>, fname: &str) -> String<24> {
     let mut s = String::new();
-    let _ = if ok {
-        write!(s, "Exported {}", fname)
-    } else {
-        write!(s, "Export FAILED")
+    let _ = match result {
+        Ok(()) => write!(s, "Exported {}", fname),
+        Err(e) => write!(s, "Export FAIL:{}", e.as_str()),
     };
     s
 }
@@ -151,8 +150,26 @@ mod tests {
 
     #[test]
     fn export_strings_match_legacy_wording() {
-        assert_eq!(exported(true, "EDIT.SYX").as_str(), "Exported EDIT.SYX");
-        assert_eq!(exported(false, "EDIT.SYX").as_str(), "Export FAILED");
+        use crate::usb_patch::ExportError;
+        assert_eq!(exported(Ok(()), "EDIT.SYX").as_str(), "Exported EDIT.SYX");
+        assert_eq!(
+            exported(Err(ExportError::Write), "EDIT.SYX").as_str(),
+            "Export FAIL:write"
+        );
+    }
+
+    #[test]
+    fn exported_strings_show_reason() {
+        use crate::usb_patch::ExportError;
+        assert_eq!(exported(Ok(()), "P007.SYX").as_str(), "Exported P007.SYX");
+        assert_eq!(
+            exported(Err(ExportError::Verify), "P007.SYX").as_str(),
+            "Export FAIL:verify"
+        );
+        assert_eq!(
+            exported(Err(ExportError::Mount), "EDIT.SYX").as_str(),
+            "Export FAIL:mount"
+        );
     }
 
     #[test]

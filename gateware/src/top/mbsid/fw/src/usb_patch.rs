@@ -131,13 +131,40 @@ pub fn encode_syx(patch: &[u8; 512], slot: u8, out: &mut [u8; 1036]) {
     out[1035] = 0xF7;
 }
 
+/// Why a `export_patch` failed. `Mount` is not produced by `export_patch`
+/// itself — the caller uses it when the drive isn't mounted, the source
+/// patch didn't load, or the post-write cache flush failed — so every export
+/// failure the UI can report lives in one enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportError {
+    Mount,
+    Create,
+    Write,
+    Flush,
+    Readback,
+    Verify,
+}
+
+impl ExportError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExportError::Mount => "mount",
+            ExportError::Create => "create",
+            ExportError::Write => "write",
+            ExportError::Flush => "flush",
+            ExportError::Readback => "readback",
+            ExportError::Verify => "verify",
+        }
+    }
+}
+
 /// Export `patch` as `/MBSID/<name>`; flush; verify by readback+reparse.
 pub fn export_patch<IO: ReadWriteSeek>(
     fs: &FileSystem<IO>,
     name: &str,
     patch: &[u8; 512],
     slot: u8,
-) -> bool {
+) -> Result<(), ExportError> {
     let root = fs.root_dir();
     let dir = match root.open_dir("MBSID") {
         Ok(d) => d,
@@ -150,26 +177,26 @@ pub fn export_patch<IO: ReadWriteSeek>(
     encode_syx(patch, slot, &mut syx);
     {
         let Ok(mut f) = dir.create_file(name) else {
-            return false;
+            return Err(ExportError::Create);
         };
         if f.truncate().is_err() {
-            return false;
+            return Err(ExportError::Write);
         }
         let mut rest: &[u8] = &syx;
         while !rest.is_empty() {
             match f.write(rest) {
-                Ok(0) | Err(_) => return false,
+                Ok(0) | Err(_) => return Err(ExportError::Write),
                 Ok(n) => rest = &rest[n..],
             }
         }
         if f.flush().is_err() {
-            return false;
+            return Err(ExportError::Flush);
         }
     }
     // Verify: re-open, re-read, re-parse, byte-compare (cheap end-to-end
     // check that the write path actually landed — spec §6b).
     let Ok(mut f) = dir.open_file(name) else {
-        return false;
+        return Err(ExportError::Readback);
     };
     let mut back = [0u8; 1036];
     let mut total = 0usize;
@@ -177,11 +204,15 @@ pub fn export_patch<IO: ReadWriteSeek>(
         match f.read(&mut back[total..]) {
             Ok(0) => break,
             Ok(n) => total += n,
-            Err(_) => return false,
+            Err(_) => return Err(ExportError::Readback),
         }
     }
     let mut dst = [0u8; 512];
-    total == 1036 && parse_patch_file(&back, &mut dst) && dst == *patch
+    if total == 1036 && parse_patch_file(&back, &mut dst) && dst == *patch {
+        Ok(())
+    } else {
+        Err(ExportError::Verify)
+    }
 }
 
 /// Fixed bank-import source file (spec §1): /MBSID/BANK.SYX, root fallback.
@@ -552,7 +583,7 @@ mod tests {
         {
             let part = VecDisk::new(&mut img[base..]);
             let fs = FileSystem::new(part, FsOptions::new()).unwrap();
-            assert!(export_patch(&fs, "P007.SYX", &p, 7));
+            assert!(export_patch(&fs, "P007.SYX", &p, 7).is_ok());
         }
         let part = VecDisk::new(&mut img[base..]);
         let fs = FileSystem::new(part, FsOptions::new()).unwrap();
@@ -572,13 +603,27 @@ mod tests {
         for p in [&p1, &p2] {
             let part = VecDisk::new(&mut img[base..]);
             let fs = FileSystem::new(part, FsOptions::new()).unwrap();
-            assert!(export_patch(&fs, "EDIT.SYX", p, 0));
+            assert!(export_patch(&fs, "EDIT.SYX", p, 0).is_ok());
         }
         let part = VecDisk::new(&mut img[base..]);
         let fs = FileSystem::new(part, FsOptions::new()).unwrap();
         let mut dst = [0u8; 512];
         assert!(load_patch_by_index(&fs, 0, &mut dst));
         assert_eq!(dst, p2); // second export won, file not duplicated
+    }
+
+    #[test]
+    fn export_returns_ok_on_success() {
+        let p = [0x5Au8; 512];
+        let mut img = build_gpt_fat_image(&[("SEED.TXT", b"x")]);
+        let base = BASE_LBA as usize * SECTOR;
+        let part = VecDisk::new(&mut img[base..]);
+        let fs = FileSystem::new(part, FsOptions::new()).unwrap();
+        assert_eq!(export_patch(&fs, "P007.SYX", &p, 7), Ok(()));
+        // round-trips back through the loader
+        let mut dst = [0u8; 512];
+        assert!(load_patch_by_index(&fs, 0, &mut dst));
+        assert_eq!(dst, p);
     }
 
     fn fs_with_root_file<'a>(img: &'a mut Vec<u8>) -> FileSystem<VecDisk<'a>> {

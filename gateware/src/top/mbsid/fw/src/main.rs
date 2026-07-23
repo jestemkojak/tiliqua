@@ -347,19 +347,27 @@ fn handle_press(
             let fname = menu::export_name(source);
             let snap0 = diag::export_begin(ser, &usb.msc, &fname, got);
             let mounted = core::cell::Cell::new(false);
-            let ok = got
-                && with_fat(&usb.msc, |fs| {
+            let export_res: Option<Result<(), usb_patch::ExportError>> = if got {
+                with_fat(&usb.msc, |fs| {
                     mounted.set(true);
                     usb_patch::export_patch(fs, &fname, &storage.patch_buf, slot)
                 })
-                .unwrap_or(false);
-            // Commit the drive's volatile cache before reporting success —
-            // the verify read may have been served from cache (round eight
+            } else {
+                None
+            };
+            // Commit the drive's volatile cache before reporting success — the
+            // verify read may have been served from cache (round eight
             // durability fix).
-            let ok = ok && usb.msc.flush().is_ok();
+            let final_res: Result<(), usb_patch::ExportError> = match export_res {
+                Some(Ok(())) if usb.msc.flush().is_ok() => Ok(()),
+                Some(Ok(())) => Err(usb_patch::ExportError::Flush),
+                Some(Err(e)) => Err(e),
+                None => Err(usb_patch::ExportError::Mount),
+            };
+            let ok = final_res.is_ok();
             diag::export_result(ser, &usb.msc, ok, mounted.get(), &snap0);
             usb.listed = false; // new file: refresh the list
-            Some(status::exported(ok, &fname))
+            Some(status::exported(final_res, &fname))
         }
     }
 }
